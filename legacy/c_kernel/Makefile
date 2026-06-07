@@ -1,26 +1,26 @@
 #==============================================================================
 # Makefile for VIBIX — two-stage build
 #
-# Stage 1:  64-bit Rust code + asm entry → flat binary (kernel64.bin) at
-#           0x200000 via cargo + ld + objcopy.
+# Stage 1:  64-bit C code → flat binary (kernel64.bin) at 0x200000.
 # Stage 2:  boot.asm (ELF32, Multiboot v1) embeds kernel64.bin via incbin.
 # Final:    vibix.elf — 32-bit ELF accepted by QEMU -kernel.
 #==============================================================================
 
-NASM        = nasm
-LD          = ld
-CARGO       = cargo
-OBJCOPY     = objcopy
+NASM       = nasm
+CC         = gcc
+LD         = ld
 
-# 64-bit kernel build (Rust staticlib + asm entry)
-RUST_TARGET = x86_64-unknown-none
-RUST_DIR    = kernel_rust
-RUST_LIB    = $(RUST_DIR)/target/$(RUST_TARGET)/release/libvibix_kernel.a
-RUST_LD     = $(RUST_DIR)/kernel64_elf.ld
+# 64-bit kernel flags
+CFLAGS64   = -ffreestanding -nostdlib -m64 -mno-red-zone -Iinclude \
+             -Wall -Wextra -Werror
+LDFLAGS64  = -T kernel64.ld -nostdlib
 
 # Final 32-bit ELF flags (Multiboot wrapper)
-ASMFLAGS32  = -f elf32
-LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
+ASMFLAGS32 = -f elf32
+LDFLAGS32  = -m elf_i386 -T linker.ld -nostdlib
+
+C_OBJS64   = kernel.o serial.o pmm.o
+ASM_OBJS64 = kernel64_entry.o
 
 .PHONY: all clean run debug
 
@@ -28,22 +28,14 @@ all: vibix.elf
 
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────
 
+$(C_OBJS64): %.o: kernel/%.c
+	$(CC) $(CFLAGS64) -c $< -o $@
+
 kernel64_entry.o: kernel/kernel64_entry.asm
 	$(NASM) -f elf64 $< -o $@
 
-# Build the Rust staticlib (produces libvibix_kernel.a)
-$(RUST_LIB): $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
-	cd $(RUST_DIR) && \
-	RUSTFLAGS="-C code-model=kernel" \
-	$(CARGO) build --target $(RUST_TARGET) --release
-
-# Link asm entry + Rust staticlib into an ELF
-kernel64.elf: kernel64_entry.o $(RUST_LIB)
-	$(LD) -T $(RUST_LD) -nostdlib -o $@ kernel64_entry.o $(RUST_LIB)
-
-# Flatten to flat binary for incbin
-kernel64.bin: kernel64.elf
-	$(OBJCOPY) -O binary $< $@
+kernel64.bin: kernel64_entry.o $(C_OBJS64)
+	$(LD) $(LDFLAGS64) -o $@ $^
 
 # ── Stage 2: 32-bit ELF wrapper ─────────────────────────────────────────────
 
@@ -69,4 +61,3 @@ test: vibix.elf
 
 clean:
 	rm -f *.o *.elf *.bin
-	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true

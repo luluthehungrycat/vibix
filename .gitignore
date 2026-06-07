@@ -3,6 +3,9 @@
 *.elf
 *.bin
 
+# Rust / Cargo
+kernel_rust/target/
+
 # Test/cache dirs
 __pycache__/
 .ruff_cache/
