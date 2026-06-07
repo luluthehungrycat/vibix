@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+*.elf
+*.bin
+
+# Test/cache dirs
+__pycache__/
+.ruff_cache/
+.mypy_cache/
+
+# OS artifacts
+*~
+.DS_Store
