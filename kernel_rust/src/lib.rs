@@ -9,6 +9,7 @@
 
 mod serial;
 mod pmm;
+mod interrupts;
 
 use core::panic::PanicInfo;
 
@@ -37,6 +38,17 @@ pub extern "C" fn kernel_main() -> ! {
     let mut pmm = pmm::PmmAllocator::new();
     pmm.init(0x100000, 0x10000000);
     pmm.test(&mut serial);
+
+    serial.writestrs(&[
+        "VIBIX: Initialising interrupts...\n",
+    ]);
+
+    interrupts::init_interrupts();
+    serial.writestrs(&["VIBIX: IDT loaded, PIC remapped.\n"]);
+
+    // Test: trigger a divide-by-zero exception
+    serial.writestrs(&["VIBIX: Triggering divide-by-zero...\n"]);
+    unsafe { core::arch::asm!("mov rax, 1\n\tmov rcx, 0\n\tdiv rcx", options(nostack)); }
 
     serial.writestrs(&[
         "VIBIX: Boot sequence complete — entering idle loop.\n",
