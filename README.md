@@ -13,8 +13,10 @@ coding agent collaboration alongside traditional coding. The kernel was original
 prototyped in freestanding C, then ported to Rust for stronger safety guarantees
 and better alignment with modern kernel development practices.
 
-**Current status: MVP boots in QEMU, prints serial output, and manages physical
-memory — built entirely in Rust (stable, no_std).**
+**Current status: MVP boots in QEMU with full interrupt handling (IDT, PIC, PIT
+at 100 Hz), VBE framebuffer (1024×768×32 with bitmap font rendering), physical
+memory manager, kernel heap allocator, and keyboard driver module — built
+entirely in Rust (stable, no_std).**
 
 ---
 
@@ -60,7 +62,7 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 |-------|----------|----------|
 | Multiboot header + mode transition | Assembly (NASM) | `boot.asm` |
 | 64-bit kernel entry stub | Assembly (NASM) | `kernel/kernel64_entry.asm` |
-| **Kernel core** (serial, PMM, idle) | **Rust (stable)** | `kernel_rust/src/` |
+| **Kernel core** (serial, PMM, KMM, interrupts, PIT, keyboard, framebuffer) | **Rust (stable)** | `kernel_rust/src/` |
 | Legacy C implementation (archived) | C (GCC) | `legacy/c_kernel/` |
 
 ---
@@ -77,28 +79,30 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 - [x] **Rust port** — kernel core migrated from C to Rust (stable, `no_std`, `x86_64-unknown-none` target)
 - [x] **Automated test suite** — `make test` boots QEMU and validates output
 - [x] **Anti-plagiarism checks** — `python3 anti_cheat.py` scans for Linux/BSD patterns
+- [x] **Interrupts (IDT + PIC)** — remapped IRQs, handler dispatch (Rust+asm)
+- [x] **PIT driver** — 100 Hz system timer via IRQ0
+- [x] **PS/2 Keyboard driver** — IRQ1 handler, scancode decoding
+- [x] **Framebuffer display** — Bochs VBE direct I/O, 1024×768×32, 8×16 bitmap font
+- [x] **Kernel heap allocator** — first-fit free-list, coalescing, split
 
 ### Next Up (Recommended Order)
 
 This ordering respects technical dependencies:
 
-1. **Interrupts (IDT + PIC remapping + IRQ handlers)** — unlocks every I/O
-   subsystem. The keyboard, timer, and other drivers are all interrupt-driven.
-   Nothing else can happen without this.
-2. **Programmable Interval Timer (PIT)** — the OS heartbeat. Gives us time
-   tracking and a tick for scheduling.
-3. **PS/2 Keyboard driver** — first real input. Needs interrupts (IRQ1).
-   Simple protocol makes it a good first driver.
-4. **Framebuffer / VBE display** — visual output on QEMU's serial console or
-   Bochs VBE LFB. Can be developed in parallel with keyboard.
-5. **Paging enhancements** — demand paging, recursive page tables, virtual
-   memory allocator. Largely independent of I/O; can proceed alongside 3–4.
+1. **GDT with Ring 3 segments + TSS** — user-mode code/data segments and task
+   state segment for syscall stack switching.
+2. **Syscall entry** — `syscall`/`sysret` or `int 0x80` handler to enter kernel
+   mode from user space.
+3. **Syscall dispatch** — ABI definition (syscall numbers, argument registers,
+   return convention).
+4. **Paging enhancements** — demand paging, recursive page tables, virtual
+   memory allocator.
+5. **Shell** — keyboard + serial + framebuffer → interactive user interface.
 
 After these are stable, the path opens to:
-- **Shell** — keyboard + serial → interactive input
-- **Syscalls** — enter/exit kernel mode
-- **Preemptive multitasking** — timer + IRQ → context switching
+- **Preemptive multitasking** — timer + context switching
 - **File systems** — block device interface
+- **User-mode applications** — ELF loader, process management
 
 ---
 
@@ -140,9 +144,30 @@ A successful boot prints:
 ========================================
 
 VIBIX: Kernel alive!
-PMM: init 0x100000-0x10000000 (65280 pages)
+VIBIX: Multiboot memory map:
+  base=0x00000000_0x00000000  len=0x00000000_0x0009FC00  Available
+  base=0x00000000_0x0009FC00  len=0x00000000_0x00000400  Reserved
+  base=0x00000000_0x000F0000  len=0x00000000_0x00010000  Reserved
+  base=0x00000000_0x00100000  len=0x00000000_0x1FEE0000  Available
+  base=0x00000000_0x1FFE0000  len=0x00000000_0x00020000  Reserved
+  base=0x00000000_0xFFFC0000  len=0x00000000_0x00040000  Reserved
+  base=0x000000FD_0x00000000  len=0x00000003_0x00000000  Reserved
 PMM: Test passed.
+KMM: Test OK — freed block reused.
+KMM: Coalescing OK — single free block.
+VIBIX: fb: Bochs VBE detected — setting 1024x768x32.
+VIBIX: fb: VBE status — 1024x768x32 enable=0xc1
+VIBIX: Framebuffer: 1024 x 768 @ 32 bpp, addr fd000000
+VIBIX: Framebuffer initialised.
+VIBIX: Initialising interrupts...
+VIBIX: IDT loaded, PIC remapped.
+VIBIX: PIT timer initialised at 100 Hz.
+VIBIX: Enabling interrupts.
 VIBIX: Boot sequence complete — entering idle loop.
+VIBIX: PIT tick #100
+VIBIX: PIT tick #200
+VIBIX: PIT tick #300
+...
 ```
 
 ---
@@ -163,7 +188,7 @@ VIBIX: Boot sequence complete — entering idle loop.
 
 - **Originality first** — every line is handwritten; no copying from existing kernels
 - **Rust safety** — leverage the type system for memory safety at compile time
-- **Serial-driven debugging** — no graphical output needed for development
+- **Serial-driven debugging** — primary debug channel even with graphical output
 - **Testable by default** — every feature should have an automated test
 
 ### Anti-Plagiarism
