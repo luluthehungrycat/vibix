@@ -5,7 +5,6 @@
 // Provides a monotonically increasing tick counter.
 //==============================================================================
 
-use crate::serial::SerialPort;
 
 //--- PIT I/O ports -----------------------------------------------------------
 
@@ -60,31 +59,6 @@ pub fn init() {
 pub fn tick() {
     unsafe {
         PIT_TICKS += 1;
-        let ticks = PIT_TICKS;
-
-        // Print a heartbeat every 100 ticks (≈ 1 second).
-        if ticks % 100 == 0 {
-            let mut serial = SerialPort::new();
-            serial.writestrs(&["VIBIX: PIT tick #"]);
-
-            // Manual decimal formatting (no_std).
-            let mut n = ticks;
-            let mut digits = [0u8; 20];
-            let mut i = digits.len();
-            while n > 0 {
-                i -= 1;
-                digits[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-            if i == digits.len() {
-                // ticks == 0
-                i -= 1;
-                digits[i] = b'0';
-            }
-            // Safety: digits[i..] contains only ASCII digits.
-            let s = core::str::from_utf8_unchecked(&digits[i..]);
-            serial.writestrs(&[s, "\n"]);
-        }
     }
 }
 

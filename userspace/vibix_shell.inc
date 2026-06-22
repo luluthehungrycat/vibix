@@ -144,6 +144,7 @@ shell:
     je .shell_loop
 
     ; ── Lookup in command table ─────────────────────────────────────────────
+    mov rdi, [rel argv_buf]         ; reload rdi (corrupted by builtin checks)
     lea r14, [rel cmd_table]        ; r14 = cmd table pointer
     xor r12d, r12d                  ; r12 = command index
 

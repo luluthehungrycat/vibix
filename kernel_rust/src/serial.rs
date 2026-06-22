@@ -121,6 +121,29 @@ impl SerialPort {
         }
         count
     }
+
+    /// Blocking read: waits for at least one byte, then drains whatever else
+    /// is available into `buf`.  Returns the number of bytes read (> 0).
+    pub fn read_blocking(&self, buf: &mut [u8]) -> usize {
+        // Spin until at least one byte is available.
+        while (inb(self.base + SERIAL_LSR) & SERIAL_LSR_DATA_READY) == 0 {
+            core::hint::spin_loop();
+        }
+        let mut count = 0usize;
+        // Read the first byte (we know it's ready).
+        buf[count] = inb(self.base + SERIAL_DATA);
+        count += 1;
+        // Drain any additional bytes that are available now.
+        while count < buf.len() {
+            if (inb(self.base + SERIAL_LSR) & SERIAL_LSR_DATA_READY) != 0 {
+                buf[count] = inb(self.base + SERIAL_DATA);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
 }
 
 //--- core::fmt::Write implementation -----------------------------------------

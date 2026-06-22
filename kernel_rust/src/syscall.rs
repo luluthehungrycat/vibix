@@ -76,7 +76,7 @@ fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
     // Fall back to serial port (COM1) if keyboard had no data.
     if count == 0 {
         let serial = SerialPort::new();
-        count = serial.read(slice);
+        count = serial.read_blocking(slice);
     }
 
     count as u64
