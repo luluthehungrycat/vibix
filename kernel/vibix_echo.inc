@@ -167,16 +167,18 @@ echo:
 ;==============================================================================
 ; strlen(rdi = string) → rax = length (excluding null terminator)
 ;==============================================================================
+%ifndef VIBIX_STRLEN
+%define VIBIX_STRLEN
 strlen:
     xor eax, eax
-.loop:
+.l:
     cmp byte [rdi + rax], 0
-    je .done
+    je .d
     inc rax
-    jmp .loop
-.done:
+    jmp .l
+.d:
     ret
-
+%endif
 ;==============================================================================
 ; decode_escapes(rdi = src, rsi = dst, rdx = max_len) → rax = decoded length
 ;
@@ -295,6 +297,12 @@ decode_escapes:
     pop rbx
     ret
 
-; ── String constants (placed in .rodata by the includer) ─────────────────────
+; ── String constants (guarded for multi-include) ──────────────────────────────
+%ifndef VIBIX_STR_SPACE
+%define VIBIX_STR_SPACE
 str_space:   db " ", 0
+%endif
+%ifndef VIBIX_STR_NEWLINE
+%define VIBIX_STR_NEWLINE
 str_newline: db 0x0A, 0
+%endif

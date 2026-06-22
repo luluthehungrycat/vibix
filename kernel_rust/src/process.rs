@@ -19,8 +19,10 @@ const USER_CODE_ADDR: u64 = 0x2000000;   // 32 MiB
 /// Virtual address for the user stack page (grows downward from +0x1000).
 const USER_STACK_ADDR: u64 = 0x2001000;  // 32 MiB + 4 KiB
 
-/// Embedded flat binary — assembled by NASM from kernel/user_init.asm.
-static USER_INIT_BIN: &[u8] = include_bytes!("../../user_init.bin");
+/// Embedded flat binary — assembled by NASM from kernel/userspace_blob.asm.
+/// Contains all GVIBU-ported commands with a dispatch table.  The kernel
+/// selects a command by setting rdi = command_id before entering user mode.
+static USER_INIT_BIN: &[u8] = include_bytes!("../../userspace_blob.bin");
 
 //------------------------------------------------------------------------------
 // Process descriptor
@@ -91,12 +93,16 @@ pub unsafe fn enter_user_mode(proc: &Process) -> ! {
     //   USER_CS = 0x20 | 3 = 0x23
     //   USER_DS  = 0x18 | 3 = 0x1B
     core::arch::asm!(
-        // Build iretq frame (push in reverse order)
+        // Build iretq frame (push in reverse order).
+        // We push FIRST, then set rdi, to avoid register-allocation conflicts.
         "push {uss}",       // SS  — user data segment
         "push {ursp}",      // RSP — user stack pointer
         "push {urflags}",   // RFLAGS — IF enabled (bit 9), bit 1 always set
         "push {ucs}",       // CS  — user code segment
         "push {urip}",      // RIP — entry point
+        // Set rdi = command_id (0 = init_demo) for the userspace blob dispatch.
+        // iretq pops the iretq frame; rdi is preserved for the user _start.
+        "mov edi, 0",
         "iretq",            // Pop and jump to Ring 3
         uss = in(reg) 0x1Bu64,
         ursp = in(reg) proc.user_rsp,
