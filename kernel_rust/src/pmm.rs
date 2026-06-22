@@ -26,6 +26,31 @@ fn bitmap_mut() -> *mut [u8; BITMAP_SIZE] {
     &raw mut PMM_BITMAP
 }
 
+//--- Global PMM access -------------------------------------------------------
+//
+// A global PMM instance so that syscall handlers and other runtime code can
+// allocate physical pages without receiving &mut PmmAllocator through the
+// call chain.
+
+/// Global PMM allocator — initialised once during boot.
+static mut GLOBAL_PMM: PmmAllocator = PmmAllocator::new();
+
+/// Initialise the global PMM from a fully-configured local allocator.
+///
+/// Call once after the boot PMM is fully set up (reservations made, etc.)
+pub fn init_global(local: &PmmAllocator) {
+    unsafe {
+        GLOBAL_PMM.total_pages = local.total_pages;
+        GLOBAL_PMM.memory_start = local.memory_start;
+    }
+}
+
+/// Return a mutable reference to the global PMM.
+#[allow(static_mut_refs)]
+pub fn global_pmm() -> &'static mut PmmAllocator {
+    unsafe { &mut GLOBAL_PMM }
+}
+
 //--- PMM Allocator -----------------------------------------------------------
 
 pub struct PmmAllocator {

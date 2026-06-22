@@ -26,14 +26,14 @@ _start:
     mov rax, 1          ; syscall 1 = write
     mov rdi, 1          ; fd = 1 (stdout)
     lea rsi, [rel msg]  ; buf (RIP-relative addressing works in flat binary)
-    mov rdx, 15         ; len
+    mov rdx, 14         ; len = "Hello, world!\n"
     syscall
 
     ; write(1, msg2, len2)
     mov rax, 1
     mov rdi, 1
     lea rsi, [rel msg2]
-    mov rdx, 17
+    mov rdx, 20         ; len = "From PID 1 (init)\n"
     syscall
 
     ; getpid() → rax should be 1

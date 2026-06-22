@@ -15,6 +15,7 @@ mod multiboot;
 mod pit;
 mod keyboard;
 mod fb;
+mod elf;
 mod gdt;
 mod syscall;
 mod paging;
@@ -58,6 +59,9 @@ pub extern "C" fn kernel_main() -> ! {
     pmm.reserve(0x200000, 0x80000);
 
     pmm.test(&mut serial);
+
+    // Initialise global PMM so runtime code (brk, ELF loader, etc.) can allocate.
+    pmm::init_global(&pmm);
 
     // Kernel Heap Allocator
     kmm::init(&mut pmm);

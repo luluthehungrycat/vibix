@@ -7,6 +7,18 @@
 
 use crate::serial::SerialPort;
 
+//--- Circular buffer for keyboard input -------------------------------------
+
+/// Size of the keyboard input ring buffer.
+const BUF_SIZE: usize = 256;
+
+/// Ring buffer for decoded keystrokes.
+static mut BUF: [u8; BUF_SIZE] = [0u8; BUF_SIZE];
+/// Write index (where the next character goes).
+static mut HEAD: usize = 0;
+/// Read index (where the next character comes from).
+static mut TAIL: usize = 0;
+
 //--- I/O ports ---------------------------------------------------------------
 
 /// PS/2 data port — read scan codes, write commands/data.
@@ -118,7 +130,32 @@ pub fn handle_keyboard() {
     let shifted = unsafe { SHIFT };
     let table = if shifted { &SCANCODE_MAKE_SHIFT } else { &SCANCODE_MAKE };
     if let Some(byte) = table[scancode as usize] {
+        // Echo to serial console.
         let mut serial = SerialPort::new();
         serial.putchar(byte as char);
+
+        // Push into the circular keyboard buffer (non-blocking, drops on full).
+        unsafe {
+            let next_head = (HEAD + 1) % BUF_SIZE;
+            if next_head != TAIL {
+                BUF[HEAD] = byte;
+                HEAD = next_head;
+            }
+        }
     }
+}
+
+/// Copy buffered keyboard input into `buf`, returning the number of bytes read.
+///
+/// This is a non-blocking read — returns 0 immediately if no data is available.
+pub fn read(buf: &mut [u8]) -> usize {
+    let mut count = 0usize;
+    unsafe {
+        while HEAD != TAIL && count < buf.len() {
+            buf[count] = BUF[TAIL];
+            TAIL = (TAIL + 1) % BUF_SIZE;
+            count += 1;
+        }
+    }
+    count
 }

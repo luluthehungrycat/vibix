@@ -44,11 +44,26 @@ syscall_entry:
     push rcx                    ; [rsp+8] = user RIP
     push r11                    ; [rsp]   = user RFLAGS
 
-    ; rdi = syscall number (RAX)
-    mov rdi, rax
-
-    ; rsi = arg1, rdx = arg2, r8 = arg3, r9 = arg4
-    ; (these are already set from the calling convention)
+    ; ─────────────────────────────────────────────────────────────────────────
+    ; Set up C ABI call: syscall_handler(num, arg1, arg2, arg3, arg4)
+    ;
+    ; After SYSCALL:
+    ;   rdi = user arg1, rsi = user arg2, rdx = user arg3, r8 = user arg4
+    ;   rcx = user RIP (clobbered by SYSCALL — saved on stack)
+    ;   rax = syscall number
+    ;
+    ; We need C ABI registers:
+    ;   rdi = num, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4
+    ;
+    ; So rotate: arg1(rsi)←usr_rdi, arg2(rdx)←usr_rsi, arg3(rcx)←usr_rdx
+    ; while preserving usr_rdi before clobber and using usr_rsi/usr_rdx correctly.
+    ; ─────────────────────────────────────────────────────────────────────────
+    mov r9, rdi                 ; r9 = user arg1 (safe, 6th C ABI slot unused)
+    mov rcx, rdx                ; rcx = arg3 = user rdx  (C ABI 4th arg)
+    mov rdx, rsi                ; rdx = arg2 = user rsi  (C ABI 3rd arg)
+    mov rsi, r9                 ; rsi = arg1 = user rdi  (C ABI 2nd arg)
+    mov rdi, rax                ; rdi = num = syscall no (C ABI 1st arg)
+    ; r8 already holds user arg4 → C ABI 5th arg ✓
 
     call syscall_handler
 

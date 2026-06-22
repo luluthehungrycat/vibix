@@ -12,6 +12,9 @@
 
 use core::fmt::Write;
 use crate::serial::SerialPort;
+use crate::keyboard;
+use crate::paging;
+use crate::pmm;
 
 /// Syscall handler function pointer.
 type SyscallFn = fn(u64, u64, u64, u64) -> u64;
@@ -55,9 +58,17 @@ fn sys_write(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
 
 /// Syscall 2: read(int fd, void *buf, size_t len) → bytes read.
 ///
-/// Stub — not yet implemented.  Returns -1.
-fn sys_read(_fd: u64, _buf: u64, _len: u64, _: u64) -> u64 {
-    u64::MAX
+/// fd=0 (stdin) reads from the keyboard buffer.
+/// Other fds return -1 (unsupported).
+fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
+    if fd != 0 {
+        return u64::MAX;  // unsupported fd
+    }
+    if buf == 0 || len == 0 {
+        return 0;
+    }
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+    keyboard::read(slice) as u64
 }
 
 /// Syscall 3: getpid() → process ID.
@@ -66,8 +77,93 @@ fn sys_getpid(_: u64, _: u64, _: u64, _: u64) -> u64 {
 }
 
 //==============================================================================
+// errno — per-process error number (currently single-process global)
+//==============================================================================
+
+/// Kernel-internal errno value.
+static mut ERRNO: i64 = 0;
+
+pub fn set_errno(e: i64) {
+    unsafe { ERRNO = e; }
+}
+
+#[allow(dead_code)]
+pub fn get_errno() -> i64 {
+    unsafe { ERRNO }
+}
+
+const ENOSYS: i64 = 38;
+
+//==============================================================================
+// brk / sbrk — program break (heap)
+//==============================================================================
+
+/// Base of the user heap area.
+const BRK_START: u64 = 0x201_0000;   // 32 MiB + 64 KiB
+
+/// Maximum program break (256 MiB — generous for the current process model).
+const BRK_MAX: u64   = 0x1000_0000;  // 256 MiB
+
+/// Current program break (initialised to BRK_START).
+static mut PROGRAM_BREAK: u64 = BRK_START;
+
+/// Syscall 4: brk(void *addr) → new program break.
+///
+/// Convention:
+///   - `addr == 0` → return current break (sbrk(0) query)
+///   - `addr < BRK_START || addr > BRK_MAX` → do nothing, return -1
+///   - Otherwise → set break, allocating/mapping pages as needed, return new break
+fn sys_brk(addr: u64, _: u64, _: u64, _: u64) -> u64 {
+    unsafe {
+        // sbrk(0) query — return current break
+        if addr == 0 {
+            return PROGRAM_BREAK;
+        }
+
+        // Validate bounds
+        if addr < BRK_START || addr > BRK_MAX {
+            set_errno(ENOSYS);  // closest match: not enough space
+            return u64::MAX;
+        }
+
+        let current_page_end = (PROGRAM_BREAK + 0xFFF) & !0xFFF;
+        let new_page_end = (addr + 0xFFF) & !0xFFF;
+
+        if new_page_end > current_page_end {
+            // Expand — allocate and map new pages
+            let pmm = pmm::global_pmm();
+            let mut vaddr = current_page_end;
+            while vaddr < new_page_end {
+                let phys = pmm.alloc();
+                if phys.is_null() {
+                    set_errno(ENOSYS);  // ENOMEM equivalent
+                    return u64::MAX;
+                }
+                // Zero the page before mapping (security: no kernel-data leaks)
+                core::ptr::write_bytes(phys, 0, 4096);
+                paging::map_4k(vaddr, phys as u64, paging::PAGE_USER_RW, pmm);
+                paging::invlpg(vaddr);
+                vaddr += 4096;
+            }
+        }
+        // Note: shrinking (new_page_end < current_page_end) could unmap pages,
+        // but we keep them for simplicity.  The break address is still updated
+        // so subsequent allocations don't reuse the "shrunk" space incorrectly.
+
+        PROGRAM_BREAK = addr;
+        addr
+    }
+}
+
+//==============================================================================
 // Public API
 //==============================================================================
+
+/// Return the current errno value.
+#[allow(dead_code)]
+pub fn errno_value() -> i64 {
+    get_errno()
+}
 
 /// Register a syscall handler.
 ///
@@ -90,6 +186,7 @@ pub fn init() {
     register(1, sys_write);
     register(2, sys_read);
     register(3, sys_getpid);
+    register(4, sys_brk);
 }
 
 //==============================================================================

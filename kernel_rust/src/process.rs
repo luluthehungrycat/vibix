@@ -28,6 +28,7 @@ static USER_INIT_BIN: &[u8] = include_bytes!("../../user_init.bin");
 
 /// Minimal process descriptor for the init process.
 pub struct Process {
+    #[allow(dead_code)]
     pub pid: u64,
     pub entry: u64,
     pub user_rsp: u64,
@@ -104,4 +105,30 @@ pub unsafe fn enter_user_mode(proc: &Process) -> ! {
         urip = in(reg) proc.entry,
         options(noreturn)
     )
+}
+
+//------------------------------------------------------------------------------
+// ELF process creation
+//------------------------------------------------------------------------------
+
+/// Create a process from an ELF64 binary loaded in memory.
+///
+/// Allocates a stack page and returns a Process ready for enter_user_mode.
+#[allow(dead_code)]
+pub fn create_from_elf(elf_data: &[u8], pmm: &mut PmmAllocator) -> Option<Process> {
+    // Load segments using the ELF loader
+    let entry = crate::elf::load(elf_data, pmm).ok()?;
+
+    // Allocate and map a fresh 4 KiB user stack at the standard stack address
+    let stack_page = pmm.alloc();
+    if stack_page.is_null() {
+        return None;
+    }
+    paging::map_4k(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm);
+
+    Some(Process {
+        pid: 1,
+        entry,
+        user_rsp: USER_STACK_ADDR + 0x1000,  // top of stack page
+    })
 }

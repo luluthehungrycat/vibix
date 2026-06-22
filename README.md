@@ -15,10 +15,12 @@ and better alignment with modern kernel development practices.
 
 **Current status: MVP boots in QEMU with full interrupt handling (IDT, PIC, PIT
 at 100 Hz), VBE framebuffer (1024×768×32 with bitmap font rendering), physical
-memory manager, kernel heap allocator, keyboard driver module, GDT with Ring 3
-segments and TSS, SYSCALL/SYSRET entry (via LSTAR MSR), and a syscall dispatch
-table — all built in Rust (stable, no_std).  The kernel enters user mode (Ring 3)
-and runs a flat binary init process (PID 1).**
+memory manager, kernel heap allocator, keyboard driver module with ring buffer,
+GDT with Ring 3 segments and TSS, SYSCALL/SYSRET entry (via LSTAR MSR), syscall
+dispatch table (5 syscalls: exit, write, read, getpid, brk), ELF64 loader,
+and kernel-internal errno — all built in Rust (stable, no_std).  The kernel
+enters user mode (Ring 3), runs a flat binary init process (PID 1) that prints
+"Hello, world!" and "From PID 1 (init)", then exits with code 0.**
 
 ---
 
@@ -92,24 +94,26 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
   state segment for syscall stack switching.
 - [x] **Syscall entry** — `syscall`/`sysretq` handler via LSTAR MSR, saves/restores
   user registers, dispatches to Rust.
-- [x] **Syscall dispatch** — 64-slot table, 4 syscalls registered (exit, write,
-  read, getpid).  ABI documented in [SYSCALL.md](SYSCALL.md).
+- [x] **Syscall dispatch** — 64-slot table, 5 syscalls registered (exit, write,
+  read, getpid, brk).  ABI documented in [SYSCALL.md](SYSCALL.md).
 - [x] **User-mode entry** — flat binary init process (PID 1) loaded at 32 MiB,
-  entered via IRETQ to Ring 3.
+  entered via IRETQ to Ring 3, prints "Hello, world!" and exits cleanly with
+  code 0.
 - [x] **Paging** — 4-level page tables, 4 KiB and 2 MiB pages, map/unmap/translate,
   self-test.
+- [x] **`read` syscall** — PS/2 keyboard driver wired to `sys_read` (fd=0).
+- [x] **`brk` syscall** — dynamic heap growth with demand paging (up to 256 MiB).
+- [x] **ELF64 loader** — parses `ET_EXEC` with `PT_LOAD` segments, creates user pages.
+- [x] **`errno` mechanism** — kernel-internal `errno` set on syscall errors.
+- [x] **Correct syscall ABI** — register rotation in `syscall_entry.asm` preserves
+  all 5 user arguments (verified: exit code 0).
 
 ### Next Up (Recommended Order)
 
-1. **`read` syscall from keyboard** — wire IRQ1 keyboard driver into `sys_read`.
-2. **`brk`/`sbrk` syscall** — heap growth for userspace `malloc`.
-3. **ELF loader** — parse and load standard ELF64 executables, replacing the
-   flat binary approach.
-4. **Multiple processes + scheduler** — context switching, preemptive
+1. **Multiple processes + scheduler** — context switching, preemptive
    multitasking, `fork`/`exec`.
-5. **`errno` mechanism** — standard error reporting for syscalls.
-6. **Shell** — keyboard + serial + framebuffer → interactive user interface.
-7. **File systems** — block device interface, initrd/tmpfs.
+2. **Shell** — keyboard + serial + framebuffer → interactive user interface.
+3. **File systems** — block device interface, initrd/tmpfs.
 
 ---
 

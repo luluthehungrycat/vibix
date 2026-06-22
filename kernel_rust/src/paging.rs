@@ -14,16 +14,21 @@ use crate::pmm::PmmAllocator;
 pub const PAGE_PRESENT:   u64 = 1 << 0;
 pub const PAGE_WRITABLE:  u64 = 1 << 1;
 pub const PAGE_USER:      u64 = 1 << 2;
+#[allow(dead_code)]
 pub const PAGE_ACCESSED:  u64 = 1 << 5;
+#[allow(dead_code)]
 pub const PAGE_DIRTY:     u64 = 1 << 6;
 pub const PAGE_HUGE:      u64 = 1 << 7;
+#[allow(dead_code)]
 pub const PAGE_GLOBAL:    u64 = 1 << 8;
+#[allow(dead_code)]
 pub const PAGE_NO_EXEC:   u64 = 1 << 63;
 
 /// Common flag combinations.
 pub const PAGE_KERNEL:       u64 = PAGE_PRESENT | PAGE_WRITABLE;
 pub const PAGE_KERNEL_HUGE:  u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
 pub const PAGE_USER_RW:      u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+#[allow(dead_code)]
 pub const PAGE_USER_RO:      u64 = PAGE_PRESENT | PAGE_USER;
 
 /// Physical address mask (bits 12–47).
@@ -47,6 +52,7 @@ pub fn read_cr3() -> u64 {
 ///
 /// # Safety
 /// `cr3` must be a valid physical address of a 4 KiB aligned PML4 page table.
+#[allow(dead_code)]
 pub unsafe fn write_cr3(cr3: u64) {
     core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
 }
