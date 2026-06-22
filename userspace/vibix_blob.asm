@@ -1,24 +1,25 @@
 ;==============================================================================
-; userspace_blob.asm — Combined userspace binary with dispatch table
+; userspace_blob.asm — Combined userspace binary with dispatch table + shell
 ;
-; All 8 GVIBU-ported commands in one flat binary.  The kernel selects which
+; All GVIBU-ported commands in one flat binary.  The kernel selects which
 ; command to run by setting rdi = command_id before entering user mode.
 ;
 ; Command IDs:
-;   0 = init_demo   — boot-time init: echo-based system info demo
-;   1 = echo_demo   — echo (default: say hello)
-;   2 = true_cmd    — exit(0)
-;   3 = false_cmd   — exit(1)
-;   4 = cat_demo    — stdin→stdout copy
-;   5 = printenv    — print environment variables
-;   6 = clear_demo  — ANSI ESC[2J ESC[H
-;   7 = yes_cmd     — infinite "y\n" loop
+;   0 = shell       — interactive serial shell (default)
+;   1 = init_demo   — boot-time init: echo-based system info demo
+;   2 = echo_demo   — echo (default: say hello)
+;   3 = true_cmd    — exit(0)
+;   4 = false_cmd   — exit(1)
+;   5 = cat_demo    — stdin→stdout copy
+;   6 = printenv    — print environment variables
+;   7 = clear_demo  — ANSI ESC[2J ESC[H
+;   8 = yes_cmd     — infinite "y\n" loop
 ;==============================================================================
 
 ORG 0x2000000
 bits 64
 
-NUM_COMMANDS equ 8
+NUM_COMMANDS equ 9
 
 section .text
 global _start
@@ -27,7 +28,7 @@ _start:
     ; rdi = command_id (set by kernel before iretq)
     cmp rdi, NUM_COMMANDS
     jb .valid
-    xor edi, edi                    ; out-of-range → default to init_demo
+    xor edi, edi                    ; out-of-range → default to shell
 .valid:
     lea rax, [rel dispatch_table]
     jmp [rax + rdi*8]
@@ -36,7 +37,7 @@ _start:
 ; Produces "Hello, world!\n" and "From PID 1 (init)\n" for test compatibility,
 ; then demonstrates echo -e with octal escapes.
 init_demo:
-    mov rsp, 0x2002000
+    mov rsp, 0x2003000
 
     ; echo "Hello, world!"
     mov rdi, 2
@@ -64,7 +65,7 @@ init_demo:
 
 ; ── Echo demo ─────────────────────────────────────────────────────────────────
 echo_demo:
-    mov rsp, 0x2002000
+    mov rsp, 0x2003000
     mov rdi, 2
     lea rsi, [rel args_hello]
     call echo
@@ -74,7 +75,7 @@ echo_demo:
 
 ; ── Cat demo ──────────────────────────────────────────────────────────────────
 cat_demo:
-    mov rsp, 0x2002000
+    mov rsp, 0x2003000
     call cat
     xor edi, edi
     mov eax, 0
@@ -82,10 +83,10 @@ cat_demo:
 
 ; ── Printenv demo ─────────────────────────────────────────────────────────────
 printenv_demo:
-    mov rsp, 0x2002000
+    mov rsp, 0x2003000
     mov rdi, 1                      ; argc=1 → print all
     xor rsi, rsi                    ; argv = NULL
-    ; rdx = envp — kernel doesn't set this yet, will be NULL → no output
+    xor rdx, rdx                    ; envp = NULL → no output
     call printenv
     xor edi, edi
     mov eax, 0
@@ -93,7 +94,9 @@ printenv_demo:
 
 ; ── Clear demo ────────────────────────────────────────────────────────────────
 clear_demo:
-    mov rsp, 0x2002000
+    mov rsp, 0x2003000
+    xor edi, edi
+    xor esi, esi
     call clear_cmd
     xor edi, edi
     mov eax, 0
@@ -103,14 +106,15 @@ section .rodata
 
 ; ── Dispatch table ──────────────────────────────────────────────────────────
 dispatch_table:
-    dq init_demo        ; 0: PID 1 init (default)
-    dq echo_demo        ; 1: echo hello world
-    dq true_cmd         ; 2: exit(0)
-    dq false_cmd        ; 3: exit(1)
-    dq cat_demo         ; 4: stdin→stdout copy
-    dq printenv_demo    ; 5: print environment
-    dq clear_demo       ; 6: clear terminal (ANSI)
-    dq yes_cmd          ; 7: infinite y loop
+    dq shell            ; 0: interactive shell (default)
+    dq init_demo        ; 1: PID 1 init
+    dq echo_demo        ; 2: echo hello world
+    dq true_cmd         ; 3: exit(0)
+    dq false_cmd        ; 4: exit(1)
+    dq cat_demo         ; 5: stdin→stdout copy
+    dq printenv_demo    ; 6: print environment
+    dq clear_demo       ; 7: clear terminal (ANSI)
+    dq yes_cmd          ; 8: infinite y loop
 
 ; ── String data ──────────────────────────────────────────────────────────────
 str_echo:       db "echo", 0
@@ -131,3 +135,7 @@ args_e_octal:   dq str_echo, str_e_flag, str_octal_test
 %include "vibix_cat.inc"
 %include "vibix_printenv.inc"
 %include "vibix_clear.inc"
+
+; Shell includes writable buffers (resb/resq), so keep it in .text
+section .text
+%include "vibix_shell.inc"
