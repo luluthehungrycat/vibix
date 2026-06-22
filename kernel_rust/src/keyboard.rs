@@ -24,8 +24,17 @@ static mut TAIL: usize = 0;
 /// PS/2 data port — read scan codes, write commands/data.
 const DATA_PORT: u16 = 0x60;
 /// PS/2 status / command port.
-#[allow(dead_code)]
 const STATUS_PORT: u16 = 0x64;
+
+//--- Status register bits ----------------------------------------------------
+
+/// Bit 0: output buffer full (1 = data ready to read from DATA_PORT).
+const STATUS_OUTPUT_FULL: u8 = 0x01;
+/// Bit 1: input buffer full (1 = controller hasn't consumed last write yet).
+const STATUS_INPUT_FULL: u8 = 0x02;
+
+/// Max spin-loop iterations for PS/2 controller timeouts.
+const WAIT_TIMEOUT: u32 = 100000;
 
 //--- Port I/O ----------------------------------------------------------------
 
@@ -34,6 +43,33 @@ fn inb(port: u16) -> u8 {
     let val: u8;
     unsafe { core::arch::asm!("inb %dx, %al", out("al") val, in("dx") port, options(att_syntax)) }
     val
+}
+
+#[inline]
+fn outb(port: u16, val: u8) {
+    unsafe { core::arch::asm!("outb %al, %dx", in("al") val, in("dx") port, options(att_syntax)) }
+}
+
+//--- PS/2 controller helpers -------------------------------------------------
+
+/// Spin until the controller is ready to accept a write (input buffer empty),
+/// or until the timeout expires.
+fn wait_write() {
+    for _ in 0..WAIT_TIMEOUT {
+        if inb(STATUS_PORT) & STATUS_INPUT_FULL == 0 {
+            return;
+        }
+    }
+}
+
+/// Spin until the controller has data for us (output buffer full),
+/// or until the timeout expires.
+fn wait_read() {
+    for _ in 0..WAIT_TIMEOUT {
+        if inb(STATUS_PORT) & STATUS_OUTPUT_FULL != 0 {
+            return;
+        }
+    }
 }
 
 //--- State -------------------------------------------------------------------
@@ -97,6 +133,13 @@ const SCANCODE_MAKE_SHIFT: [Option<u8>; 0x3B] = {
 
 /// Called from the IRQ dispatcher on each IRQ1 (keyboard interrupt).
 pub fn handle_keyboard() {
+    // Check status register: only read data port if output buffer is full.
+    // This prevents spurious reads in headless / virtualised environments
+    // where an IRQ1 may fire without a real keystroke.
+    if inb(STATUS_PORT) & STATUS_OUTPUT_FULL == 0 {
+        return; // spurious interrupt — nothing to read
+    }
+
     // Read the scan code from the PS/2 data port.
     let scancode = inb(DATA_PORT);
 
@@ -158,4 +201,73 @@ pub fn read(buf: &mut [u8]) -> usize {
         }
     }
     count
+}
+
+//--- Initialisation ----------------------------------------------------------
+
+/// Initialise the PS/2 keyboard controller and keyboard device.
+///
+/// Performs the standard PS/2 controller initialisation sequence:
+/// 1. Disables both PS/2 ports
+/// 2. Flushes the output buffer
+/// 3. Tests the controller (expects 0x55)
+/// 4. Enables keyboard + IRQ via the config byte
+/// 5. Tests the keyboard (reset + BAT)
+/// 6. Enables keyboard scanning
+pub fn init() {
+    // 1. Disable PS/2 devices
+    wait_write();
+    outb(STATUS_PORT, 0xAD); // disable keyboard port
+    wait_write();
+    outb(STATUS_PORT, 0xA7); // disable mouse port
+
+    // 2. Flush output buffer (drain any leftover bytes)
+    for _ in 0..WAIT_TIMEOUT {
+        if inb(STATUS_PORT) & STATUS_OUTPUT_FULL == 0 {
+            break;
+        }
+        inb(DATA_PORT); // read and discard
+    }
+
+    // 3. Test PS/2 controller (self-test)
+    wait_write();
+    outb(STATUS_PORT, 0xAA); // controller self-test command
+    wait_read();
+    if inb(DATA_PORT) != 0x55 {
+        // Controller self-test failed — abort initialisation.
+        return;
+    }
+
+    // 4. Enable keyboard + IRQ via config byte
+    wait_write();
+    outb(STATUS_PORT, 0x60); // write config byte command
+    wait_write();
+    outb(DATA_PORT, 0x47);   // config: enable keyboard, IRQ, SCAN_CODE_SET_1 translate
+
+    // 5. Test keyboard (send reset command)
+    wait_write();
+    outb(DATA_PORT, 0xFF);   // keyboard reset
+    wait_read();
+    let resp = inb(DATA_PORT);
+    if resp == 0xFA {
+        // ACK received — wait for BAT completion
+        wait_read();
+        if inb(DATA_PORT) != 0xAA {
+            // BAT failed
+            return;
+        }
+    } else if resp != 0xAA {
+        // Neither ACK nor BAT success — keyboard not responding
+        return;
+    }
+    // If resp == 0xAA, the keyboard sent BAT success directly (no ACK)
+
+    // 6. Enable keyboard scanning
+    wait_write();
+    outb(DATA_PORT, 0xF4);   // enable scanning
+    wait_read();
+    if inb(DATA_PORT) != 0xFA {
+        // Enable scanning command was not acknowledged
+        return;
+    }
 }
