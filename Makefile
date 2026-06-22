@@ -29,7 +29,7 @@ all: vibix.elf
 # ── User-mode init binary (flat, included via include_bytes! in Rust) ────────
 
 user_init.bin: kernel/user_init.asm
-	$(NASM) -f bin $< -o $@
+	$(NASM) -f bin -I kernel/ $< -o $@
 
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────
 

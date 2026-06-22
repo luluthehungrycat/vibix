@@ -56,9 +56,12 @@ def test_kernel_alive():
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".serial", delete=False) as f:
         serial_path = f.name
 
-    # Try KVM first, fall back to TCG
+    # Try KVM if available and usable, else fall back to TCG
     accel = "kvm"
-    if not os.path.exists("/dev/kvm"):
+    try:
+        with open("/dev/kvm", "rb"):
+            pass
+    except (FileNotFoundError, PermissionError, OSError):
         accel = "tcg"
 
     try:
@@ -75,7 +78,7 @@ def test_kernel_alive():
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
         )
 
         with open(serial_path, "r") as f:

@@ -1,56 +1,66 @@
 ;==============================================================================
-; user_init.asm — PID 1 init process (flat binary)
+; user_init.asm — PID 1 init process using ported echo command
 ;
-; The first user-mode process launched by the kernel. Demonstrates syscalls
-; by printing a message and exiting.
+; Replaces the original raw-write init with the GVIBU-ported echo command.
+; Echo is implemented via the shared vibix_echo.inc library, which supports
+; -n, -e, -E, -- flags and escape decoding (\n, \t, \r, \\, \0NNN).
 ;
-; Syscall ABI:
+; Syscall ABI (from kernel):
 ;   rax = syscall number
 ;   rdi = arg1, rsi = arg2, rdx = arg3, r8  = arg4, r9  = arg5
-; Return value in rax.
+;   Return value in rax.
+;   All registers clobbered except rcx, r11.
 ;
 ; Syscall numbers:
-;   0 = exit(int code)          — never returns
-;   1 = write(int fd, buf, len) — writes buf to fd, returns bytes written
-;   2 = read(int fd, buf, len)  — reads into buf, returns bytes read
-;   3 = getpid()                — returns PID
+;   0 = exit(int code)
+;   1 = write(int fd, buf, len)
+;   2 = read(int fd, buf, len)
+;   3 = getpid()
+;   4 = brk(size) — not implemented
 ;==============================================================================
 
+ORG 0x2000000
 bits 64
 
 section .text
-
 global _start
+
 _start:
-    ; write(1, msg, len)
-    mov rax, 1          ; syscall 1 = write
-    mov rdi, 1          ; fd = 1 (stdout)
-    lea rsi, [rel msg]  ; buf (RIP-relative addressing works in flat binary)
-    mov rdx, 14         ; len = "Hello, world!\n"
-    syscall
+    ; Stack starts at top of stack page (0x2002000)
+    mov rsp, 0x2002000
 
-    ; write(1, msg2, len2)
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [rel msg2]
-    mov rdx, 20         ; len = "From PID 1 (init)\n"
-    syscall
+    ; echo "Hello, world!"
+    mov rdi, 2
+    lea rsi, [rel args_hello]
+    call echo
 
-    ; getpid() → rax should be 1
+    ; echo "From PID 1 (init)"
+    mov rdi, 2
+    lea rsi, [rel args_from]
+    call echo
+
+    ; getpid() → rax (should be 1 for PID 1)
     mov rax, 3
     syscall
-    ; rax now contains PID; ignore it for now
 
     ; exit(0)
-    mov rax, 0          ; syscall 0 = exit
-    mov rdi, 0          ; code = 0
+    xor rdi, rdi
+    mov rax, 0
     syscall
 
-    ; Fallback: halt loop (in case exit returns)
+; ── Halt loop (belt-and-suspenders) ──────────────────────────────────────────
 .halt:
     hlt
     jmp .halt
 
 section .rodata
-msg:  db "Hello, world!", 0x0A
-msg2: db "From PID 1 (init)", 0x0A
+
+args_hello: dq cmd_name, str_hello
+args_from:  dq cmd_name, str_from
+
+cmd_name:   db "echo", 0
+str_hello:  db "Hello, world!", 0
+str_from:   db "From PID 1 (init)", 0
+
+; ── Shared echo implementation ────────────────────────────────────────────────
+%include "vibix_echo.inc"
