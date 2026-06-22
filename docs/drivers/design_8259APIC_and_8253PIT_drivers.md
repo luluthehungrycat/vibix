@@ -1,5 +1,10 @@
 # Design and Implementation of 8259A PIC and 8253 PIT Drivers for VIBIX: A UNIXoid Kernel for x86_64 on QEMU
 
+> **Note:** This document describes the original C-based driver design used for
+> the legacy kernel (`legacy/c_kernel/`). The current Rust kernel (`kernel_rust/`)
+> has functionally equivalent drivers built in. This document is retained for
+> architectural reference.
+
 
 1. Generate the PIC driver design and pseudocode using OpenCode.
 2. Implement the PIC driver in Vibe CLI based on the design from OpenCode.

@@ -76,7 +76,10 @@ pub fn get_or_create_table<'e>(entry: &'e mut u64, pmm: &mut PmmAllocator) -> &'
     }
     let table = unsafe { &mut *(page as *mut PageTable) };
     for slot in table.iter_mut() { *slot = 0; }
-    *entry = (page as u64) | PAGE_KERNEL;
+    // Include USER in intermediate entries so user-mode (ring 3) page walks
+    // succeed for pages mapped with PAGE_USER.  Kernel-only leaf entries
+    // remain protected because they lack the USER bit.
+    *entry = (page as u64) | PAGE_KERNEL | PAGE_USER;
     table
 }
 
@@ -109,11 +112,26 @@ pub fn map_4k(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator) {
     debug_assert!(paddr & 0xFFF == 0, "map_4k: paddr not page-aligned");
 
     let (l4i, l3i, l2i, l1i) = indices(vaddr);
-    let l4 = active_l4();
-    let l3 = get_or_create_table(&mut l4[l4i], pmm);
-    let l2 = get_or_create_table(&mut l3[l3i], pmm);
-    let l1 = get_or_create_table(&mut l2[l2i], pmm);
-    l1[l1i] = paddr | flags;
+    let is_user = flags & PAGE_USER != 0;
+
+    // Use raw pointers to avoid borrow-checker conflicts from the chain of
+    // mutable references through get_or_create_table calls.
+    unsafe {
+        let l4 = active_l4() as *mut PageTable;
+        let l3_ptr: *mut PageTable = get_or_create_table(&mut (*l4)[l4i], pmm);
+        let l2_ptr: *mut PageTable = get_or_create_table(&mut (*l3_ptr)[l3i], pmm);
+        let l1_ptr: *mut PageTable = get_or_create_table(&mut (*l2_ptr)[l2i], pmm);
+        (*l1_ptr)[l1i] = paddr | flags;
+
+        // When mapping a user-accessible page, ensure ALL intermediate
+        // page-table entries have the USER bit set.  The CPU checks USER
+        // at EVERY level of the walk for Ring 3 accesses.
+        if is_user {
+            (*l4)[l4i] |= PAGE_USER;
+            (*l3_ptr)[l3i] |= PAGE_USER;
+            (*l2_ptr)[l2i] |= PAGE_USER;
+        }
+    }
 }
 
 /// Map a 2 MiB huge page in the active address space.

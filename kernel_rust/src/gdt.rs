@@ -248,6 +248,12 @@ unsafe fn setup_syscall_msrs(syscall_entry: u64) {
 // Initialization
 //------------------------------------------------------------------------------
 
+// The top of the 16 KiB kernel stack set up by kernel64_entry.asm.
+// Used for TSS.RSP0 so that interrupts from Ring 3 land on a valid stack.
+extern "C" {
+    static stack_top: u8;
+}
+
 /// Initialise the GDT, TSS, and syscall MSRs.
 ///
 /// Must be called once, early in boot, after the stack is set up but before
@@ -257,10 +263,9 @@ unsafe fn setup_syscall_msrs(syscall_entry: u64) {
 /// Pass `0` to skip MSR setup (if bootstrapping without syscall).
 pub fn init(syscall_entry: u64) {
     unsafe {
-        // Set TSS.RSP0 to the current stack top (kernel stack for ring 0)
-        let stack_top: u64;
-        asm!("mov {0}, rsp", out(reg) stack_top, options(nostack));
-        TSS.rsp0 = stack_top;
+        // Set TSS.RSP0 to the actual top of the 16 KiB kernel stack so that
+        // interrupts from Ring 3 have plenty of room.
+        TSS.rsp0 = &stack_top as *const u8 as u64;
 
         // Install TSS descriptor into GDT
         let gdt: *mut Gdt = &raw mut GDT;

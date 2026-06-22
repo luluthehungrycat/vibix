@@ -31,6 +31,7 @@ syscall_saved_rsp: dq 0
 ; Syscall entry point — set LSTAR to this address
 ;------------------------------------------------------------------------------
 
+section .text
 global syscall_entry
 syscall_entry:
     ; Save user stack pointer to scratch area
@@ -59,7 +60,8 @@ syscall_entry:
     mov rsp, [rel syscall_saved_rsp]
 
     ; Return to ring 3
-    sysretq
+    ; NASM 2.x doesn't recognize sysretq — use explicit encoding
+    db 0x48, 0x0f, 0x07          ; sysretq (REX.W + SYSRET)
 
 ;------------------------------------------------------------------------------
 ; Dedicated 4 KB stack for syscall processing

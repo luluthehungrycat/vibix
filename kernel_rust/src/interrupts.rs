@@ -171,14 +171,20 @@ static IRQ_STUBS: [unsafe extern "C" fn(); 16] = [
 //------------------------------------------------------------------------------
 
 /// Saved register state, matching the push order in `isr_common` in
-/// `interrupts.asm`.  Fields ordered from low to high addresses.
+/// `interrupts.asm`.  `isr_common` pushes in this order:
+///   r15, r14, r13, r12, r11, r10, r9, r8, rdi, rsi, rbp, rbx, rdx, rcx, rax
+///
+/// Since push decrements RSP then stores, the LAST pushed register (rax) is
+/// at the LOWEST address (offset 0), and the FIRST pushed register (r15) is
+/// at the HIGHEST address (offset 112).  Fields are ordered from low to high
+/// addresses, so rax is first and r15 is last.
 #[repr(C)]
 #[derive(Debug)]
 pub struct SavedRegisters {
-    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
-    pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,
-    pub rdi: u64, pub rsi: u64, pub rbp: u64, pub rbx: u64,
-    pub rdx: u64, pub rcx: u64, pub rax: u64,
+    pub rax: u64, pub rcx: u64, pub rdx: u64, pub rbx: u64,
+    pub rbp: u64, pub rsi: u64, pub rdi: u64, pub r8: u64,
+    pub r9: u64,  pub r10: u64, pub r11: u64, pub r12: u64,
+    pub r13: u64, pub r14: u64, pub r15: u64,
 }
 
 /// Complete interrupt frame, including CPU-pushed state.
@@ -396,6 +402,14 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     serial.writestrs(&["VIBIX: EXCEPTION: "]);
     let _ = write!(serial, "{} (#{})\n", name, int_no);
 
+    // CR2 = linear address that caused the page fault (only valid for #PF, #14)
+    let cr2: u64;
+    if int_no == 14 {
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
+    } else {
+        cr2 = 0;
+    }
+
     let rip_buf = hex_str(frame.rip);
     serial.writestrs(&["VIBIX:   RIP: ", core::str::from_utf8(&rip_buf).unwrap_or("???"), "\n"]);
     let cs_buf = hex_str(frame.cs);
@@ -404,6 +418,8 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     serial.writestrs(&["VIBIX: RFLAGS: ", core::str::from_utf8(&rflags_buf).unwrap_or("???"), "\n"]);
     let err_buf = hex_str(frame.err_code);
     serial.writestrs(&["VIBIX:   ERR: ", core::str::from_utf8(&err_buf).unwrap_or("???"), "\n"]);
+    let cr2_buf = hex_str(cr2);
+    serial.writestrs(&["VIBIX:   CR2: ", core::str::from_utf8(&cr2_buf).unwrap_or("???"), "\n"]);
 
     // Print saved registers
     serial.writestrs(&["VIBIX: Registers:\n"]);

@@ -26,6 +26,11 @@ LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
 
 all: vibix.elf
 
+# ── User-mode init binary (flat, included via include_bytes! in Rust) ────────
+
+user_init.bin: kernel/user_init.asm
+	$(NASM) -f bin $< -o $@
+
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────
 
 kernel64_entry.o: kernel/kernel64_entry.asm
@@ -38,7 +43,7 @@ syscall_entry.o: kernel/syscall_entry.asm
 	$(NASM) -f elf64 $< -o $@
 
 # Build the Rust staticlib (produces libvibix_kernel.a)
-$(RUST_LIB): $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
+$(RUST_LIB): user_init.bin $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
 	cd $(RUST_DIR) && \
 	RUSTFLAGS="-C code-model=kernel" \
 	$(CARGO) build --target $(RUST_TARGET) --release
@@ -74,5 +79,5 @@ test: vibix.elf
 	python3 test_kernel.py
 
 clean:
-	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o
+	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o user_init.bin
 	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true

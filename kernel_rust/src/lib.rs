@@ -18,6 +18,7 @@ mod fb;
 mod gdt;
 mod syscall;
 mod paging;
+mod process;
 
 use core::panic::PanicInfo;
 
@@ -112,13 +113,15 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { interrupts::enable_interrupts(); }
 
     serial.writestrs(&[
-        "VIBIX: Boot sequence complete — entering idle loop.\n",
+        "VIBIX: Boot sequence complete — spawning PID 1.\n",
     ]);
 
-    // Idle — hlt wakes on each IRQ0 tick, then immediately halts again
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
-    }
+    // Create the init process from the embedded flat binary
+    let proc = process::create_init(&mut pmm);
+
+    // Enter user mode (Ring 3) — never returns
+    serial.writestrs(&["VIBIX: Entering user mode...\n"]);
+    unsafe { process::enter_user_mode(&proc); }
 }
 
 //------------------------------------------------------------------------------

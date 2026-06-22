@@ -15,8 +15,10 @@ and better alignment with modern kernel development practices.
 
 **Current status: MVP boots in QEMU with full interrupt handling (IDT, PIC, PIT
 at 100 Hz), VBE framebuffer (1024×768×32 with bitmap font rendering), physical
-memory manager, kernel heap allocator, and keyboard driver module — built
-entirely in Rust (stable, no_std).**
+memory manager, kernel heap allocator, keyboard driver module, GDT with Ring 3
+segments and TSS, SYSCALL/SYSRET entry (via LSTAR MSR), and a syscall dispatch
+table — all built in Rust (stable, no_std).  The kernel enters user mode (Ring 3)
+and runs a flat binary init process (PID 1).**
 
 ---
 
@@ -62,7 +64,9 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 |-------|----------|----------|
 | Multiboot header + mode transition | Assembly (NASM) | `boot.asm` |
 | 64-bit kernel entry stub | Assembly (NASM) | `kernel/kernel64_entry.asm` |
-| **Kernel core** (serial, PMM, KMM, interrupts, PIT, keyboard, framebuffer) | **Rust (stable)** | `kernel_rust/src/` |
+| Syscall entry stub | Assembly (NASM) | `kernel/syscall_entry.asm` |
+| User-mode init process (flat binary) | Assembly (NASM) | `kernel/user_init.asm` |
+| **Kernel core** (serial, PMM, KMM, interrupts, PIT, keyboard, framebuffer, GDT, paging, syscall dispatch, process) | **Rust (stable)** | `kernel_rust/src/` |
 | Legacy C implementation (archived) | C (GCC) | `legacy/c_kernel/` |
 
 ---
@@ -84,25 +88,28 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 - [x] **PS/2 Keyboard driver** — IRQ1 handler, scancode decoding
 - [x] **Framebuffer display** — Bochs VBE direct I/O, 1024×768×32, 8×16 bitmap font
 - [x] **Kernel heap allocator** — first-fit free-list, coalescing, split
+- [x] **GDT with Ring 3 segments + TSS** — user-mode code/data segments and task
+  state segment for syscall stack switching.
+- [x] **Syscall entry** — `syscall`/`sysretq` handler via LSTAR MSR, saves/restores
+  user registers, dispatches to Rust.
+- [x] **Syscall dispatch** — 64-slot table, 4 syscalls registered (exit, write,
+  read, getpid).  ABI documented in [SYSCALL.md](SYSCALL.md).
+- [x] **User-mode entry** — flat binary init process (PID 1) loaded at 32 MiB,
+  entered via IRETQ to Ring 3.
+- [x] **Paging** — 4-level page tables, 4 KiB and 2 MiB pages, map/unmap/translate,
+  self-test.
 
 ### Next Up (Recommended Order)
 
-This ordering respects technical dependencies:
-
-1. **GDT with Ring 3 segments + TSS** — user-mode code/data segments and task
-   state segment for syscall stack switching.
-2. **Syscall entry** — `syscall`/`sysret` or `int 0x80` handler to enter kernel
-   mode from user space.
-3. **Syscall dispatch** — ABI definition (syscall numbers, argument registers,
-   return convention).
-4. **Paging enhancements** — demand paging, recursive page tables, virtual
-   memory allocator.
-5. **Shell** — keyboard + serial + framebuffer → interactive user interface.
-
-After these are stable, the path opens to:
-- **Preemptive multitasking** — timer + context switching
-- **File systems** — block device interface
-- **User-mode applications** — ELF loader, process management
+1. **`read` syscall from keyboard** — wire IRQ1 keyboard driver into `sys_read`.
+2. **`brk`/`sbrk` syscall** — heap growth for userspace `malloc`.
+3. **ELF loader** — parse and load standard ELF64 executables, replacing the
+   flat binary approach.
+4. **Multiple processes + scheduler** — context switching, preemptive
+   multitasking, `fork`/`exec`.
+5. **`errno` mechanism** — standard error reporting for syscalls.
+6. **Shell** — keyboard + serial + framebuffer → interactive user interface.
+7. **File systems** — block device interface, initrd/tmpfs.
 
 ---
 
@@ -155,6 +162,7 @@ VIBIX: Multiboot memory map:
 PMM: Test passed.
 KMM: Test OK — freed block reused.
 KMM: Coalescing OK — single free block.
+PAGING: Test passed.
 VIBIX: fb: Bochs VBE detected — setting 1024x768x32.
 VIBIX: fb: VBE status — 1024x768x32 enable=0xc1
 VIBIX: Framebuffer: 1024 x 768 @ 32 bpp, addr fd000000
@@ -162,12 +170,13 @@ VIBIX: Framebuffer initialised.
 VIBIX: Initialising interrupts...
 VIBIX: IDT loaded, PIC remapped.
 VIBIX: PIT timer initialised at 100 Hz.
+VIBIX: Loading GDT/TSS and enabling SYSCALL.
 VIBIX: Enabling interrupts.
-VIBIX: Boot sequence complete — entering idle loop.
-VIBIX: PIT tick #100
-VIBIX: PIT tick #200
-VIBIX: PIT tick #300
-...
+VIBIX: Boot sequence complete — spawning PID 1.
+VIBIX: Entering user mode...
+Hello, world!
+From PID 1 (init)
+VIBIX: init exited with code 0
 ```
 
 ---
@@ -179,6 +188,7 @@ VIBIX: PIT tick #300
 | `anti_cheat.py` | Scans for Linux/BSD kernel patterns to prevent accidental plagiarism |
 | `test_kernel.py` | Boots QEMU, captures serial output, verifies boot banner |
 | `run_qemu.sh` | QEMU runner with debug logging (`-d int,cpu_reset`) |
+| `SYSCALL.md` | Formal system call ABI specification for userspace programs |
 
 ---
 

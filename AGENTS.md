@@ -1,24 +1,34 @@
 # AGENTS.md
-*Guidelines for using coding agents (Vibe CLI, Web Vibe, OpenCode) with VIBIX.*
+*Guidelines for coding agents (OpenCode) working with VIBIX.*
 
 ---
 
-## **🎯 General Rules**
-1. **Primary Tool**: Use **Vibe CLI** and **Open Code** for all core development (generation, compilation, testing).
-2. **Hermes Agent**: Use Hermes Agent for high-level project orchestration, planning, architecture design and only minor edits. Non-minor code edits are to be delegated to coding agents named in Rule #1 whenever possible.
+## **General Rules**
+1. **Primary workflow**: OpenCode agents handle all development — Rust kernel code, NASM assembly, build system, and testing.
+2. **Orchestration**: High-level planning, architecture, and multi-phase refactors use the orchestrator with deepwork skill. Implementation is delegated to specialist agents (fixer, coder).
 3. **Avoid**:
-   - Using Mistral models in OpenCode/Hermes (flaky behavior).
-   - Generating assembly or low-level code in Web Vibe (no execution).
-   - Copying foreign kernel source code verbatim (the project's anti-plagiarism agent and other guardrails will check for it)
-   - Re-using any GPL-licensed source code
+   - Copying foreign kernel source code verbatim (anti-plagiarism checker scans for Linux/BSD patterns).
+   - Re-using any GPL-licensed source code.
+   - Using Mistral models (known flaky behavior with low-level kernel code).
 
 ---
-## **🤖 Agent-Specific Guidelines**
-### **Vibe CLI (Local)**
-| Use Case | Command | Notes |
-|----------|---------|-------|
-| **Generate code** | `vibe --model mistral-medium-3.5` | Use for new files (e.g., `pmm.c`). |
-| **Edit code** | Paste file + prompt | Ask for refinements (e.g., "Optimize this for UNIXoid"). |
-| **Debug** | Paste error + code | Ask for root cause (e.g., "Why does this triple-fault?"). |
-| **Teleport** | `/teleport` | Sync to cloud for backup/collaboration. |
+
+## **Agent Workflow**
+
+### New feature / syscall
+1. **Orchestrator** plans interface (arguments, return type, error handling)
+2. **Fixer/Coder** implements Rust handler in `kernel_rust/src/syscall.rs`
+3. **Orchestrator** verifies via `make run` in QEMU
+
+### New assembly routine
+1. **Orchestrator** designs the calling convention and register protocol
+2. **Fixer/Coder** writes `.asm` file under `kernel/`
+3. **Fixer/Coder** wires the Rust ↔ asm interface
+
+### Testing
+```bash
+make        # Build the kernel
+make run    # Run in QEMU (serial output)
+make test   # Automated boot test
+```
 --

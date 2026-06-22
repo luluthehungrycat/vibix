@@ -3,6 +3,11 @@
 //
 // Called from syscall_entry.asm after SYSCALL.
 // Dispatches to registered handlers based on syscall number in RAX.
+//
+// Syscall ABI (VIBIX):
+//   rax = syscall number
+//   rdi = arg1, rsi = arg2, rdx = arg3, r8  = arg4, r9  = arg5
+// Return value in rax.
 //==============================================================================
 
 use core::fmt::Write;
@@ -17,31 +22,52 @@ const MAX_SYSCALLS: usize = 64;
 /// Syscall dispatch table.
 static mut SYSCALL_TABLE: [Option<SyscallFn>; MAX_SYSCALLS] = [None; MAX_SYSCALLS];
 
-//------------------------------------------------------------------------------
-// Built-in syscalls (debug/test)
-//------------------------------------------------------------------------------
+//==============================================================================
+// Syscall handlers
+//==============================================================================
 
-/// Syscall 0: test handler — prints arguments and returns 0.
-fn sys_test(a: u64, b: u64, c: u64, d: u64) -> u64 {
+/// Syscall 0: exit(int code) — halts the system.
+///
+/// In a single-process kernel, exit means the whole system halts.
+fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     let mut serial = SerialPort::new();
-    serial.init();
-    serial.writestrs(&["VIBIX: syscall 0 (test): args="]);
-    // Use write! for formatted output
-    let _ = core::write!(serial, "0x{a:X} 0x{b:X} 0x{c:X} 0x{d:X}\n");
-    0
+    let _ = core::write!(serial, "VIBIX: init exited with code {}\n", code);
+    // Halt forever
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+    }
 }
 
-/// Syscall 1: write to serial (debug output).
-fn sys_write(ch: u64, _b: u64, _c: u64, _d: u64) -> u64 {
+/// Syscall 1: write(int fd, const char *buf, size_t len) → bytes written.
+///
+/// Currently only fd=1 (stdout, mapped to serial) is supported.
+fn sys_write(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
+    if fd != 1 {
+        return 0;  // unsupported fd
+    }
     let mut serial = SerialPort::new();
-    serial.init();
-    serial.putchar(ch as u8 as char);
-    1
+    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    for &byte in slice {
+        serial.putchar(byte as char);
+    }
+    len
 }
 
-//------------------------------------------------------------------------------
+/// Syscall 2: read(int fd, void *buf, size_t len) → bytes read.
+///
+/// Stub — not yet implemented.  Returns -1.
+fn sys_read(_fd: u64, _buf: u64, _len: u64, _: u64) -> u64 {
+    u64::MAX
+}
+
+/// Syscall 3: getpid() → process ID.
+fn sys_getpid(_: u64, _: u64, _: u64, _: u64) -> u64 {
+    1  // PID 1 for the init process
+}
+
+//==============================================================================
 // Public API
-//------------------------------------------------------------------------------
+//==============================================================================
 
 /// Register a syscall handler.
 ///
@@ -60,13 +86,15 @@ pub fn register(num: usize, handler: SyscallFn) -> bool {
 ///
 /// Registers built-in handlers.  Called once during boot.
 pub fn init() {
-    register(0, sys_test);
+    register(0, sys_exit);
     register(1, sys_write);
+    register(2, sys_read);
+    register(3, sys_getpid);
 }
 
-//------------------------------------------------------------------------------
+//==============================================================================
 // Dispatch — called from assembly
-//------------------------------------------------------------------------------
+//==============================================================================
 
 /// Called from `syscall_entry.asm`.
 ///

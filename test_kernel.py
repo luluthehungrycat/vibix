@@ -13,10 +13,16 @@ CHECKLIST = {
     "PMM: Test passed.":                  "PMM self-test",
     "KMM: Test OK — freed block reused.":  "Heap allocator (reuse)",
     "KMM: Coalescing OK — single free block.": "Heap allocator (coalescing)",
+    "PAGING: Test passed.":               "Paging self-test",
     "VIBIX: IDT loaded":                  "IDT initialization",
     "VIBIX: PIT timer initialised":       "PIT timer init",
+    "VIBIX: Loading GDT/TSS":             "GDT/TSS and SYSCALL setup",
     "VIBIX: Enabling interrupts.":        "Interrupts enabled",
-    "VIBIX: PIT tick #100":              "PIT timer ticks",
+    "VIBIX: Boot sequence complete":      "Boot sequence",
+    "VIBIX: Entering user mode...":       "User mode entry",
+    "Hello, world!":                      "User-mode init output",
+    "From PID 1 (init)":                  "Init process message",
+    "VIBIX: init exited with code":       "Init exit",
 }
 
 OPTIONAL = {
