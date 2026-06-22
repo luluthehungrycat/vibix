@@ -10,6 +10,7 @@
 // font.
 //==============================================================================
 
+use crate::paging;
 use crate::pmm::PmmAllocator;
 use crate::serial::SerialPort;
 
@@ -140,7 +141,10 @@ fn init_vbe(pmm: &mut PmmAllocator, serial: &mut SerialPort) -> Option<Framebuff
 
     // ── Map the framebuffer ────────────────────────────────────────────────
     let fb_size = (pitch as u64) * (height as u64);
-    map_framebuffer(fb_addr, fb_size as usize, pmm);
+    paging::map_range_2m(
+        fb_addr, fb_addr, fb_size as usize,
+        paging::PAGE_KERNEL_HUGE, pmm,
+    );
 
     Some(Framebuffer { address: fb_addr, pitch, width, height, bpp })
 }
@@ -238,65 +242,7 @@ impl Framebuffer {
     }
 }
 
-//==============================================================================
-// Page table manipulation (4-level paging)
-//==============================================================================
 
-const PAGE_PRESENT: u64  = 1 << 0;
-const PAGE_WRITABLE: u64 = 1 << 1;
-const PAGE_HUGE: u64     = 1 << 7;
-const PAGE_FLAGS: u64    = PAGE_PRESENT | PAGE_WRITABLE;
-
-/// Identity-map physical 2 MiB pages covering the framebuffer address range.
-fn map_framebuffer(fb_phys: u64, fb_size: usize, pmm: &mut PmmAllocator) {
-    let start = fb_phys & !0x1FFFFF;
-    let end   = (fb_phys + fb_size as u64 + 0x1FFFFF) & !0x1FFFFF;
-    let count = ((end - start) / 0x200000) as usize;
-    if count == 0 {
-        return;
-    }
-
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
-    let l4 = unsafe { &mut *(cr3 as *mut [u64; 512]) };
-
-    for i in 0..count {
-        let vaddr = start + (i as u64) * 0x200000;
-        let paddr = start + (i as u64) * 0x200000;
-
-        let l4i = ((vaddr >> 39) & 0x1FF) as usize;
-        let l3i = ((vaddr >> 30) & 0x1FF) as usize;
-        let l2i = ((vaddr >> 21) & 0x1FF) as usize;
-
-        let l3 = get_or_create_table(&mut l4[l4i], pmm);
-        let l2 = get_or_create_table(&mut l3[l3i], pmm);
-
-        if l2[l2i] & PAGE_PRESENT != 0 {
-            continue;
-        }
-        l2[l2i] = paddr | PAGE_FLAGS | PAGE_HUGE;
-
-        unsafe {
-            core::arch::asm!("invlpg [{v}]", v = in(reg) vaddr, options(nostack, preserves_flags));
-        }
-    }
-}
-
-/// Return the next-level page table (allocating and wiring it if absent).
-fn get_or_create_table<'e>(entry: &'e mut u64, pmm: &mut PmmAllocator) -> &'e mut [u64; 512] {
-    if *entry & PAGE_PRESENT != 0 {
-        let addr = *entry & 0x000FFFFF_FFFFF000;
-        return unsafe { &mut *(addr as *mut [u64; 512]) };
-    }
-    let page = pmm.alloc();
-    if page.is_null() {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
-    }
-    let table = unsafe { &mut *(page as *mut [u64; 512]) };
-    for slot in table.iter_mut() { *slot = 0; }
-    *entry = (page as u64) | PAGE_FLAGS;
-    table
-}
 
 //==============================================================================
 // 8×16 Bitmap Font (ASCII 0x20–0x7E)

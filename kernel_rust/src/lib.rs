@@ -17,6 +17,7 @@ mod keyboard;
 mod fb;
 mod gdt;
 mod syscall;
+mod paging;
 
 use core::panic::PanicInfo;
 
@@ -60,6 +61,9 @@ pub extern "C" fn kernel_main() -> ! {
     // Kernel Heap Allocator
     kmm::init(&mut pmm);
     kmm::test(&mut serial);
+
+    // Page Table Manager
+    paging::test(&mut pmm, &mut serial);
 
     // Framebuffer (Bochs VBE direct programming)
     match fb::init(&mut pmm, &mut serial) {
