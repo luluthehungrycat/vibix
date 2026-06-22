@@ -18,6 +18,9 @@ const SERIAL_LSR: u16       = 5;
 
 const SERIAL_LSR_THR_EMPTY: u8 = 1 << 5;
 
+/// Bit 0 of LSR: Data Ready (receiver has data).
+const SERIAL_LSR_DATA_READY: u8 = 0x01;
+
 //--- Port I/O helpers (inline asm) ------------------------------------------
 
 #[inline]
@@ -91,6 +94,32 @@ impl SerialPort {
                 self.putchar(byte as char);
             }
         }
+    }
+
+    /// Try to read a single byte.  Returns `None` if no data is available
+    /// (non-blocking).
+    pub fn getchar(&self) -> Option<u8> {
+        if inb(self.base + SERIAL_LSR) & SERIAL_LSR_DATA_READY != 0 {
+            Some(inb(self.base + SERIAL_DATA))
+        } else {
+            None
+        }
+    }
+
+    /// Non-blocking read: copy available bytes from the serial receive buffer
+    /// into `buf`.  Returns the number of bytes read (0 if empty).
+    pub fn read(&self, buf: &mut [u8]) -> usize {
+        let mut count = 0usize;
+        while count < buf.len() {
+            match self.getchar() {
+                Some(byte) => {
+                    buf[count] = byte;
+                    count += 1;
+                }
+                None => break,
+            }
+        }
+        count
     }
 }
 

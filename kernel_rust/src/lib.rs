@@ -104,6 +104,14 @@ pub extern "C" fn kernel_main() -> ! {
     pit::init();
     serial.writestrs(&["VIBIX: PIT timer initialised at 100 Hz.\n"]);
 
+    // Mask keyboard IRQ — we route input through the serial port instead.
+    interrupts::mask_irq(1);
+    serial.writestrs(&["VIBIX: Keyboard IRQ masked — using serial for input.\n"]);
+
+    // Initialize PS/2 keyboard
+    keyboard::init();
+    serial.writestrs(&["VIBIX: PS/2 keyboard initialised.\n"]);
+
     // GDT, TSS, and syscall MSR setup
     serial.writestrs(&["VIBIX: Loading GDT/TSS and enabling SYSCALL.\n"]);
     extern "C" {

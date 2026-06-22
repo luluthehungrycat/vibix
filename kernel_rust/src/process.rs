@@ -16,13 +16,16 @@ use crate::pmm::PmmAllocator;
 /// Virtual address where the user init binary is loaded.
 const USER_CODE_ADDR: u64 = 0x2000000;   // 32 MiB
 
-/// Virtual address for the user stack page (grows downward from +0x1000).
-const USER_STACK_ADDR: u64 = 0x2001000;  // 32 MiB + 4 KiB
+/// Number of 4 KiB pages mapped for user code.
+const USER_CODE_PAGES: u64 = 2;
 
-/// Embedded flat binary — assembled by NASM from kernel/userspace_blob.asm.
+/// Virtual address for the user stack page (grows downward from +0x1000).
+const USER_STACK_ADDR: u64 = 0x2002000;  // 32 MiB + 8 KiB
+
+/// Embedded flat binary — assembled by NASM from userspace/vibix_blob.asm.
 /// Contains all GVIBU-ported commands with a dispatch table.  The kernel
 /// selects a command by setting rdi = command_id before entering user mode.
-static USER_INIT_BIN: &[u8] = include_bytes!("../../userspace_blob.bin");
+static USER_INIT_BIN: &[u8] = include_bytes!("../../userspace/vibix_blob.bin");
 
 //------------------------------------------------------------------------------
 // Process descriptor
@@ -46,17 +49,30 @@ pub struct Process {
 /// both pages in the active address space with the USER flag so Ring 3 can
 /// access them.
 pub fn create_init(pmm: &mut PmmAllocator) -> Process {
-    // ── Load user binary ──────────────────────────────────────────────────
-    let code_page = pmm.alloc();
-    if code_page.is_null() {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+    // ── Load user binary (spans up to USER_CODE_PAGES) ─────────────────────
+    use core::cmp::min;
+    let mut bytes_left = USER_INIT_BIN.len();
+    let mut src_offset = 0usize;
+    let mut virt_addr = USER_CODE_ADDR;
+
+    for _page_i in 0..USER_CODE_PAGES {
+        let page = pmm.alloc();
+        if page.is_null() {
+            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        }
+        let copy_len = min(bytes_left, 0x1000);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                USER_INIT_BIN.as_ptr().add(src_offset),
+                page,
+                copy_len,
+            );
+        }
+        paging::map_4k(virt_addr, page as u64, paging::PAGE_USER_RW, pmm);
+        src_offset += 0x1000;
+        virt_addr += 0x1000;
+        bytes_left = bytes_left.saturating_sub(0x1000);
     }
-    // Copy the embedded binary to the allocated physical page.
-    unsafe {
-        core::ptr::copy_nonoverlapping(USER_INIT_BIN.as_ptr(), code_page, USER_INIT_BIN.len());
-    }
-    // Map with USER + RW so Ring 3 can read/execute.
-    paging::map_4k(USER_CODE_ADDR, code_page as u64, paging::PAGE_USER_RW, pmm);
 
     // ── Set up user stack ─────────────────────────────────────────────────
     let stack_page = pmm.alloc();

@@ -12,7 +12,6 @@
 
 use core::fmt::Write;
 use crate::serial::SerialPort;
-use crate::keyboard;
 use crate::paging;
 use crate::pmm;
 
@@ -58,7 +57,7 @@ fn sys_write(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
 
 /// Syscall 2: read(int fd, void *buf, size_t len) → bytes read.
 ///
-/// fd=0 (stdin) reads from the keyboard buffer.
+/// fd=0 (stdin) reads from the serial port (COM1).
 /// Other fds return -1 (unsupported).
 fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
     if fd != 0 {
@@ -68,7 +67,8 @@ fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
         return 0;
     }
     let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-    keyboard::read(slice) as u64
+    let serial = SerialPort::new();
+    serial.read(slice) as u64
 }
 
 /// Syscall 3: getpid() → process ID.
