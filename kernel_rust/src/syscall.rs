@@ -57,7 +57,9 @@ fn sys_write(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
 
 /// Syscall 2: read(int fd, void *buf, size_t len) → bytes read.
 ///
-/// fd=0 (stdin) reads from the serial port (COM1).
+/// fd=0 (stdin) reads from:
+///   1. PS/2 keyboard ring buffer (IRQ1 — used with QEMU graphical display)
+///   2. Fall back to serial port COM1 (used with `-serial stdio`)
 /// Other fds return -1 (unsupported).
 fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
     if fd != 0 {
@@ -67,8 +69,17 @@ fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
         return 0;
     }
     let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-    let serial = SerialPort::new();
-    serial.read(slice) as u64
+
+    // Try PS/2 keyboard ring buffer first.
+    let mut count = crate::keyboard::read(slice);
+
+    // Fall back to serial port (COM1) if keyboard had no data.
+    if count == 0 {
+        let serial = SerialPort::new();
+        count = serial.read(slice);
+    }
+
+    count as u64
 }
 
 /// Syscall 3: getpid() → process ID.
