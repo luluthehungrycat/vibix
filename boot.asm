@@ -6,9 +6,9 @@
 ;   2. Handles the 32→64 bit long-mode transition.
 ;   3. Embeds the 64-bit kernel binary (kernel64.bin) via incbin.
 ;
-; The 64-bit C code is compiled separately and linked as a flat binary,
+; The 64-bit Rust kernel is compiled separately and linked as a flat binary,
 ; then stitched in here as a .kernel64 section so the ELF32 loader places it
-; at 0x101000 — exactly where the transition code jumps to.
+; at 0x200000 — exactly where the transition code jumps to.
 ;==============================================================================
 
 bits 32
@@ -16,7 +16,7 @@ section .text
 
 ; ── Multiboot v1 header ────────────────────────────────────────────────────
 MB1_MAGIC       equ 0x1BADB002
-MB1_FLAGS       equ 0x00000003
+MB1_FLAGS       equ 0x00000003     ; bit 0 = align, bit 1 = mem map
 MB1_CHECKSUM    equ -(MB1_MAGIC + MB1_FLAGS)
 
 align 4
@@ -28,8 +28,9 @@ mb1_header:
 ; ── Entry point ────────────────────────────────────────────────────────────
 global _start
 _start:
-    ; Save Multiboot info for later (memory-map parsing etc.).
-    mov [saved_mb_info], esi
+    ; Save Multiboot info pointer at a fixed physical address (below 1 MB)
+    ; so the 64-bit Rust kernel can read it later.
+    mov [0x5000], ebx
 
     ; ── Build 4-level page tables (identity-map first 2 MB) ───────────────
     mov edi, page_table_l4
@@ -116,15 +117,12 @@ page_table_l3:
 page_table_l2:
     resb 4096
 
-saved_mb_info:
-    resd 1
-
 stack_bottom:
     resb 16384
 stack_top:
 
 ;==============================================================================
-; Embedded 64-bit kernel binary, loaded by the ELF32 loader at 0x101000.
+; Embedded 64-bit kernel binary, loaded by the ELF32 loader at 0x200000.
 ;==============================================================================
 section .kernel64 align=4096
     incbin "kernel64.bin"

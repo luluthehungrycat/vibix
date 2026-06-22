@@ -20,7 +20,10 @@ _start64:
     ; 32-bit ELF's page tables at 0x201000).
     mov rsp, stack_top
 
-    ; Hand off to C — individual modules zero their own BSS as needed.
+    ; BSS zeroing NOT done: the 64-bit kernel .bss lives in the same physical
+    ; address space as the 32-bit boot page tables (at 0x209000+).  Zeroing the
+    ; 64-bit .bss would clobber the active long-mode page tables.
+    ; Rust modules zero their own .bss statics at init (PMM_BITMAP, IDT, etc.).
     extern kernel_main
     call kernel_main
 

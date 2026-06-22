@@ -68,6 +68,116 @@ ISR_ERR 17      ; Alignment Check
 ISR_ERR 21      ; Control Protection Exception
 
 ;------------------------------------------------------------------------------
+; IRQ stubs — one per PIC IRQ line (0..15), mapped to vectors 32..47
+;------------------------------------------------------------------------------
+
+%macro IRQ 2
+global irq%1
+irq%1:
+    push 0          ; dummy error code
+    push %2         ; interrupt vector (32 + IRQ#)
+    jmp irq_common
+%endmacro
+
+IRQ 0, 32
+IRQ 1, 33
+IRQ 2, 34
+IRQ 3, 35
+IRQ 4, 36
+IRQ 5, 37
+IRQ 6, 38
+IRQ 7, 39
+IRQ 8, 40
+IRQ 9, 41
+IRQ 10, 42
+IRQ 11, 43
+IRQ 12, 44
+IRQ 13, 45
+IRQ 14, 46
+IRQ 15, 47
+
+;------------------------------------------------------------------------------
+; IRQ common handler — saves volatile registers, calls Rust handler,
+; sends EOI to the master PIC (and slave if needed), restores, iretq.
+;------------------------------------------------------------------------------
+; Stack layout when irq_common runs:
+;   [rsp+0]   = r15              ← pushed last (rsp points here)
+;   [rsp+8]   = r14
+;   ...
+;   [rsp+112] = rax
+;   [rsp+120] = int_no
+;   [rsp+128] = err_code (dummy 0)
+;   [rsp+136] = rip
+;   [rsp+144] = cs
+;   [rsp+152] = rflags
+;------------------------------------------------------------------------------
+
+irq_common:
+    ; Save all volatile registers
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rdi
+    push rsi
+    push rbp
+    push rbx
+    push rdx
+    push rcx
+    push rax
+
+    ; First argument = frame pointer (rsp points to saved r15)
+    mov rdi, rsp
+
+    ; Call the Rust IRQ handler
+    extern irq_handler
+    call irq_handler
+
+    ; Send End-Of-Interrupt to the master PIC (port 0x20)
+    ; For slave IRQs (8-15), also send to slave PIC (port 0xA0).
+    ; Check int_no value still on stack after registers restored... easier:
+    ; check if int_no >= 40 (slave IRQs are vectors 40-47).
+    mov al, 0x20        ; EOI value
+    out 0x20, al        ; always send to master
+
+    ; Check frame->int_no (it's at rsp + 15*8 + 8 after register push)
+    ; Actually let's recover int_no from the stack: it was pushed before registers.
+    ; After saving regs, int_no is at [rsp + 15*8] = [rsp + 120]
+    mov rax, [rsp + 120]
+    cmp rax, 40
+    jb .eoi_done
+    mov al, 0x20
+    out 0xA0, al        ; send EOI to slave too
+.eoi_done:
+
+    ; Restore registers (reverse order)
+    pop rax
+    pop rcx
+    pop rdx
+    pop rbx
+    pop rbp
+    pop rsi
+    pop rdi
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    ; Clean up int_no and err_code pushed by IRQ stub
+    add rsp, 16
+
+    ; Return to interrupted code
+    iretq
+
+;------------------------------------------------------------------------------
 ; Common handler — saves all volatile registers, calls Rust handler,
 ; restores registers, and returns via iretq.
 ;------------------------------------------------------------------------------

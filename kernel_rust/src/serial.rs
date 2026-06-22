@@ -54,17 +54,32 @@ impl SerialPort {
         outb(self.base + SERIAL_MCR,  0x0B);   // DTR+RTS+OUT2
     }
 
-    /// Write a single character — spin until THR empty.
-    pub fn putchar(&mut self, c: char) {
-        // Wait for the transmit-holding-register to be empty.
-        while (inb(self.base + SERIAL_LSR) & SERIAL_LSR_THR_EMPTY) == 0 {}
+    /// Max iterations to spin-wait for THR empty before giving up.
+    const PUTCHAR_TIMEOUT: u32 = 1_000_000;
 
+    /// Write a single character — spin until THR empty (with timeout).
+    pub fn putchar(&mut self, c: char) {
         let byte = c as u8;
+
+        // Wait for the transmit-holding-register to be empty.
+        let mut timeout = Self::PUTCHAR_TIMEOUT;
+        while (inb(self.base + SERIAL_LSR) & SERIAL_LSR_THR_EMPTY) == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                return;  // give up — don't hang
+            }
+        }
         outb(self.base + SERIAL_DATA, byte);
 
         // Carriage-return before newline — many serial consoles need it.
         if c == '\n' {
-            while (inb(self.base + SERIAL_LSR) & SERIAL_LSR_THR_EMPTY) == 0 {}
+            let mut timeout = Self::PUTCHAR_TIMEOUT;
+            while (inb(self.base + SERIAL_LSR) & SERIAL_LSR_THR_EMPTY) == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    return;
+                }
+            }
             outb(self.base + SERIAL_DATA, b'\r');
         }
     }

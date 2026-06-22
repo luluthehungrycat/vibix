@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+
+# Pin a specific version for reproducible builds:
+# channel = "1.95.0"

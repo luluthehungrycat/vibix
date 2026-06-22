@@ -8,17 +8,58 @@ import tempfile
 QEMU = "/usr/bin/qemu-system-x86_64"
 
 
+CHECKLIST = {
+    "VIBIX: Kernel alive!":               "Kernel boot",
+    "PMM: Test passed.":                  "PMM self-test",
+    "KMM: Test OK — freed block reused.":  "Heap allocator (reuse)",
+    "KMM: Coalescing OK — single free block.": "Heap allocator (coalescing)",
+    "VIBIX: IDT loaded":                  "IDT initialization",
+    "VIBIX: PIT timer initialised":       "PIT timer init",
+    "VIBIX: Enabling interrupts.":        "Interrupts enabled",
+    "VIBIX: PIT tick #100":              "PIT timer ticks",
+}
+
+OPTIONAL = {
+    "VIBIX: Multiboot memory map:":       "Multiboot memory map",
+    "VIBIX: EXCEPTION:":                  "Exception handler (future)",
+}
+
+
+def verify_serial(serial_output):
+    """Run all checks against serial output. Returns (ok, failure_count)."""
+    all_ok = True
+    failed = 0
+    for marker, label in CHECKLIST.items():
+        if marker in serial_output:
+            print(f"  ✅ {label}")
+        else:
+            print(f"  ❌ {label} (missing: {marker!r})")
+            all_ok = False
+            failed += 1
+    for marker, label in OPTIONAL.items():
+        if marker in serial_output:
+            print(f"  ◇ {label}")
+        else:
+            print(f"  · {label} (absent)")
+    return all_ok, failed
+
+
 def test_kernel_alive():
     print("🧪 Testing VIBIX kernel...")
 
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".serial", delete=False) as f:
         serial_path = f.name
 
+    # Try KVM first, fall back to TCG
+    accel = "kvm"
+    if not os.path.exists("/dev/kvm"):
+        accel = "tcg"
+
     try:
         result = subprocess.run(
             [
                 QEMU,
-                "-accel", "tcg",
+                "-accel", accel,
                 "-kernel", "vibix.elf",
                 "-serial", f"file:{serial_path}",
                 "-display", "none",
@@ -34,22 +75,27 @@ def test_kernel_alive():
         with open(serial_path, "r") as f:
             serial_output = f.read()
 
-        if "VIBIX: Kernel alive!" in serial_output:
-            print("✅ Test passed: Kernel printed alive message.")
+        ok, _ = verify_serial(serial_output)
+        if ok:
+            print("✅ All boot sequence checks passed.")
             return True
         else:
-            print("❌ Test failed: Kernel did not print alive message.")
-            print("Serial output:", repr(serial_output))
+            print("❌ Some checks failed.")
+            print("Full serial output:", repr(serial_output))
             return False
 
     except subprocess.TimeoutExpired:
-        # Timed out — the kernel should still have written to the serial file
         if os.path.exists(serial_path):
             with open(serial_path, "r") as f:
                 serial_output = f.read()
-            if "VIBIX: Kernel alive!" in serial_output:
-                print("✅ Test passed (timeout): Kernel printed alive message.")
+            ok, failed = verify_serial(serial_output)
+            if ok:
+                print("✅ Test passed: all checks passed.")
                 return True
+            else:
+                print(f"❌ Test failed: {failed} check(s) failed.")
+                print("Full serial output:", repr(serial_output))
+                return False
         print("❌ Test failed: QEMU timed out (kernel likely hung).")
         return False
     except Exception as e:

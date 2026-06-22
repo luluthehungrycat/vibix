@@ -16,7 +16,9 @@ SECTIONS
     .rodata : { *(.rodata) }
     .data : { *(.data) }
 
-    _bss_start = .;
-    .bss : { *(COMMON) *(.bss) *(.bss.*) }
+    .bss : {
+        _bss_start = .;
+        *(COMMON) *(.bss) *(.bss.*)
+    }
     _bss_end = .;
 }

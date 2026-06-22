@@ -138,6 +138,35 @@ static ISR_STUBS: [unsafe extern "C" fn(); 32] = [
 ];
 
 //------------------------------------------------------------------------------
+// External IRQ entry points (from interrupts.asm)
+//------------------------------------------------------------------------------
+
+extern "C" {
+    fn irq0();
+    fn irq1();
+    fn irq2();
+    fn irq3();
+    fn irq4();
+    fn irq5();
+    fn irq6();
+    fn irq7();
+    fn irq8();
+    fn irq9();
+    fn irq10();
+    fn irq11();
+    fn irq12();
+    fn irq13();
+    fn irq14();
+    fn irq15();
+}
+
+/// Array of IRQ entry points, indexed by IRQ number.
+static IRQ_STUBS: [unsafe extern "C" fn(); 16] = [
+    irq0,  irq1,  irq2,  irq3,  irq4,  irq5,  irq6,  irq7,
+    irq8,  irq9,  irq10, irq11, irq12, irq13, irq14, irq15,
+];
+
+//------------------------------------------------------------------------------
 // Register frame (matches stack layout in interrupts.asm)
 //------------------------------------------------------------------------------
 
@@ -229,21 +258,32 @@ unsafe fn inb(port: u16) -> u8 {
 static mut IDT: Idt = Idt::new();
 
 /// Load the IDT via the `lidt` instruction.
+///
+/// The `IdtDescriptor` is a local variable holding the limit + base pointer.
+/// We pass its address in a register so `lidt` can read the 10-byte descriptor.
 unsafe fn load_idt(idt: &Idt) {
     let desc = IdtDescriptor {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: idt as *const Idt as u64,
     };
-    // AT&T syntax: lidt loads from memory operand
-    core::arch::asm!("lidt ({0})", in(reg) &desc, options(nostack, preserves_flags));
+    let ptr = &desc as *const IdtDescriptor;
+    // Intel-syntax memory operand `[reg]` is accepted by LLVM's assembler
+    // and avoids AT&T register-prefix issues with template substitution.
+    core::arch::asm!(
+        "lidt [{ptr}]",
+        ptr = in(reg) ptr,
+        options(nostack, preserves_flags),
+    );
 }
 
 /// Enable interrupts (sti).
+#[allow(dead_code)]
 pub unsafe fn enable_interrupts() {
     core::arch::asm!("sti", options(nostack, preserves_flags));
 }
 
 /// Disable interrupts (cli).
+#[allow(dead_code)]
 pub unsafe fn disable_interrupts() {
     core::arch::asm!("cli", options(nostack, preserves_flags));
 }
@@ -259,19 +299,25 @@ pub fn init_interrupts() {
     let selector = 0x08;  // kernel code segment from GDT
 
     unsafe {
-        let idt = &mut IDT;
+        let idt: *mut Idt = &raw mut IDT;
 
         // Set up handlers for CPU exceptions 0–31
         for i in 0..32 {
             let handler = ISR_STUBS[i] as u64;
-            idt.set(i, handler, selector, 0);  // dpl = 0 (kernel)
+            (*idt).set(i, handler, selector, 0);  // dpl = 0 (kernel)
+        }
+
+        // Set up handlers for PIC IRQs 0–15 at vectors 32–47
+        for i in 0..16 {
+            let handler = IRQ_STUBS[i] as u64;
+            (*idt).set(32 + i, handler, selector, 0);  // dpl = 0 (kernel)
         }
 
         // Remap PIC to put IRQs at vectors 0x20–0x2F (32–47)
         remap_pic(0x20, 0x28);
 
         // Load the IDT
-        load_idt(idt);
+        load_idt(&*idt);
     }
 }
 
@@ -346,56 +392,51 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
         "Unknown"
     };
 
-    // Build panic message manually (avoid fmt machinery in exception context)
     serial.writestrs(&["\n========================================\n"]);
     serial.writestrs(&["VIBIX: EXCEPTION: "]);
-    serial.writestrs(&[name, " (", "\n"]);
-    // Print int_no - use integer to byte conversion
-    let _ = write!(serial, "VIBIX: Exception #{}: {}\n", int_no, name);
+    let _ = write!(serial, "{} (#{})\n", name, int_no);
 
-    let rip_hex = core::str::from_utf8(&hex_str(frame.rip)).unwrap_or("???");
-    let cs_hex  = core::str::from_utf8(&hex_str(frame.cs)).unwrap_or("???");
-    let rflags_hex = core::str::from_utf8(&hex_str(frame.rflags)).unwrap_or("???");
-    let err_hex = core::str::from_utf8(&hex_str(frame.err_code)).unwrap_or("???");
-
-    serial.writestrs(&["VIBIX:   RIP: ", rip_hex, "\n"]);
-    serial.writestrs(&["VIBIX:    CS: ", cs_hex, "\n"]);
-    serial.writestrs(&["VIBIX: RFLAGS: ", rflags_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   ERR: ", err_hex, "\n"]);
+    let rip_buf = hex_str(frame.rip);
+    serial.writestrs(&["VIBIX:   RIP: ", core::str::from_utf8(&rip_buf).unwrap_or("???"), "\n"]);
+    let cs_buf = hex_str(frame.cs);
+    serial.writestrs(&["VIBIX:    CS: ", core::str::from_utf8(&cs_buf).unwrap_or("???"), "\n"]);
+    let rflags_buf = hex_str(frame.rflags);
+    serial.writestrs(&["VIBIX: RFLAGS: ", core::str::from_utf8(&rflags_buf).unwrap_or("???"), "\n"]);
+    let err_buf = hex_str(frame.err_code);
+    serial.writestrs(&["VIBIX:   ERR: ", core::str::from_utf8(&err_buf).unwrap_or("???"), "\n"]);
 
     // Print saved registers
     serial.writestrs(&["VIBIX: Registers:\n"]);
-    let rax_hex = core::str::from_utf8(&hex_str(frame.regs.rax)).unwrap_or("???");
-    let rbx_hex = core::str::from_utf8(&hex_str(frame.regs.rbx)).unwrap_or("???");
-    let rcx_hex = core::str::from_utf8(&hex_str(frame.regs.rcx)).unwrap_or("???");
-    let rdx_hex = core::str::from_utf8(&hex_str(frame.regs.rdx)).unwrap_or("???");
-    let rsi_hex = core::str::from_utf8(&hex_str(frame.regs.rsi)).unwrap_or("???");
-    let rdi_hex = core::str::from_utf8(&hex_str(frame.regs.rdi)).unwrap_or("???");
-    let rbp_hex = core::str::from_utf8(&hex_str(frame.regs.rbp)).unwrap_or("???");
-    let r8_hex  = core::str::from_utf8(&hex_str(frame.regs.r8)).unwrap_or("???");
-    let r9_hex  = core::str::from_utf8(&hex_str(frame.regs.r9)).unwrap_or("???");
-    let r10_hex = core::str::from_utf8(&hex_str(frame.regs.r10)).unwrap_or("???");
-    let r11_hex = core::str::from_utf8(&hex_str(frame.regs.r11)).unwrap_or("???");
-    let r12_hex = core::str::from_utf8(&hex_str(frame.regs.r12)).unwrap_or("???");
-    let r13_hex = core::str::from_utf8(&hex_str(frame.regs.r13)).unwrap_or("???");
-    let r14_hex = core::str::from_utf8(&hex_str(frame.regs.r14)).unwrap_or("???");
-    let r15_hex = core::str::from_utf8(&hex_str(frame.regs.r15)).unwrap_or("???");
-
-    serial.writestrs(&["VIBIX:   RAX: ", rax_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RBX: ", rbx_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RCX: ", rcx_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RDX: ", rdx_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RSI: ", rsi_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RDI: ", rdi_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   RBP: ", rbp_hex, "\n"]);
-    serial.writestrs(&["VIBIX:    R8: ", r8_hex, "\n"]);
-    serial.writestrs(&["VIBIX:    R9: ", r9_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R10: ", r10_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R11: ", r11_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R12: ", r12_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R13: ", r13_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R14: ", r14_hex, "\n"]);
-    serial.writestrs(&["VIBIX:   R15: ", r15_hex, "\n"]);
+    let rax_buf = hex_str(frame.regs.rax);
+    serial.writestrs(&["VIBIX:   RAX: ", core::str::from_utf8(&rax_buf).unwrap_or("???"), "\n"]);
+    let rbx_buf = hex_str(frame.regs.rbx);
+    serial.writestrs(&["VIBIX:   RBX: ", core::str::from_utf8(&rbx_buf).unwrap_or("???"), "\n"]);
+    let rcx_buf = hex_str(frame.regs.rcx);
+    serial.writestrs(&["VIBIX:   RCX: ", core::str::from_utf8(&rcx_buf).unwrap_or("???"), "\n"]);
+    let rdx_buf = hex_str(frame.regs.rdx);
+    serial.writestrs(&["VIBIX:   RDX: ", core::str::from_utf8(&rdx_buf).unwrap_or("???"), "\n"]);
+    let rsi_buf = hex_str(frame.regs.rsi);
+    serial.writestrs(&["VIBIX:   RSI: ", core::str::from_utf8(&rsi_buf).unwrap_or("???"), "\n"]);
+    let rdi_buf = hex_str(frame.regs.rdi);
+    serial.writestrs(&["VIBIX:   RDI: ", core::str::from_utf8(&rdi_buf).unwrap_or("???"), "\n"]);
+    let rbp_buf = hex_str(frame.regs.rbp);
+    serial.writestrs(&["VIBIX:   RBP: ", core::str::from_utf8(&rbp_buf).unwrap_or("???"), "\n"]);
+    let r8_buf = hex_str(frame.regs.r8);
+    serial.writestrs(&["VIBIX:    R8: ", core::str::from_utf8(&r8_buf).unwrap_or("???"), "\n"]);
+    let r9_buf = hex_str(frame.regs.r9);
+    serial.writestrs(&["VIBIX:    R9: ", core::str::from_utf8(&r9_buf).unwrap_or("???"), "\n"]);
+    let r10_buf = hex_str(frame.regs.r10);
+    serial.writestrs(&["VIBIX:   R10: ", core::str::from_utf8(&r10_buf).unwrap_or("???"), "\n"]);
+    let r11_buf = hex_str(frame.regs.r11);
+    serial.writestrs(&["VIBIX:   R11: ", core::str::from_utf8(&r11_buf).unwrap_or("???"), "\n"]);
+    let r12_buf = hex_str(frame.regs.r12);
+    serial.writestrs(&["VIBIX:   R12: ", core::str::from_utf8(&r12_buf).unwrap_or("???"), "\n"]);
+    let r13_buf = hex_str(frame.regs.r13);
+    serial.writestrs(&["VIBIX:   R13: ", core::str::from_utf8(&r13_buf).unwrap_or("???"), "\n"]);
+    let r14_buf = hex_str(frame.regs.r14);
+    serial.writestrs(&["VIBIX:   R14: ", core::str::from_utf8(&r14_buf).unwrap_or("???"), "\n"]);
+    let r15_buf = hex_str(frame.regs.r15);
+    serial.writestrs(&["VIBIX:   R15: ", core::str::from_utf8(&r15_buf).unwrap_or("???"), "\n"]);
 
     serial.writestrs(&["========================================\n"]);
 
@@ -403,5 +444,21 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     // could be handled differently in the future).
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+    }
+}
+
+//------------------------------------------------------------------------------
+// IRQ handler — called from assembly irq_common
+//------------------------------------------------------------------------------
+
+/// Called from the assembly `irq_common` handler.
+/// Dispatches to the appropriate device driver based on IRQ number.
+#[no_mangle]
+pub extern "C" fn irq_handler(frame: &InterruptFrame) {
+    let irq = frame.int_no.wrapping_sub(32);  // PIC offset 0x20 → 0..15
+    match irq {
+        0 => crate::pit::tick(),
+        1 => crate::keyboard::handle_keyboard(),
+        _ => {}  // unknown/spurious IRQ — ignore
     }
 }
