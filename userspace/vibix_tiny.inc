@@ -1,16 +1,28 @@
 ; void true_cmd(int argc, const char **argv)
-; Exit with code 0.
+; Exit with code 0 — entry point for direct dispatch.
 true_cmd:
-    xor rdi, rdi
-    mov rax, 0
+    xor edi, edi
+    mov eax, 0
     syscall
 
 ; void false_cmd(int argc, const char **argv)
-; Exit with code 1.
+; Exit with code 1 — entry point for direct dispatch.
 false_cmd:
-    mov rdi, 1
-    mov rax, 0
+    mov edi, 1
+    mov eax, 0
     syscall
+
+; int true_func(int argc, const char **argv, const char **envp)
+; Callable from a shell — returns 0 (does not exit).
+true_func:
+    xor eax, eax
+    ret
+
+; int false_func(int argc, const char **argv, const char **envp)
+; Callable from a shell — returns 1 (does not exit).
+false_func:
+    mov eax, 1
+    ret
 
 ; void yes_cmd(int argc, const char **argv)
 ; Repeatedly write "y\n" to stdout until killed.

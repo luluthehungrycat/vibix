@@ -6,9 +6,10 @@ write_str:
     push r13
     push r14
     push r15
-    push rdi
-    push rsi
-    call strlen         ; uses rdi (set to rsi from push below)
+    push rdi                        ; save fd
+    push rsi                        ; save buf
+    mov rdi, rsi                    ; strlen expects buf in rdi
+    call strlen
     mov rdx, rax
     pop rsi
     pop rdi
