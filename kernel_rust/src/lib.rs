@@ -104,13 +104,11 @@ pub extern "C" fn kernel_main() -> ! {
     pit::init();
     serial.writestrs(&["VIBIX: PIT timer initialised at 100 Hz.\n"]);
 
-    // Mask keyboard IRQ — we route input through the serial port instead.
-    interrupts::mask_irq(1);
-    serial.writestrs(&["VIBIX: Keyboard IRQ masked — using serial for input.\n"]);
-
     // Initialize PS/2 keyboard
     keyboard::init();
-    serial.writestrs(&["VIBIX: PS/2 keyboard initialised.\n"]);
+    serial.writestrs(&["VIBIX: PS/2 keyboard ready.\n"]);
+    interrupts::unmask_irq(1);
+    serial.writestrs(&["VIBIX: Keyboard IRQ unmasked -- PS/2 input active.\n"]);
 
     // GDT, TSS, and syscall MSR setup
     serial.writestrs(&["VIBIX: Loading GDT/TSS and enabling SYSCALL.\n"]);
@@ -128,12 +126,13 @@ pub extern "C" fn kernel_main() -> ! {
         "VIBIX: Boot sequence complete — spawning PID 1.\n",
     ]);
 
-    // Create the init process from the embedded flat binary
-    let proc = process::create_init(&mut pmm);
+    // Create the init process
+    let init_pid = process::spawn_init(&mut pmm);
+    serial.writestrs(&["VIBIX: Created PID 1 (init).\n"]);
 
-    // Enter user mode (Ring 3) — never returns
-    serial.writestrs(&["VIBIX: Entering user mode...\n"]);
-    unsafe { process::enter_user_mode(&proc); }
+    // Start the scheduler — never returns
+    serial.writestrs(&["VIBIX: Starting scheduler...\n"]);
+    unsafe { process::start_scheduler(init_pid); }
 }
 
 //------------------------------------------------------------------------------

@@ -155,6 +155,16 @@ static mut GDT: Gdt = Gdt::new();
 /// Global TSS instance — lives here because it needs a stable address.
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// Update TSS.RSP0 — called by the scheduler on each context switch
+/// so that interrupts from Ring 3 land on the current process's kernel stack.
+///
+/// # Safety
+///
+/// Must be called with interrupts disabled.
+pub unsafe fn set_rsp0(rsp0: u64) {
+    TSS.rsp0 = rsp0;
+}
+
 /// Load GDT via `lgdt` and reload segment registers.
 ///
 /// # Safety

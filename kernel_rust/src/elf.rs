@@ -5,7 +5,7 @@
 // the entry point.
 //==============================================================================
 
-#![allow(dead_code)]
+#![expect(dead_code, reason = "ELF loader ready for process loading")]
 
 use crate::paging;
 use crate::pmm::PmmAllocator;
