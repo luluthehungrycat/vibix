@@ -111,6 +111,8 @@ IRQ 15, 47
 ;   [rsp+136] = rip
 ;   [rsp+144] = cs
 ;   [rsp+152] = rflags
+;   [rsp+160] = user_rsp  (ONLY if interrupt from userspace CPL=3)
+;   [rsp+168] = ss         (ONLY if interrupt from userspace CPL=3)
 ;------------------------------------------------------------------------------
 
 irq_common:
@@ -206,6 +208,8 @@ irq_common:
 ;   [rsp+136] = rip
 ;   [rsp+144] = cs
 ;   [rsp+152] = rflags
+;   [rsp+160] = user_rsp  (ONLY if interrupt from userspace CPL=3)
+;   [rsp+168] = ss         (ONLY if interrupt from userspace CPL=3)
 ;------------------------------------------------------------------------------
 
 isr_common:

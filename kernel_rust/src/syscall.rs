@@ -8,6 +8,8 @@
 //   rax = syscall number
 //   rdi = arg1, rsi = arg2, rdx = arg3, r8  = arg4, r9  = arg5
 // Return value in rax.
+//
+// Phase 2 additions: fork (8), exec (9), waitpid (10).
 //==============================================================================
 
 use core::fmt::Write;
@@ -38,6 +40,16 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     let cur = process_mut(pid);
     cur.state = process::ProcessState::Zombie;
     cur.exit_code = code;
+
+    // Wake parent if it's blocked waiting for us
+    let parent_pid = cur.parent_pid;
+    if parent_pid != 0 {
+        let parent = process_mut(parent_pid);
+        if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
+            parent.state = process::ProcessState::Ready;
+            parent.wait_for_pid = 0;
+        }
+    }
 
     // Signal the assembly stub to divert through scheduler
     unsafe {
@@ -155,6 +167,25 @@ fn sys_reboot(magic: u64, magic2: u64, cmd: u64, _: u64) -> u64 {
 }
 
 //==============================================================================
+// Phase 2 syscalls: fork, exec, waitpid
+//==============================================================================
+
+/// Syscall 8: fork() → child PID (parent) or 0 (child).
+fn sys_fork(_a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
+    crate::process::sys_fork() as u64
+}
+
+/// Syscall 9: exec(path, argv, envp) — replace process image.
+fn sys_exec(a: u64, b: u64, c: u64, _d: u64) -> u64 {
+    crate::process::sys_exec(a, b, c) as u64
+}
+
+/// Syscall 10: waitpid(pid, wstatus, flags) — wait for child.
+fn sys_waitpid(a: u64, b: u64, c: u64, _d: u64) -> u64 {
+    crate::process::sys_waitpid(a as i64, b, c) as u64
+}
+
+//==============================================================================
 // brk / sbrk — program break (heap)
 //==============================================================================
 
@@ -229,6 +260,10 @@ pub fn init() {
     register(5, sys_nanosleep);
     register(6, sys_uname);
     register(7, sys_reboot);
+    // Phase 2
+    register(8, sys_fork);
+    register(9, sys_exec);
+    register(10, sys_waitpid);
 }
 
 //==============================================================================

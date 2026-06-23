@@ -188,6 +188,9 @@ pub struct SavedRegisters {
 }
 
 /// Complete interrupt frame, including CPU-pushed state.
+/// `user_rsp` and `ss` are valid only for user-mode interrupts (CPL=3).
+/// For kernel-mode interrupts, those fields contain whatever data was
+/// below RFLAGS on the kernel stack (typically uninitialized).
 #[repr(C)]
 #[derive(Debug)]
 pub struct InterruptFrame {
@@ -197,6 +200,8 @@ pub struct InterruptFrame {
     pub rip: u64,
     pub cs: u64,
     pub rflags: u64,
+    pub user_rsp: u64,
+    pub ss: u64,
 }
 
 //------------------------------------------------------------------------------
