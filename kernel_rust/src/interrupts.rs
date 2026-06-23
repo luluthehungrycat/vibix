@@ -251,6 +251,7 @@ pub fn remap_pic(master_offset: u8, slave_offset: u8) {
 /// irq 8–15 → slave PIC  (port 0xA1)
 ///
 /// After this call, the PIC will not deliver that IRQ to the CPU.
+#[allow(dead_code)]
 pub fn mask_irq(irq: u8) {
     unsafe {
         if irq < 8 {
@@ -259,6 +260,24 @@ pub fn mask_irq(irq: u8) {
         } else if irq < 16 {
             let mask = inb(PIC2_DATA);
             outb(PIC2_DATA, mask | (1u8 << (irq - 8)));
+        }
+    }
+}
+
+/// Unmask a specific IRQ on the appropriate PIC.
+///
+/// irq 0–7 → master PIC  (port 0x21)
+/// irq 8–15 → slave PIC  (port 0xA1)
+///
+/// After this call, the PIC will deliver that IRQ to the CPU.
+pub fn unmask_irq(irq: u8) {
+    unsafe {
+        if irq < 8 {
+            let mask = inb(PIC1_DATA);
+            outb(PIC1_DATA, mask & !(1u8 << irq));
+        } else if irq < 16 {
+            let mask = inb(PIC2_DATA);
+            outb(PIC2_DATA, mask & !(1u8 << (irq - 8)));
         }
     }
 }

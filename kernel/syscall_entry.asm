@@ -1,8 +1,12 @@
 ;==============================================================================
-; syscall_entry.asm — SYSCALL/SYSRET entry point for 64-bit long mode
+; syscall_entry.asm — SYSCALL/SYSRET entry with per-process kernel stack
 ;
-; Called via the LSTAR MSR when SYSCALL is executed in ring 3.
-; Saves user registers, switches to kernel stack, and dispatches to Rust.
+; Uses current_proc_kernel_rsp (updated by scheduler on each switch)
+; instead of a dedicated global syscall stack.
+;
+; After syscall_handler returns, checks should_schedule flag.
+; If set (process exited or blocked), builds synthetic interrupt-compatible
+; frame and switches through the scheduler.  Otherwise returns via sysretq.
 ;==============================================================================
 
 bits 64
@@ -13,77 +17,130 @@ section .text
 ;------------------------------------------------------------------------------
 
 extern syscall_handler
+extern scheduler_switch_exit
 
 ;------------------------------------------------------------------------------
-; Kernel stack area for syscall processing
+; Per-process globals (updated by scheduler)
 ;------------------------------------------------------------------------------
 
 section .data
-align 16
+align 8
 
-global syscall_kernel_rsp
-syscall_kernel_rsp: dq syscall_stack_top
+global current_proc_kernel_rsp
+current_proc_kernel_rsp: dq 0
 
-global syscall_saved_rsp
-syscall_saved_rsp: dq 0
+global syscall_state
+syscall_state:
+    .rsp:    dq 0       ; +0: user RSP
+    .rflags: dq 0       ; +8: user RFLAGS
+    .rip:    dq 0       ; +16: user RIP (RCX on SYSCALL)
+
+global should_schedule
+should_schedule: db 0
 
 ;------------------------------------------------------------------------------
-; Syscall entry point — set LSTAR to this address
+; Syscall entry point
 ;------------------------------------------------------------------------------
 
 section .text
 global syscall_entry
 syscall_entry:
-    ; Save user stack pointer to scratch area
-    mov [rel syscall_saved_rsp], rsp
+    ; Save user RSP
+    mov [rel syscall_state.rsp], rsp
 
-    ; Switch to kernel syscall stack
-    mov rsp, [rel syscall_kernel_rsp]
+    ; Switch to per-process kernel stack
+    mov rsp, [rel current_proc_kernel_rsp]
 
-    ; Save user RIP (RCX on SYSCALL entry) and RFLAGS (R11)
-    push rcx                    ; [rsp+8] = user RIP
-    push r11                    ; [rsp]   = user RFLAGS
+    ; Save user RIP (RCX) and RFLAGS (R11)
+    mov [rel syscall_state.rip], rcx
+    mov [rel syscall_state.rflags], r11
 
-    ; ─────────────────────────────────────────────────────────────────────────
-    ; Set up C ABI call: syscall_handler(num, arg1, arg2, arg3, arg4)
-    ;
-    ; After SYSCALL:
-    ;   rdi = user arg1, rsi = user arg2, rdx = user arg3, r8 = user arg4
-    ;   rcx = user RIP (clobbered by SYSCALL — saved on stack)
-    ;   rax = syscall number
-    ;
-    ; We need C ABI registers:
-    ;   rdi = num, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4
-    ;
-    ; So rotate: arg1(rsi)←usr_rdi, arg2(rdx)←usr_rsi, arg3(rcx)←usr_rdx
-    ; while preserving usr_rdi before clobber and using usr_rsi/usr_rdx correctly.
-    ; ─────────────────────────────────────────────────────────────────────────
-    mov r9, rdi                 ; r9 = user arg1 (safe, 6th C ABI slot unused)
-    mov rcx, rdx                ; rcx = arg3 = user rdx  (C ABI 4th arg)
-    mov rdx, rsi                ; rdx = arg2 = user rsi  (C ABI 3rd arg)
-    mov rsi, r9                 ; rsi = arg1 = user rdi  (C ABI 2nd arg)
-    mov rdi, rax                ; rdi = num = syscall no (C ABI 1st arg)
-    ; r8 already holds user arg4 → C ABI 5th arg ✓
+    ; ── Set up C ABI call: syscall_handler(num, arg1, arg2, arg3, arg4) ──
+    ; After SYSCALL: rdi=arg1, rsi=arg2, rdx=arg3, r8=arg4, rax=num
+    ; C ABI:         rdi=num,  rsi=arg1, rdx=arg2, rcx=arg3, r8=arg4
+    mov r9, rdi          ; r9 = user arg1 (safe)
+    mov rcx, rdx         ; rcx = arg3 = user rdx
+    mov rdx, rsi         ; rdx = arg2 = user rsi
+    mov rsi, r9          ; rsi = arg1 = user rdi
+    mov rdi, rax         ; rdi = num = syscall number
 
     call syscall_handler
 
-    ; Restore return frame
-    pop r11                     ; user RFLAGS
-    pop rcx                     ; user RIP
+    ; Check for pending reschedule
+    cmp byte [rel should_schedule], 1
+    je .exit_or_block
 
-    ; Restore user stack pointer
-    mov rsp, [rel syscall_saved_rsp]
-
-    ; Return to ring 3
-    ; NASM 2.x doesn't recognize sysretq — use explicit encoding
-    db 0x48, 0x0f, 0x07          ; sysretq (REX.W + SYSRET)
+    ; ── Normal return via sysretq ──
+    mov rcx, [rel syscall_state.rip]
+    mov r11, [rel syscall_state.rflags]
+    mov rsp, [rel syscall_state.rsp]
+    db 0x48, 0x0f, 0x07    ; sysretq
 
 ;------------------------------------------------------------------------------
-; Dedicated 4 KB stack for syscall processing
+; Exit / block path — divert through scheduler
 ;------------------------------------------------------------------------------
+; Build a synthetic interrupt-compatible frame from the saved syscall_state,
+; then call scheduler_switch_exit which returns the next process's kernel_rsp.
 
-section .bss
-align 16
-syscall_stack_bottom:
-    resb 4096
-syscall_stack_top:
+.exit_or_block:
+    ; Clear flag BEFORE building frame (avoid recursive entry)
+    mov byte [rel should_schedule], 0
+
+    ; Discard the call return address from syscall_handler call
+    add rsp, 8
+
+    ; Build frame HIGH→LOW (matching irq_common pop order).
+    ; Individual pushes in reverse order: r15 first (highest), rax last (RSP).
+
+    ; iretq frame (highest addresses)
+    push 0x1B                       ; SS
+    push qword [rel syscall_state.rsp]  ; user RSP
+    push 0x202                      ; RFLAGS (IF enabled)
+    push 0x23                       ; CS (user code | 3)
+    push qword [rel syscall_state.rip]  ; RIP
+
+    ; err_code + int_no
+    push 0                          ; err_code
+    push 0                          ; int_no
+
+    ; GPRs (reverse push: r15 first, rax last = RSP)
+    push 0                          ; R15
+    push 0                          ; R14
+    push 0                          ; R13
+    push 0                          ; R12
+    push 0                          ; R11
+    push 0                          ; R10
+    push 0                          ; R9
+    push 0                          ; R8
+    push 0                          ; RDI
+    push 0                          ; RSI
+    push 0                          ; RBP
+    push 0                          ; RBX
+    push 0                          ; RDX
+    push 0                          ; RCX
+    push 0                          ; RAX  ← RSP now points here
+
+    ; RSP now points at RAX — pass as argument
+    mov rdi, rsp
+    call scheduler_switch_exit
+    mov rsp, rax
+
+    ; Pop GPRs (irq_common order: rax..r15)
+    pop rax
+    pop rcx
+    pop rdx
+    pop rbx
+    pop rbp
+    pop rsi
+    pop rdi
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    add rsp, 16    ; skip int_no + err_code
+    iretq

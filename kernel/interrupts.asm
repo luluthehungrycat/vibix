@@ -98,7 +98,8 @@ IRQ 15, 47
 
 ;------------------------------------------------------------------------------
 ; IRQ common handler — saves volatile registers, calls Rust handler,
-; sends EOI to the master PIC (and slave if needed), restores, iretq.
+; sends EOI to the master PIC (and slave if needed), calls scheduler,
+; restores, iretq.
 ;------------------------------------------------------------------------------
 ; Stack layout when irq_common runs:
 ;   [rsp+0]   = r15              ← pushed last (rsp points here)
@@ -139,13 +140,10 @@ irq_common:
 
     ; Send End-Of-Interrupt to the master PIC (port 0x20)
     ; For slave IRQs (8-15), also send to slave PIC (port 0xA0).
-    ; Check int_no value still on stack after registers restored... easier:
-    ; check if int_no >= 40 (slave IRQs are vectors 40-47).
     mov al, 0x20        ; EOI value
     out 0x20, al        ; always send to master
 
     ; Check frame->int_no (it's at rsp + 15*8 + 8 after register push)
-    ; Actually let's recover int_no from the stack: it was pushed before registers.
     ; After saving regs, int_no is at [rsp + 15*8] = [rsp + 120]
     mov rax, [rsp + 120]
     cmp rax, 40
@@ -153,6 +151,12 @@ irq_common:
     mov al, 0x20
     out 0xA0, al        ; send EOI to slave too
 .eoi_done:
+
+    ; Call scheduler_tick — must be after EOI to avoid re-entrancy
+    mov rdi, rsp                ; arg: current kernel_rsp (points at RAX)
+    extern scheduler_tick
+    call scheduler_tick
+    mov rsp, rax                ; switch to next process's stack
 
     ; Restore registers (reverse order)
     pop rax

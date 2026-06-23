@@ -44,6 +44,9 @@ interrupts.o: kernel/interrupts.asm
 syscall_entry.o: kernel/syscall_entry.asm
 	$(NASM) -f elf64 $< -o $@
 
+context_switch.o: kernel/context_switch.asm
+	$(NASM) -f elf64 $< -o $@
+
 # Build the Rust staticlib (produces libvibix_kernel.a)
 $(RUST_LIB): $(USR_BIN) $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
 	cd $(RUST_DIR) && \
@@ -51,8 +54,8 @@ $(RUST_LIB): $(USR_BIN) $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
 	$(CARGO) build --target $(RUST_TARGET) --release
 
 # Link asm entry + interrupt stubs + Rust staticlib into an ELF
-kernel64.elf: kernel64_entry.o interrupts.o syscall_entry.o $(RUST_LIB)
-	$(LD) -T $(RUST_LD) -nostdlib -o $@ kernel64_entry.o interrupts.o syscall_entry.o $(RUST_LIB)
+kernel64.elf: kernel64_entry.o interrupts.o syscall_entry.o context_switch.o $(RUST_LIB)
+	$(LD) -T $(RUST_LD) -nostdlib -o $@ kernel64_entry.o interrupts.o syscall_entry.o context_switch.o $(RUST_LIB)
 
 # Flatten to flat binary for incbin
 kernel64.bin: kernel64.elf
@@ -81,6 +84,6 @@ test: vibix.elf
 	python3 test_kernel.py
 
 clean:
-	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o
+	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o kernel/context_switch.o
 	$(MAKE) -C userspace clean
 	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true

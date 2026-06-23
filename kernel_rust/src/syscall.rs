@@ -12,8 +12,9 @@
 
 use core::fmt::Write;
 use crate::serial::SerialPort;
-use crate::paging;
 use crate::pmm;
+use crate::process::{current_pid, process_mut, BRK_START, BRK_MAX};
+use crate::process;
 
 /// Syscall handler function pointer.
 type SyscallFn = fn(u64, u64, u64, u64) -> u64;
@@ -28,16 +29,21 @@ static mut SYSCALL_TABLE: [Option<SyscallFn>; MAX_SYSCALLS] = [None; MAX_SYSCALL
 // Syscall handlers
 //==============================================================================
 
-/// Syscall 0: exit(int code) — halts the system.
-///
-/// In a single-process kernel, exit means the whole system halts.
+/// Syscall 0: exit(int code) — marks process as Zombie and triggers reschedule.
 fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
+    let pid = current_pid();
     let mut serial = SerialPort::new();
-    let _ = core::write!(serial, "VIBIX: init exited with code {}\n", code);
-    // Halt forever
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+    let _ = core::write!(serial, "VIBIX: PID {} exited with code {}\n", pid, code);
+
+    let cur = process_mut(pid);
+    cur.state = process::ProcessState::Zombie;
+    cur.exit_code = code;
+
+    // Signal the assembly stub to divert through scheduler
+    unsafe {
+        process::should_schedule = 1;
     }
+    0  // value ignored; asm diverts to scheduler
 }
 
 /// Syscall 1: write(int fd, const char *buf, size_t len) → bytes written.
@@ -84,39 +90,73 @@ fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
 
 /// Syscall 3: getpid() → process ID.
 fn sys_getpid(_: u64, _: u64, _: u64, _: u64) -> u64 {
-    1  // PID 1 for the init process
+    current_pid()
 }
 
-//==============================================================================
-// errno — per-process error number (currently single-process global)
-//==============================================================================
-
-/// Kernel-internal errno value.
-static mut ERRNO: i64 = 0;
-
-pub fn set_errno(e: i64) {
-    unsafe { ERRNO = e; }
+/// Syscall 5: nanosleep(sec, nsec) — busy-wait for given duration.
+fn sys_nanosleep(sec: u64, nsec: u64, _: u64, _: u64) -> u64 {
+    if nsec >= 1_000_000_000 {
+        return u64::MAX;
+    }
+    let total_ticks = sec * 100 + nsec / 10_000_000;
+    let start = crate::pit::get_ticks();
+    loop {
+        let now = crate::pit::get_ticks();
+        if now.wrapping_sub(start) >= total_ticks {
+            break;
+        }
+    }
+    0
 }
 
-#[allow(dead_code)]
-pub fn get_errno() -> i64 {
-    unsafe { ERRNO }
+/// Syscall 6: uname(buf) — fill in system identification structure.
+fn sys_uname(buf: u64, _: u64, _: u64, _: u64) -> u64 {
+    let sysname: [u8; 6] = *b"VIBIX\0";
+    let nodename: [u8; 6] = *b"vibix\0";
+    let release: [u8; 6] = *b"0.1.0\0";
+    let version: [u8; 27] = *b"#1 PREEMPT Tue Jun 23 2026\0";
+    let machine: [u8; 7] = *b"x86_64\0";
+    let domainname: [u8; 6] = *b"VIBIX\0";
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(sysname.as_ptr(), buf as *mut u8, sysname.len());
+        core::ptr::copy_nonoverlapping(nodename.as_ptr(), (buf + 65) as *mut u8, nodename.len());
+        core::ptr::copy_nonoverlapping(release.as_ptr(), (buf + 130) as *mut u8, release.len());
+        core::ptr::copy_nonoverlapping(version.as_ptr(), (buf + 195) as *mut u8, version.len());
+        core::ptr::copy_nonoverlapping(machine.as_ptr(), (buf + 260) as *mut u8, machine.len());
+        core::ptr::copy_nonoverlapping(domainname.as_ptr(), (buf + 325) as *mut u8, domainname.len());
+    }
+    0
 }
 
-const ENOSYS: i64 = 38;
+#[inline]
+fn outw(port: u16, val: u16) {
+    unsafe { core::arch::asm!("outw %ax, %dx", in("ax") val, in("dx") port, options(att_syntax)) }
+}
+
+/// Syscall 7: reboot(magic, magic2, cmd) — reboot or power off.
+fn sys_reboot(magic: u64, magic2: u64, cmd: u64, _: u64) -> u64 {
+    if magic != 0xfee1dead || magic2 != 0x28121969 {
+        return u64::MAX;
+    }
+    match cmd {
+        0xcdef0123 => {
+            // LINUX_REBOOT_CMD_RESTART
+            outw(0x604, 0x2000);
+            0
+        }
+        0x4321fedc => {
+            // LINUX_REBOOT_CMD_POWER_OFF
+            outw(0x604, 0x2000);
+            0
+        }
+        _ => u64::MAX,
+    }
+}
 
 //==============================================================================
 // brk / sbrk — program break (heap)
 //==============================================================================
-
-/// Base of the user heap area.
-const BRK_START: u64 = 0x201_0000;   // 32 MiB + 64 KiB
-
-/// Maximum program break (256 MiB — generous for the current process model).
-const BRK_MAX: u64   = 0x1000_0000;  // 256 MiB
-
-/// Current program break (initialised to BRK_START).
-static mut PROGRAM_BREAK: u64 = BRK_START;
 
 /// Syscall 4: brk(void *addr) → new program break.
 ///
@@ -125,56 +165,44 @@ static mut PROGRAM_BREAK: u64 = BRK_START;
 ///   - `addr < BRK_START || addr > BRK_MAX` → do nothing, return -1
 ///   - Otherwise → set break, allocating/mapping pages as needed, return new break
 fn sys_brk(addr: u64, _: u64, _: u64, _: u64) -> u64 {
-    unsafe {
-        // sbrk(0) query — return current break
-        if addr == 0 {
-            return PROGRAM_BREAK;
-        }
+    let pid = current_pid();
+    let proc = process_mut(pid);
 
-        // Validate bounds
-        if addr < BRK_START || addr > BRK_MAX {
-            set_errno(ENOSYS);  // closest match: not enough space
-            return u64::MAX;
-        }
-
-        let current_page_end = (PROGRAM_BREAK + 0xFFF) & !0xFFF;
-        let new_page_end = (addr + 0xFFF) & !0xFFF;
-
-        if new_page_end > current_page_end {
-            // Expand — allocate and map new pages
-            let pmm = pmm::global_pmm();
-            let mut vaddr = current_page_end;
-            while vaddr < new_page_end {
-                let phys = pmm.alloc();
-                if phys.is_null() {
-                    set_errno(ENOSYS);  // ENOMEM equivalent
-                    return u64::MAX;
-                }
-                // Zero the page before mapping (security: no kernel-data leaks)
-                core::ptr::write_bytes(phys, 0, 4096);
-                paging::map_4k(vaddr, phys as u64, paging::PAGE_USER_RW, pmm);
-                paging::invlpg(vaddr);
-                vaddr += 4096;
-            }
-        }
-        // Note: shrinking (new_page_end < current_page_end) could unmap pages,
-        // but we keep them for simplicity.  The break address is still updated
-        // so subsequent allocations don't reuse the "shrunk" space incorrectly.
-
-        PROGRAM_BREAK = addr;
-        addr
+    if addr == 0 {
+        return proc.brk;  // sbrk(0) query
     }
+
+    if addr < BRK_START || addr > BRK_MAX {
+        proc.errno = 38;   // ENOSYS
+        return u64::MAX;
+    }
+
+    let current_page_end = (proc.brk + 0xFFF) & !0xFFF;
+    let new_page_end = (addr + 0xFFF) & !0xFFF;
+
+    if new_page_end > current_page_end {
+        let pmm = pmm::global_pmm();
+        let mut vaddr = current_page_end;
+        while vaddr < new_page_end {
+            let phys = pmm.alloc();
+            if phys.is_null() {
+                proc.errno = 38;
+                return u64::MAX;
+            }
+            unsafe { core::ptr::write_bytes(phys, 0, 4096); }
+            crate::paging::map_4k(vaddr, phys as u64, crate::paging::PAGE_USER_RW, pmm);
+            crate::paging::invlpg(vaddr);
+            vaddr += 4096;
+        }
+    }
+
+    proc.brk = addr;
+    addr
 }
 
 //==============================================================================
 // Public API
 //==============================================================================
-
-/// Return the current errno value.
-#[allow(dead_code)]
-pub fn errno_value() -> i64 {
-    get_errno()
-}
 
 /// Register a syscall handler.
 ///
@@ -198,6 +226,9 @@ pub fn init() {
     register(2, sys_read);
     register(3, sys_getpid);
     register(4, sys_brk);
+    register(5, sys_nanosleep);
+    register(6, sys_uname);
+    register(7, sys_reboot);
 }
 
 //==============================================================================

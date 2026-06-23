@@ -19,10 +19,11 @@ CHECKLIST = {
     "VIBIX: Loading GDT/TSS":             "GDT/TSS and SYSCALL setup",
     "VIBIX: Enabling interrupts.":        "Interrupts enabled",
     "VIBIX: Boot sequence complete":      "Boot sequence",
-    "VIBIX: Entering user mode...":       "User mode entry",
+    "VIBIX: Created PID 1 (init).":       "Init process creation",
+    "VIBIX: Starting scheduler...":       "Scheduler start",
     "Hello, world!":                      "User-mode init output",
     "From PID 1 (init)":                  "Init process message",
-    "VIBIX: init exited with code":       "Init exit",
+    "VIBIX: PID 1 exited with code":      "Init exit",
 }
 
 OPTIONAL = {
