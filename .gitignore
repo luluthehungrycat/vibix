@@ -2,15 +2,25 @@
 *.o
 *.elf
 *.bin
+*.tar
 
 # Rust / Cargo
 kernel_rust/target/
+
+# QEMU debug log
+qemu.log
 
 # Test/cache dirs
 __pycache__/
 .ruff_cache/
 .mypy_cache/
 
+# Deepwork progress files
+.slim/deepwork/
+
 # OS artifacts
 *~
 .DS_Store
+
+# Generated userspace test artifacts
+userspace/vibix_vfstest.inc

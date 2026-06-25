@@ -29,8 +29,9 @@ all: vibix.elf
 # ── Combined userspace binary (delegated to userspace/Makefile) ──────────────
 
 USR_BIN = userspace/vibix_blob.bin
+USR_TAR = userspace/initramfs.tar
 
-$(USR_BIN):
+$(USR_BIN) $(USR_TAR):
 	$(MAKE) -C userspace all
 
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────

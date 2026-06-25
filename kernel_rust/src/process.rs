@@ -11,10 +11,8 @@ use crate::gdt;
 const MAX_PROCS: usize = 64;
 const KERNEL_STACK_SIZE: usize = 4096;
 const USER_CODE_ADDR: u64 = 0x2000000;
-const USER_CODE_PAGES: u64 = 2;
 const USER_STACK_ADDR: u64 = 0x2002000;
 
-static USER_INIT_BIN: &[u8] = include_bytes!("../../userspace/vibix_blob.bin");
 
 /// BRK start address (shared constant for per-process brk)
 pub const BRK_START: u64 = 0x201_0000;
@@ -52,6 +50,7 @@ pub struct Process {
     pub brk: u64,
     pub errno: i64,
     pub name: [u8; 32],
+    pub fd_table: crate::vfs::FdTable,
 }
 
 pub struct ProcessTable {
@@ -184,15 +183,62 @@ fn build_init_frame(
     }
 }
 
+/// Build a synthetic register frame for the child of a fork().
+/// Uses syscall_state saved at fork syscall entry so the child
+/// returns to the instruction after the fork syscall with RAX=0.
+fn build_fork_frame(kstack_top: u64) -> u64 {
+    unsafe {
+        let ptr = kstack_top as *mut u64;
+
+        // iretq frame (highest addresses)
+        ptr.sub(1).write(0x1Bu64);                        // SS
+        ptr.sub(2).write(syscall_state.rsp);               // user RSP
+        ptr.sub(3).write(0x202u64);                        // RFLAGS (IF=1)
+        ptr.sub(4).write(0x23u64);                         // CS (user code | 3)
+        ptr.sub(5).write(syscall_state.rip);               // RIP (after fork)
+
+        // int_no + err_code
+        ptr.sub(6).write(0u64);                            // err_code (dummy)
+        ptr.sub(7).write(0u64);                            // int_no
+
+        // GPRs — written high-to-low
+        ptr.sub(8).write(0u64);                            // R15
+        ptr.sub(9).write(0u64);                            // R14
+        ptr.sub(10).write(0u64);                           // R13
+        ptr.sub(11).write(0u64);                           // R12
+        ptr.sub(12).write(0u64);                           // R11
+        ptr.sub(13).write(0u64);                           // R10
+        ptr.sub(14).write(0u64);                           // R9
+        ptr.sub(15).write(0u64);                           // R8
+        ptr.sub(16).write(0u64);                           // RDI
+        ptr.sub(17).write(0u64);                           // RSI
+        ptr.sub(18).write(0u64);                           // RBP
+        ptr.sub(19).write(0u64);                           // RBX
+        ptr.sub(20).write(0u64);                           // RDX
+        ptr.sub(21).write(0u64);                           // RCX
+        ptr.sub(22).write(0u64);                           // RAX = 0 (child gets 0)
+
+        ptr.sub(22) as u64  // kernel_rsp = address of RAX slot
+    }
+}
+
 // --- Binary loader ---
 
-fn load_init_binary(pmm: &mut PmmAllocator) {
+
+/// Load a flat binary from a raw data pointer to user pages.
+/// Maps pages at USER_CODE_ADDR (code) and USER_STACK_ADDR (stack).
+pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
     use core::cmp::min;
-    let mut bytes_left = USER_INIT_BIN.len();
+    let mut bytes_left = size;
     let mut src_offset = 0usize;
     let mut virt_addr = USER_CODE_ADDR;
 
-    for _ in 0..USER_CODE_PAGES {
+    // Allocate enough pages for the binary (minimum 2 like before)
+    let min_pages = 2;
+    let pages_needed = (size + 0xfff) / 0x1000;
+    let pages = if pages_needed < min_pages { min_pages } else { pages_needed };
+
+    for _ in 0..pages {
         let page = pmm.alloc();
         if page.is_null() {
             loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
@@ -200,7 +246,7 @@ fn load_init_binary(pmm: &mut PmmAllocator) {
         let copy_len = min(bytes_left, 0x1000);
         unsafe {
             core::ptr::copy_nonoverlapping(
-                USER_INIT_BIN.as_ptr().add(src_offset),
+                data.add(src_offset),
                 page,
                 copy_len,
             );
@@ -211,6 +257,7 @@ fn load_init_binary(pmm: &mut PmmAllocator) {
         bytes_left = bytes_left.saturating_sub(0x1000);
     }
 
+    // Allocate and map stack page
     let stack_page = pmm.alloc();
     if stack_page.is_null() {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
@@ -223,7 +270,14 @@ fn load_init_binary(pmm: &mut PmmAllocator) {
 /// Create and register the init process (PID 1) and idle process (PID 2).
 /// Returns PID of init.
 pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
-    load_init_binary(pmm);
+    // Load PID 1 binary from initramfs via VFS
+    if let Ok(vn) = crate::vfs::vfs_resolve(b"/sbin/init") {
+        let data = vn.data as *const u8;
+        let size = vn.size as usize;
+        if !data.is_null() && size > 0 {
+            load_flat_binary(data, size, pmm);
+        }
+    }
 
     // ── PID 1: init ──
     let kstack_page = pmm.alloc();
@@ -256,9 +310,35 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             while i < bytes.len() { n[i] = bytes[i]; i += 1; }
             n
         },
+            fd_table: crate::vfs::FdTable::new(),
     });
     table.count = 1;
     table.next_pid = 2;
+
+    // Set up fd 0/1/2 for init — all point to /dev/ttyS0
+    unsafe {
+        let tty_vnode = crate::vfs::devfs::devfs_get_vnode(crate::vfs::devfs::DevId::TtyS0);
+        let oft_idx = crate::vfs::open_file::oft_alloc(
+            tty_vnode,
+            crate::vfs::O_RDWR,
+            0o666,
+        );
+        match oft_idx {
+            Ok(idx) => {
+                // All three fds share the same OpenFile entry (same offset)
+                table.slots[0].as_mut().unwrap().fd_table.fds[0] = idx as i32;
+                table.slots[0].as_mut().unwrap().fd_table.fds[1] = idx as i32;
+                table.slots[0].as_mut().unwrap().fd_table.fds[2] = idx as i32;
+                // Refcount is already 1 from oft_alloc, account for fds 1 and 2
+                if let Some(ref mut of) = crate::vfs::open_file::OPEN_FILE_TABLE.entries[idx] {
+                    of.refcount = 3;
+                }
+            }
+            Err(_) => {
+                // No OFT slots available — should not happen at boot
+            }
+        }
+    }
 
     // ── PID 2: idle ──
     let idle_kstack = pmm.alloc();
@@ -297,6 +377,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             while i < bytes.len() { n[i] = bytes[i]; i += 1; }
             n
         },
+            fd_table: crate::vfs::FdTable::new(),
     });
     table.count = 2;
     table.next_pid = 3;
@@ -409,22 +490,12 @@ pub fn sys_fork() -> i64 {
         return -1; // ENOMEM
     }
 
-    // Copy parent's kernel stack contents to child
     let child_base = child_kstack as u64;
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            parent.kernel_stack_base as *const u8,
-            child_base as *mut u8,
-            KERNEL_STACK_SIZE,
-        );
-    }
+    let child_ktop = child_base + KERNEL_STACK_SIZE as u64;
 
-    // Calculate child's kernel_rsp (same offset from base as parent)
-    let krsp_offset = parent.kernel_rsp - parent.kernel_stack_base;
-    let child_krsp = child_base + krsp_offset;
-
-    // Set child's RAX to 0 (offset 0 from kernel_rsp)
-    unsafe { *(child_krsp as *mut u64) = 0; }
+    // Build synthetic frame for child using saved syscall state.
+    // Child returns to the instruction after fork syscall with RAX=0.
+    let child_krsp = build_fork_frame(child_ktop);
 
     // Assign child PID
     let child_pid = unsafe {
@@ -446,8 +517,8 @@ pub fn sys_fork() -> i64 {
                     pid: child_pid,
                     state: ProcessState::Ready,
                     entry: parent.entry,
-                    user_rsp: parent.user_rsp,
-                    kernel_stack_top: child_base + KERNEL_STACK_SIZE as u64,
+                    user_rsp: syscall_state.rsp,  // use saved syscall RSP
+                    kernel_stack_top: child_ktop,
                     kernel_rsp: child_krsp,
                     kernel_stack_base: child_base,
                     parent_pid: parent_pid,
@@ -462,7 +533,17 @@ pub fn sys_fork() -> i64 {
                         while i < bytes.len() { n[i] = bytes[i]; i += 1; }
                         n
                     },
+                    fd_table: parent.fd_table,
                 });
+                // Increment refcount on shared OFT entries (child now shares them)
+                {
+                    let child = PROCESS_TABLE.slots[idx].as_ref().unwrap();
+                    for &fd_entry in &child.fd_table.fds {
+                        if fd_entry >= 0 {
+                            crate::vfs::open_file::oft_incref(fd_entry as usize);
+                        }
+                    }
+                }
                 PROCESS_TABLE.count += 1;
             }
             child_pid as i64
@@ -471,23 +552,96 @@ pub fn sys_fork() -> i64 {
     }
 }
 
-/// Exec — reload user program context.
-/// For MVP, updates syscall_state so the next sysretq jumps to the binary entry.
-pub fn sys_exec(_path: u64, _argv: u64, _envp: u64) -> i64 {
+/// Exec — reload user program context from a VFS-resolved path.
+/// Supports both ELF64 executables and flat binaries.
+pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     let pid = current_pid();
     let proc = process_mut(pid);
 
-    // Update syscall_state with new entry point and stack.
-    // When syscall_handler returns, syscall_entry.asm loads these into
-    // RCX/R11/RSP and executes sysretq, jumping to the new entry.
+    // 1. Copy path string from user space
+    let path_buf = unsafe {
+        match crate::vfs::cstr_from_user(path as *const u8, crate::vfs::PATH_MAX) {
+            Ok(buf) => buf,
+            Err(e) => return -e as i64,
+        }
+    };
+    let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(crate::vfs::PATH_MAX);
+    let path_slice = &path_buf[..path_len];
+
+    // 2. Resolve path through VFS
+    let vn = match crate::vfs::vfs_resolve(path_slice) {
+        Ok(v) => v,
+        Err(e) => return -e as i64,
+    };
+
+    // 3. Extract data pointer and size from vnode
+    let data = vn.data as *const u8;
+    let size = vn.size as usize;
+    if data.is_null() || size == 0 {
+        return -2; // ENOENT
+    }
+
+    let pmm = crate::pmm::global_pmm();
+
+    // 4. Check for ELF magic and dispatch accordingly
+    let entry: u64;
     unsafe {
-        syscall_state.rip = USER_CODE_ADDR;
+        let magic = core::slice::from_raw_parts(data, 4);
+        if magic == b"ELF" {
+            // ELF64 binary — use the ELF loader
+            let data_slice = core::slice::from_raw_parts(data, size);
+            match crate::elf::load(data_slice, pmm) {
+                Ok(ep) => {
+                    // ELF loader maps segments but NOT the user stack
+                    let stack_page = pmm.alloc();
+                    if stack_page.is_null() {
+                        return -12; // ENOMEM
+                    }
+                    crate::paging::map_4k(
+                        USER_STACK_ADDR,
+                        stack_page as u64,
+                        crate::paging::PAGE_USER_RW,
+                        pmm,
+                    );
+                    entry = ep;
+                }
+                Err(e) => {
+                    return match e {
+                        crate::elf::ElfError::BadMagic
+                        | crate::elf::ElfError::BadClass
+                        | crate::elf::ElfError::BadEndian
+                        | crate::elf::ElfError::BadMachine
+                        | crate::elf::ElfError::BadType
+                        | crate::elf::ElfError::Truncated => -22,  // EINVAL
+                        crate::elf::ElfError::Oom => -12,           // ENOMEM
+                    };
+                }
+            }
+        } else {
+            // Flat binary — use load_flat_binary (handles stack page internally)
+            load_flat_binary(data, size, pmm);
+            entry = USER_CODE_ADDR;
+        }
+    }
+
+    // 5. Update syscall_state with new entry point and stack
+    unsafe {
+        syscall_state.rip = entry;
         syscall_state.rsp = USER_STACK_ADDR + 0x1000;
         syscall_state.rflags = 0x202;
     }
 
     proc.brk = BRK_START;
     proc.errno = 0;
+
+    // 6. Close all fds except 0/1/2 on exec
+    for fd in 3..crate::vfs::MAX_FDS {
+        let oft_idx = proc.fd_table.fds[fd];
+        if oft_idx >= 0 {
+            proc.fd_table.fds[fd] = -1;
+            crate::vfs::open_file::oft_decref(oft_idx as usize);
+        }
+    }
     0
 }
 
@@ -547,6 +701,19 @@ pub unsafe fn start_scheduler(init_pid: u64) -> ! {
         // Mark running
         process_mut(init_pid).state = ProcessState::Running;
         context_switch_to(proc.kernel_rsp)
+    }
+}
+
+
+/// Clean up all file descriptors for a process.
+/// Should be called on process exit (e.g. from sys_exit) to release all OFT references.
+pub fn cleanup_fds(proc: &mut Process) {
+    for fd in 0..crate::vfs::MAX_FDS {
+        let oft_idx = proc.fd_table.fds[fd];
+        if oft_idx >= 0 {
+            proc.fd_table.fds[fd] = -1;
+            crate::vfs::open_file::oft_decref(oft_idx as usize);
+        }
     }
 }
 

@@ -1,5 +1,10 @@
 # VIBIX Multi-Process + Preemptive Scheduler Architecture
 
+> **⚠️ Status: IMPLEMENTED** — This design document describes the Phase 1
+> scheduler architecture that has been fully implemented. See the source code
+> at `kernel_rust/src/process.rs` and `kernel/context_switch.asm` for the
+> actual implementation. Reference this doc for architecture understanding.
+
 ## Current State Summary
 
 | Component | Current | Target |
@@ -763,11 +768,13 @@ CPU clears IF on interrupt gate entry (our IDT setup). scheduler_tick runs with 
 
 ## 9. Future Work
 
-1. True blocking waitpid with automatic syscall restart
-2. Idle process (HLT loop) for power saving
-3. Address space isolation (per-process page tables)
-4. COW fork
-5. IPC (pipes, shared memory, signals)
-6. Kernel stack reclamation on process exit
-7. Syscall times / per-process accounting
-8. Per-CPU data for SMP
+1. ~~Idle process (HLT loop) for power saving~~ ✅ DONE (PID 2)
+2. ~~IPC (pipes)~~ ✅ DONE (syscall 20)
+3. Signals + process groups — needed for Ctrl+C / job control (see [phase3c.md](phase3c.md))
+4. True blocking waitpid with automatic syscall restart
+5. Address space isolation (per-process page tables)
+6. COW fork
+7. Shared memory (shm)
+8. Kernel stack reclamation on process exit
+9. Syscall times / per-process accounting
+10. Per-CPU data for SMP

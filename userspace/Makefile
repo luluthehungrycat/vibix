@@ -24,13 +24,20 @@ VIBIX_INC     = $(BUILD_DIR)/vibix_core.inc   \
                 $(BUILD_DIR)/vibix_shell.inc
 
 OUTPUT        = $(BUILD_DIR)/vibix_blob.bin
+INITRAMFS     = $(BUILD_DIR)/initramfs.tar
 
 .PHONY: all clean
 
-all: $(OUTPUT)
+all: $(OUTPUT) $(INITRAMFS)
 
 $(OUTPUT): $(BLOB_ASM) $(VIBIX_INC)
 	$(NASM) -f bin -I $(INC_DIR)/ $< -o $@
 
+$(INITRAMFS): $(OUTPUT)
+	mkdir -p /tmp/vibix-initramfs/sbin
+	cp $(OUTPUT) /tmp/vibix-initramfs/sbin/init
+	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init
+	rm -rf /tmp/vibix-initramfs
+
 clean:
-	rm -f $(OUTPUT)
+	rm -f $(OUTPUT) $(INITRAMFS)
