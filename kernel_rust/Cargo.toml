@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "VIBIX 64-bit kernel (Rust port)"
 
+[features]
+default = []
+debug = []
+
 [lib]
 crate-type = ["staticlib"]
 

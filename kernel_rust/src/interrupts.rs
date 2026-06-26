@@ -463,6 +463,47 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     let cr2_buf = hex_str(cr2);
     serial.writestrs(&["VIBIX:   CR2: ", core::str::from_utf8(&cr2_buf).unwrap_or("???"), "\n"]);
 
+    // Debug-only: extended register/stack dumps (enable with `make DEBUG=1`)
+    if cfg!(feature = "debug") {
+        let u_rsp_buf = hex_str(frame.user_rsp);
+        serial.writestrs(&["VIBIX:  U_RSP: ", core::str::from_utf8(&u_rsp_buf).unwrap_or("???"), "\n"]);
+        let ss_buf = hex_str(frame.ss);
+        serial.writestrs(&["VIBIX:     SS: ", core::str::from_utf8(&ss_buf).unwrap_or("???"), "\n"]);
+
+        // Read RSP inside handler (approximates fault RSP minus isr push offset)
+        let handler_rsp: u64;
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) handler_rsp); }
+        let hrsp_buf = hex_str(handler_rsp);
+        serial.writestrs(&["VIBIX: HND_RSP: ", core::str::from_utf8(&hrsp_buf).unwrap_or("???"), "\n"]);
+
+        // Compute frame pointer = address of InterruptFrame (= RAX address)
+        let frame_ptr = core::ptr::addr_of!(*frame) as u64;
+
+        // Dump the iretq frame values at frame_ptr+136..168 (RIP, CS, RFLAGS, user_rsp, SS)
+        serial.writestrs(&["VIBIX: iretq frame values from stack:\n"]);
+        for i in 17..22 {
+            let addr = frame_ptr + i * 8;
+            if addr < 0x288000 {
+                let val: u64 = unsafe { core::ptr::read_volatile(addr as *const u64) };
+                let v_buf = hex_str(val);
+                let _ = write!(serial, "VIBIX:   [{:+3}]: {}\n", i * 8, core::str::from_utf8(&v_buf).unwrap_or("???"));
+            }
+        }
+        // Also dump the raw stack from ktop-40 down
+        serial.writestrs(&["VIBIX: idle page ktop-40 (iretq frame):\n"]);
+        const KTOP: u64 = 0x288000;
+        for i in 0..5 {
+            let addr = KTOP - 40 + i * 8;
+            let val: u64 = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            let v_buf = hex_str(val);
+            let _ = write!(serial, "VIBIX:   [{:+3}]: {}\n", KTOP as i64 - 40 + i as i64 * 8, core::str::from_utf8(&v_buf).unwrap_or("???"));
+        }
+
+        serial.writestrs(&["VIBIX: frame_ptr="]);
+        let fpb = hex_str(frame_ptr);
+        serial.writestrs(&[core::str::from_utf8(&fpb).unwrap_or("???"), "\n"]);
+    }
+
     // Print saved registers
     serial.writestrs(&["VIBIX: Registers:\n"]);
     let rax_buf = hex_str(frame.regs.rax);

@@ -350,11 +350,22 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
 
     // Build frame for idle — uses build_init_frame then overrides CS to kernel CS
     let idle_krsp = build_init_frame(idle_ktop, idle_entry as *const () as u64, 0, 0);
-    // Override CS to kernel code segment since idle runs in kernel mode
+    // Debug: print idle frame and kernel stack addresses (enable with `make DEBUG=1`)
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "VIBIX: idle kstack_base={:016X} ktop={:016X} krsp={:016X} entry={:016X}\n",
+            idle_kstack as u64, idle_ktop, idle_krsp, idle_entry as *const () as u64);
+    }
+    // Override CS and SS for kernel-mode return (CPL=0).
+    // In 64-bit mode, iretq ALWAYS pops SS:RSP even for same-level returns,
+    // so SS must match the target CPL (0 → kernel data segment).
     unsafe {
-        // kernel_rsp points at RAX. Offsets: RAX=0, RCX=8, ..., RIP=136, CS=144
         let ptr = idle_krsp as *mut u64;
+        // Offsets: RAX=0, ..., RIP=136, CS=144, RFLAGS=152, RSP=160, SS=168
         *ptr.add(144/8) = 0x08;  // CS = kernel code segment (CPL=0)
+        *ptr.add(168/8) = 0x10;  // SS = kernel data segment (CPL=0)
     }
 
     table.slots[1] = Some(Process {

@@ -18,6 +18,10 @@ RUST_DIR    = kernel_rust
 RUST_LIB    = $(RUST_DIR)/target/$(RUST_TARGET)/release/libvibix_kernel.a
 RUST_LD     = $(RUST_DIR)/kernel64_elf.ld
 
+# Debug flag: make DEBUG=1 to enable kernel debug output
+DEBUG ?= 0
+RUST_FEATURES = $(if $(filter 1,$(DEBUG)),--features debug,)
+
 # Final 32-bit ELF flags (Multiboot wrapper)
 ASMFLAGS32  = -f elf32
 LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
@@ -49,10 +53,11 @@ context_switch.o: kernel/context_switch.asm
 	$(NASM) -f elf64 $< -o $@
 
 # Build the Rust staticlib (produces libvibix_kernel.a)
+# Use `make DEBUG=1` to enable kernel debug output
 $(RUST_LIB): $(USR_BIN) $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
 	cd $(RUST_DIR) && \
 	RUSTFLAGS="-C code-model=kernel" \
-	$(CARGO) build --target $(RUST_TARGET) --release
+	$(CARGO) build --target $(RUST_TARGET) --release $(RUST_FEATURES)
 
 # Link asm entry + interrupt stubs + Rust staticlib into an ELF
 kernel64.elf: kernel64_entry.o interrupts.o syscall_entry.o context_switch.o $(RUST_LIB)

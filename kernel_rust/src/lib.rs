@@ -111,6 +111,10 @@ pub extern "C" fn kernel_main() -> ! {
     interrupts::unmask_irq(1);
     serial.writestrs(&["VIBIX: Keyboard IRQ unmasked -- PS/2 input active.\n"]);
 
+    // Unmask timer — PIT will fire IRQ0 after STI
+    interrupts::unmask_irq(0);
+    serial.writestrs(&["VIBIX: Timer IRQ unmasked.\n"]);
+
     // GDT, TSS, and syscall MSR setup
     serial.writestrs(&["VIBIX: Loading GDT/TSS and enabling SYSCALL.\n"]);
     extern "C" {

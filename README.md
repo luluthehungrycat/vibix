@@ -164,8 +164,11 @@ The Rust target `x86_64-unknown-none` is installed automatically by the build.
 ### Commands
 
 ```bash
-# Build the kernel
+# Build the kernel (no debug output)
 make
+
+# Build with debug output (extra frame/stack dumps on exceptions)
+make DEBUG=1
 
 # Run in QEMU (serial output to terminal)
 make run
