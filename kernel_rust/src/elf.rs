@@ -5,7 +5,7 @@
 // the entry point.
 //==============================================================================
 
-#![expect(dead_code, reason = "ELF loader ready for process loading")]
+// ELF loader — wired into sys_exec() for ELF64 binary support
 
 use crate::paging;
 use crate::pmm::PmmAllocator;

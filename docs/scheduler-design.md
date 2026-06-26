@@ -1,5 +1,10 @@
 # VIBIX Multi-Process + Preemptive Scheduler Architecture
 
+> **⚠️ Status: IMPLEMENTED** — This design document describes the Phase 1
+> scheduler architecture that has been fully implemented. See the source code
+> at `kernel_rust/src/process.rs` and `kernel/context_switch.asm` for the
+> actual implementation. Reference this doc for architecture understanding.
+
 ## Current State Summary
 
 | Component | Current | Target |
@@ -168,6 +173,13 @@ LOW ADDRESS (kernel_stack_base)
 | +160   | user RSP |
 | +168   | SS       |
 
+> **⚠️ 64-bit iretq always pops SS:RSP**: Even for same-CPL returns, IA-32e mode
+> always pops SS from the frame and validates its DPL against the target CPL.
+> The idle process frame overrides SS to `0x10` (kernel data, DPL=0) to match
+> the kernel-mode CS=0x08 override. Leaving SS=0x1B (user data, DPL=3) with
+> CS=0x08 causes a GPF (error=0x0018 = USER_DATA). See `spawn_init()` in
+> `process.rs` for the override.
+
 ---
 
 ## 3. Context Switch Mechanism
@@ -297,6 +309,12 @@ context_switch_to:
 
 ### 3.5 Building the Init Process Frame
 
+`build_init_frame()` builds the register frame for a user-mode process (CS=0x23,
+SS=0x1B). For the **idle process** (PID 2), `spawn_init()` overrides CS to 0x08
+and SS to 0x10 _after_ `build_init_frame()` returns, because idle runs entirely
+in kernel mode (CPL=0). Both overrides are required because 64-bit mode `iretq`
+always pops SS:RSP regardless of CPL change.
+
 ```rust
 pub fn build_init_frame(
     kernel_stack_top: u64,
@@ -339,6 +357,8 @@ pub fn build_init_frame(
     }
 }
 ```
+
+See `kernel_rust/src/process.rs` for the idle overrides after `build_init_frame()`.
 
 ---
 
@@ -725,9 +745,12 @@ pub unsafe fn set_rsp0(rsp0: u64) {
 | kernel_rust/src/process.rs | FULL REWRITE: Process, ProcessState, ProcessTable, spawn_init(), build_init_frame(), start_scheduler(), sched_next(), scheduler_tick(), scheduler_switch_exit(), set_syscall_kstack(), current_pid(), process_mut(), load_init_binary(). |
 | kernel_rust/src/syscall.rs | Modify sys_exit, sys_getpid, sys_brk. Add sys_fork, sys_exec, sys_waitpid. Remove global PROGRAM_BREAK, ERRNO. Update init(). |
 | kernel_rust/src/gdt.rs | Add pub unsafe fn set_rsp0(u64). |
+| kernel_rust/src/interrupts.rs | Add debug-only frame dumps in exception handler (behind `cfg!(feature = "debug")`). |
 | kernel_rust/src/lib.rs | Replace create_init+enter_user_mode with spawn_init+start_scheduler. |
 | kernel/syscall_entry.asm | Add current_proc_kernel_rsp, syscall_state, should_schedule globals. Use per-process stack. Add exit/block scheduler path. |
 | kernel/interrupts.asm | Modify irq_common: call scheduler_tick after EOI, switch stacks. |
+| kernel_rust/Cargo.toml | Add `[features] debug = []` for conditional debug output. |
+| Makefile | Add `DEBUG ?= 0`, pass `--features debug` to cargo when `DEBUG=1`. |
 | Makefile | Add context_switch.o to link line. |
 
 ### Unchanged
@@ -738,7 +761,6 @@ pub unsafe fn set_rsp0(rsp0: u64) {
 | kernel_rust/src/paging.rs | No changes needed |
 | kernel_rust/src/pmm.rs | No changes needed |
 | kernel_rust/src/elf.rs | Already correct |
-| kernel_rust/src/interrupts.rs | No changes needed (handler dispatched by asm) |
 
 ---
 
@@ -763,11 +785,13 @@ CPU clears IF on interrupt gate entry (our IDT setup). scheduler_tick runs with 
 
 ## 9. Future Work
 
-1. True blocking waitpid with automatic syscall restart
-2. Idle process (HLT loop) for power saving
-3. Address space isolation (per-process page tables)
-4. COW fork
-5. IPC (pipes, shared memory, signals)
-6. Kernel stack reclamation on process exit
-7. Syscall times / per-process accounting
-8. Per-CPU data for SMP
+1. ~~Idle process (HLT loop) for power saving~~ ✅ DONE (PID 2)
+2. ~~IPC (pipes)~~ ✅ DONE (syscall 20)
+3. Signals + process groups — needed for Ctrl+C / job control (see [phase3c.md](phase3c.md))
+4. True blocking waitpid with automatic syscall restart
+5. Address space isolation (per-process page tables)
+6. COW fork
+7. Shared memory (shm)
+8. Kernel stack reclamation on process exit
+9. Syscall times / per-process accounting
+10. Per-CPU data for SMP

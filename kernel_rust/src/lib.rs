@@ -21,6 +21,7 @@ mod syscall;
 mod paging;
 mod process;
 
+mod vfs;
 use core::panic::PanicInfo;
 
 //------------------------------------------------------------------------------
@@ -110,6 +111,10 @@ pub extern "C" fn kernel_main() -> ! {
     interrupts::unmask_irq(1);
     serial.writestrs(&["VIBIX: Keyboard IRQ unmasked -- PS/2 input active.\n"]);
 
+    // Unmask timer — PIT will fire IRQ0 after STI
+    interrupts::unmask_irq(0);
+    serial.writestrs(&["VIBIX: Timer IRQ unmasked.\n"]);
+
     // GDT, TSS, and syscall MSR setup
     serial.writestrs(&["VIBIX: Loading GDT/TSS and enabling SYSCALL.\n"]);
     extern "C" {
@@ -117,7 +122,10 @@ pub extern "C" fn kernel_main() -> ! {
     }
     gdt::init(syscall_entry as *const () as u64);
     syscall::init();
-
+    // Virtual File System
+    serial.writestrs(&["VIBIX: Initialising VFS...\n"]);
+    unsafe { vfs::vfs_init(); }
+    serial.writestrs(&["VIBIX: VFS ready.\n"]);
     // Enable interrupts — timer ticks will begin immediately
     serial.writestrs(&["VIBIX: Enabling interrupts.\n"]);
     unsafe { interrupts::enable_interrupts(); }

@@ -10,6 +10,7 @@
 // Return value in rax.
 //
 // Phase 2 additions: fork (8), exec (9), waitpid (10).
+// Phase 3: dup (18), dup2 (19).
 //==============================================================================
 
 use core::fmt::Write;
@@ -17,15 +18,41 @@ use crate::serial::SerialPort;
 use crate::pmm;
 use crate::process::{current_pid, process_mut, BRK_START, BRK_MAX};
 use crate::process;
+use crate::vfs::{MAX_FDS, EBADF, EMFILE};
 
 /// Syscall handler function pointer.
-type SyscallFn = fn(u64, u64, u64, u64) -> u64;
+pub type SyscallFn = fn(u64, u64, u64, u64) -> u64;
 
 /// Maximum number of syscalls supported.
 const MAX_SYSCALLS: usize = 64;
 
 /// Syscall dispatch table.
 static mut SYSCALL_TABLE: [Option<SyscallFn>; MAX_SYSCALLS] = [None; MAX_SYSCALLS];
+//==============================================================================
+// mmap constants (syscall 11)
+//==============================================================================
+
+/// Page protection flags
+#[allow(dead_code)]
+const PROT_NONE:  u64 = 0;
+#[allow(dead_code)]
+const PROT_READ:  u64 = 1;
+#[allow(dead_code)]
+const PROT_WRITE: u64 = 2;
+#[allow(dead_code)]
+const PROT_EXEC:  u64 = 4;
+
+/// Mapping flags
+#[allow(dead_code)]
+const MAP_SHARED:    u64 = 0x01;
+#[allow(dead_code)]
+const MAP_PRIVATE:   u64 = 0x02;
+const MAP_FIXED:     u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+/// mmap failure sentinel
+const MAP_FAILED: u64 = u64::MAX;
+
 
 //==============================================================================
 // Syscall handlers
@@ -46,6 +73,13 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     if parent_pid != 0 {
         let parent = process_mut(parent_pid);
         if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
+            // Patch RAX in parent's saved frame to child PID (waitpid return value)
+            unsafe {
+                let parent_rsp = parent.kernel_rsp;
+                if parent_rsp != 0 {
+                    *(parent_rsp as *mut u64) = pid;
+                }
+            }
             parent.state = process::ProcessState::Ready;
             parent.wait_for_pid = 0;
         }
@@ -58,46 +92,66 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     0  // value ignored; asm diverts to scheduler
 }
 
-/// Syscall 1: write(int fd, const char *buf, size_t len) → bytes written.
+/// Syscall 1: write(int fd, const void *buf, size_t len) → bytes written.
 ///
-/// Currently only fd=1 (stdout, mapped to serial) is supported.
+/// Dispatches through VFS: resolves fd → fd_table → OFT → vnode write op.
 fn sys_write(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
-    if fd != 1 {
-        return 0;  // unsupported fd
+    if fd as usize >= MAX_FDS || buf == 0 || len == 0 {
+        return 0;
     }
-    let mut serial = SerialPort::new();
-    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
-    for &byte in slice {
-        serial.putchar(byte as char);
+    let pid = current_pid();
+    let proc = process_mut(pid);
+    let oft_idx = proc.fd_table.fds[fd as usize];
+    if oft_idx < 0 { return 0; }
+
+    unsafe {
+        let of = match crate::vfs::open_file::oft_get(oft_idx as usize) {
+            Some(of) => of as *mut crate::vfs::open_file::OpenFile,
+            None => return 0,
+        };
+        let vnode = match &mut (*of).vnode {
+            Some(ref mut vn) => *vn as *mut crate::vfs::Vnode,
+            None => return 0,
+        };
+        match (*(*vnode).ops).write {
+            Some(write_fn) => {
+                let nwritten = write_fn(vnode, buf as *const u8, len as usize, &mut (*of).offset);
+                if nwritten < 0 { 0 } else { nwritten as u64 }
+            }
+            None => 0,
+        }
     }
-    len
 }
 
 /// Syscall 2: read(int fd, void *buf, size_t len) → bytes read.
 ///
-/// fd=0 (stdin) reads from:
-///   1. PS/2 keyboard ring buffer (IRQ1 — used with QEMU graphical display)
-///   2. Fall back to serial port COM1 (used with `-serial stdio`)
-/// Other fds return -1 (unsupported).
+/// Dispatches through VFS: resolves fd → fd_table → OFT → vnode read op.
 fn sys_read(fd: u64, buf: u64, len: u64, _: u64) -> u64 {
-    if fd != 0 {
-        return u64::MAX;  // unsupported fd
+    if fd as usize >= MAX_FDS || buf == 0 || len == 0 {
+        return u64::MAX;
     }
-    if buf == 0 || len == 0 {
-        return 0;
+    let pid = current_pid();
+    let proc = process_mut(pid);
+    let oft_idx = proc.fd_table.fds[fd as usize];
+    if oft_idx < 0 { return u64::MAX; }
+
+    unsafe {
+        let of = match crate::vfs::open_file::oft_get(oft_idx as usize) {
+            Some(of) => of as *mut crate::vfs::open_file::OpenFile,
+            None => return u64::MAX,
+        };
+        let vnode = match &mut (*of).vnode {
+            Some(ref mut vn) => *vn as *mut crate::vfs::Vnode,
+            None => return u64::MAX,
+        };
+        match (*(*vnode).ops).read {
+            Some(read_fn) => {
+                let nread = read_fn(vnode, buf as *mut u8, len as usize, &mut (*of).offset);
+                if nread < 0 { u64::MAX } else { nread as u64 }
+            }
+            None => u64::MAX,
+        }
     }
-    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
-
-    // Try PS/2 keyboard ring buffer first.
-    let mut count = crate::keyboard::read(slice);
-
-    // Fall back to serial port (COM1) if keyboard had no data.
-    if count == 0 {
-        let serial = SerialPort::new();
-        count = serial.read(slice);
-    }
-
-    count as u64
 }
 
 /// Syscall 3: getpid() → process ID.
@@ -180,6 +234,64 @@ fn sys_exec(a: u64, b: u64, c: u64, _d: u64) -> u64 {
     crate::process::sys_exec(a, b, c) as u64
 }
 
+//==============================================================================
+// Syscall 11: mmap — memory mapping (MAP_ANONYMOUS only)
+//==============================================================================
+
+/// Syscall 11: mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+///
+/// For MVP, only MAP_ANONYMOUS (with or without MAP_FIXED) is supported.
+/// fd and offset are ignored (must be -1 and 0 for MAP_ANONYMOUS).
+fn sys_mmap(addr: u64, length: u64, _prot: u64, flags: u64) -> u64 {
+    let pid = current_pid();
+    let proc = process_mut(pid);
+
+    if length == 0 {
+        proc.errno = 22;   // EINVAL
+        return MAP_FAILED;
+    }
+
+    let is_anon  = flags & MAP_ANONYMOUS != 0;
+    let is_fixed = flags & MAP_FIXED != 0;
+
+    if !is_anon {
+        proc.errno = 38;   // ENOSYS
+        return MAP_FAILED;
+    }
+
+    let page_aligned_len = (length + 0xFFF) & !0xFFF;
+
+    let base = if is_fixed {
+        if addr & 0xFFF != 0 {
+            proc.errno = 22;   // EINVAL
+            return MAP_FAILED;
+        }
+        addr
+    } else {
+        // Use current brk as allocation point
+        let alloc = proc.brk;
+        proc.brk += page_aligned_len;
+        alloc
+    };
+
+    let pmm = crate::pmm::global_pmm();
+    let mut vaddr = base;
+    while vaddr < base + page_aligned_len {
+        let phys = pmm.alloc();
+        if phys.is_null() {
+            proc.errno = 12;   // ENOMEM
+            return MAP_FAILED;
+        }
+        unsafe { core::ptr::write_bytes(phys, 0, 4096); }
+        crate::paging::map_4k(vaddr, phys as u64, crate::paging::PAGE_USER_RW, pmm);
+        crate::paging::invlpg(vaddr);
+        vaddr += 4096;
+    }
+
+    base
+}
+
+
 /// Syscall 10: waitpid(pid, wstatus, flags) — wait for child.
 fn sys_waitpid(a: u64, b: u64, c: u64, _d: u64) -> u64 {
     crate::process::sys_waitpid(a as i64, b, c) as u64
@@ -232,6 +344,64 @@ fn sys_brk(addr: u64, _: u64, _: u64, _: u64) -> u64 {
 }
 
 //==============================================================================
+// fd-dup syscalls: dup (18), dup2 (19)
+//==============================================================================
+
+/// Syscall 18: dup(int old_fd) — duplicate a file descriptor.
+///
+/// Returns the new fd number on success, or -EBADF / -EMFILE on error.
+fn sys_dup(old_fd: u64, _: u64, _: u64, _: u64) -> u64 {
+    if old_fd as usize >= MAX_FDS {
+        return (-EBADF as i64) as u64;
+    }
+    let pid = current_pid();
+    let proc = process_mut(pid);
+    let oft_idx = proc.fd_table.fds[old_fd as usize];
+    if oft_idx < 0 {
+        return (-EBADF as i64) as u64;
+    }
+    // Find first free fd
+    for new_fd in 0..MAX_FDS {
+        if proc.fd_table.fds[new_fd] < 0 {
+            proc.fd_table.fds[new_fd] = oft_idx;
+            crate::vfs::open_file::oft_incref(oft_idx as usize);
+            return new_fd as u64;
+        }
+    }
+    (-EMFILE as i64) as u64
+}
+
+/// Syscall 19: dup2(int old_fd, int new_fd) — duplicate a file descriptor to a specific number.
+///
+/// Follows Linux convention:
+///   - If old_fd == new_fd, return new_fd (no-op).
+///   - If new_fd is already open, close it first.
+fn sys_dup2(old_fd: u64, new_fd: u64, _: u64, _: u64) -> u64 {
+    if old_fd as usize >= MAX_FDS || new_fd as usize >= MAX_FDS {
+        return (-EBADF as i64) as u64;
+    }
+    if old_fd == new_fd {
+        return new_fd;
+    }
+    let pid = current_pid();
+    let proc = process_mut(pid);
+    let oft_idx = proc.fd_table.fds[old_fd as usize];
+    if oft_idx < 0 {
+        return (-EBADF as i64) as u64;
+    }
+    // If new_fd is already open, close it first
+    let new_oft_idx = proc.fd_table.fds[new_fd as usize];
+    if new_oft_idx >= 0 {
+        proc.fd_table.fds[new_fd as usize] = -1;
+        crate::vfs::open_file::oft_decref(new_oft_idx as usize);
+    }
+    // Point new_fd to the same OFT entry as old_fd
+    proc.fd_table.fds[new_fd as usize] = oft_idx;
+    crate::vfs::open_file::oft_incref(oft_idx as usize);
+    new_fd
+}
+
+//==============================================================================
 // Public API
 //==============================================================================
 
@@ -264,6 +434,11 @@ pub fn init() {
     register(8, sys_fork);
     register(9, sys_exec);
     register(10, sys_waitpid);
+    register(11, sys_mmap);
+    // Phase 3: fd duplication
+    register(18, sys_dup);
+    register(19, sys_dup2);
+    register(20, sys_pipe);
 }
 
 //==============================================================================
@@ -293,4 +468,17 @@ pub extern "C" fn syscall_handler(
     }
     // Unknown syscall — return -1
     u64::MAX
+}
+
+//==============================================================================
+// Syscall 20: pipe(pipefd) — create a pipe
+//==============================================================================
+
+/// Syscall 20: pipe(pipefd) — create a pipe.
+///
+/// `pipefd` is a pointer to a user-space array of two `i32`s.
+/// On success, writes `[read_fd, write_fd]` to `pipefd` and returns 0.
+/// On error, returns a negative errno value.
+fn sys_pipe(pipefd: u64, _: u64, _: u64, _: u64) -> u64 {
+    crate::vfs::pipe::sys_pipe(pipefd) as u64
 }

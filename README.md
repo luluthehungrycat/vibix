@@ -13,14 +13,14 @@ coding agent collaboration alongside traditional coding. The kernel was original
 prototyped in freestanding C, then ported to Rust for stronger safety guarantees
 and better alignment with modern kernel development practices.
 
-**Current status: MVP boots in QEMU with full interrupt handling (IDT, PIC, PIT
-at 100 Hz), VBE framebuffer (1024×768×32 with bitmap font rendering), physical
-memory manager, kernel heap allocator, keyboard driver module with ring buffer,
-GDT with Ring 3 segments and TSS, SYSCALL/SYSRET entry (via LSTAR MSR), syscall
-dispatch table (5 syscalls: exit, write, read, getpid, brk), ELF64 loader,
-and kernel-internal errno — all built in Rust (stable, no_std).  The kernel
-enters user mode (Ring 3), runs a flat binary init process (PID 1) that prints
-"Hello, world!" and "From PID 1 (init)", then exits with code 0.**
+**Current status: MVP boots in QEMU with full preemptive multitasking (round-robin
+scheduler, 64-process table, idle process), VFS layer (vnode abstraction, open
+file table, mount table, devfs, initramfs with ustar parser, rootfs), 19 syscalls
+(exit, write, read, getpid, brk, nanosleep, uname, reboot, fork, exec, waitpid,
+mmap, open, close, lseek, getdents, dup, dup2, pipe), ELF64 + flat binary loader,
+per-process fd table with /dev/ttyS0 for fd 0/1/2, and full interrupt handling
+(IDT, PIC, PIT at 100 Hz), VBE framebuffer, PMM, KMM, keyboard driver, GDT with
+Ring 3/TSS — all built in Rust (stable, no_std).**
 
 ---
 
@@ -77,43 +77,75 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 
 ### Implemented
 
+#### Core Infrastructure
 - [x] **Multiboot v1 boot** — QEMU `-kernel` loads our ELF32
 - [x] **32→64-bit transition** — GDT, PAE, PML4, long mode entry
 - [x] **Two-stage build system** — flat 64-bit binary `incbin`ed into ELF32 wrapper
 - [x] **Serial output** — COM1 at 115200 8N1 via port I/O (Rust)
 - [x] **Physical Memory Manager** — bitmap allocator, 256 MB managed, self-test (Rust)
-- [x] **Rust port** — kernel core migrated from C to Rust (stable, `no_std`, `x86_64-unknown-none` target)
+- [x] **Kernel heap allocator** — first-fit free-list, coalescing, split
 - [x] **Automated test suite** — `make test` boots QEMU and validates output
 - [x] **Anti-plagiarism checks** — `python3 anti_cheat.py` scans for Linux/BSD patterns
+
+#### Interrupts & Devices
 - [x] **Interrupts (IDT + PIC)** — remapped IRQs, handler dispatch (Rust+asm)
 - [x] **PIT driver** — 100 Hz system timer via IRQ0
 - [x] **PS/2 Keyboard driver** — IRQ1 handler, scancode decoding
 - [x] **Framebuffer display** — Bochs VBE direct I/O, 1024×768×32, 8×16 bitmap font
-- [x] **Kernel heap allocator** — first-fit free-list, coalescing, split
-- [x] **GDT with Ring 3 segments + TSS** — user-mode code/data segments and task
-  state segment for syscall stack switching.
-- [x] **Syscall entry** — `syscall`/`sysretq` handler via LSTAR MSR, saves/restores
-  user registers, dispatches to Rust.
-- [x] **Syscall dispatch** — 64-slot table, 5 syscalls registered (exit, write,
-  read, getpid, brk).  ABI documented in [SYSCALL.md](SYSCALL.md).
-- [x] **User-mode entry** — flat binary init process (PID 1) loaded at 32 MiB,
-  entered via IRETQ to Ring 3, prints "Hello, world!" and exits cleanly with
-  code 0.
-- [x] **Paging** — 4-level page tables, 4 KiB and 2 MiB pages, map/unmap/translate,
-  self-test.
-- [x] **`read` syscall** — PS/2 keyboard driver wired to `sys_read` (fd=0).
-- [x] **`brk` syscall** — dynamic heap growth with demand paging (up to 256 MiB).
-- [x] **ELF64 loader** — parses `ET_EXEC` with `PT_LOAD` segments, creates user pages.
-- [x] **`errno` mechanism** — kernel-internal `errno` set on syscall errors.
-- [x] **Correct syscall ABI** — register rotation in `syscall_entry.asm` preserves
-  all 5 user arguments (verified: exit code 0).
+
+#### Memory Management
+- [x] **Paging** — 4-level page tables, 4 KiB and 2 MiB pages, map/unmap/translate, self-test
+- [x] **`brk` syscall** — dynamic heap growth with demand paging (up to 256 MiB)
+- [x] **`mmap` syscall** — MAP_ANONYMOUS memory mapping (syscall 11)
+
+#### Process & Scheduler
+- [x] **Preemptive round-robin scheduler** — PIT-driven context switching, 64-slot process table
+- [x] **Per-process kernel stacks** — 4 KiB per process, switched on context switch
+- [x] **Idle process** — PID 2, HLT loop when nothing else is ready
+- [x] **Process states** — Ready, Running, Blocked, Zombie with correct transitions
+- [x] **`fork` syscall** — creates child with copy of kernel stack, shared fd table (syscall 8)
+- [x] **`exec` syscall** — ELF64 and flat binary loading from VFS path (syscall 9)
+- [x] **`waitpid` syscall** — block parent until child exit, reap zombies (syscall 10)
+
+#### Virtual File System
+- [x] **Vnode abstraction** — Vnode with function-pointer ops table, FsType dispatch
+- [x] **Global Open File Table** — 64 entries with refcounted OpenFile descriptors
+- [x] **Per-process fd table** — 16 fds, embedded in Process struct, fork shares correctly
+- [x] **Mount table** — static 4-slot, rootfs at `/`, devfs at `/dev`
+- [x] **devfs** — `/dev/null`, `/dev/zero`, `/dev/ttyS0` with char device semantics
+- [x] **initramfs** — embedded ustar archive parser, boot-time entry build, linear lookup
+- [x] **rootfs** — minimal in-memory directory skeleton
+- [x] **Path resolution** — component-by-component walk with mount point crossing
+- [x] **`open`/`close` syscalls** — VFS-backed fd allocation (syscalls 12-13)
+- [x] **`read`/`write` VFS dispatch** — fd→OFT→vnode→ops chain (syscalls 14-15)
+- [x] **`lseek` syscall** — file offset repositioning (syscall 16)
+- [x] **`getdents` syscall** — directory listing (syscall 17)
+
+#### Additional Syscalls
+- [x] **`exit` syscall** — Zombie state, wakes blocked parent, reschedules (syscall 0)
+- [x] **`write` syscall** — serial console via /dev/ttyS0 (syscall 1)
+- [x] **`read` syscall** — keyboard ring buffer via /dev/ttyS0 (syscall 2)
+- [x] **`getpid` syscall** — returns current_pid() (syscall 3)
+- [x] **`nanosleep` syscall** — busy-wait based on PIT ticks (syscall 5)
+- [x] **`uname` syscall** — system identification structure (syscall 6)
+- [x] **`reboot` syscall** — QEMU ISA reboot/poweroff (syscall 7)
+- [x] **`dup`/`dup2` syscalls** — file descriptor duplication (syscalls 18-19)
+- [x] **`pipe` syscall** — inter-process communication via shared ring buffer (syscall 20)
+
+#### GDT / Syscall ABI
+- [x] **GDT with Ring 3 segments + TSS** — user-mode code/data segments and TSS for syscall stack switching
+- [x] **TSS.RSP0 update** — per-context-switch RSP0 for correct syscall kernel stack
+- [x] **Syscall entry** — `syscall`/`sysretq` via LSTAR MSR, saves/restores user registers
+- [x] **Syscall dispatch** — 64-slot table, 19 syscalls registered
+- [x] **Correct syscall ABI** — register rotation preserves all 5 user arguments
+- [x] **`errno` mechanism** — per-process errno set on syscall errors
+- [x] **ELF64 loader** — parses `ET_EXEC` with `PT_LOAD` segments
+- [x] **User-mode entry** — init process loaded from initramfs `/sbin/init`
 
 ### Next Up (Recommended Order)
 
-1. **Multiple processes + scheduler** — context switching, preemptive
-   multitasking, `fork`/`exec`.
-2. **Shell** — keyboard + serial + framebuffer → interactive user interface.
-3. **File systems** — block device interface, initrd/tmpfs.
+See [docs/phase3c.md](docs/phase3c.md) for detailed planning on the next
+development phase (Phase 3c: Shell, init, and ANSI terminal).
 
 ---
 
@@ -132,8 +164,11 @@ The Rust target `x86_64-unknown-none` is installed automatically by the build.
 ### Commands
 
 ```bash
-# Build the kernel
+# Build the kernel (no debug output)
 make
+
+# Build with debug output (extra frame/stack dumps on exceptions)
+make DEBUG=1
 
 # Run in QEMU (serial output to terminal)
 make run
@@ -174,13 +209,16 @@ VIBIX: Framebuffer initialised.
 VIBIX: Initialising interrupts...
 VIBIX: IDT loaded, PIC remapped.
 VIBIX: PIT timer initialised at 100 Hz.
+VIBIX: PS/2 keyboard ready.
+VIBIX: Keyboard IRQ unmasked -- PS/2 input active.
 VIBIX: Loading GDT/TSS and enabling SYSCALL.
+VIBIX: Initialising VFS...
+VIBIX: VFS ready.
 VIBIX: Enabling interrupts.
 VIBIX: Boot sequence complete — spawning PID 1.
-VIBIX: Entering user mode...
-Hello, world!
-From PID 1 (init)
-VIBIX: init exited with code 0
+VIBIX: Created PID 1 (init).
+VIBIX: Starting scheduler...
+<init process output>
 ```
 
 ---
@@ -193,6 +231,9 @@ VIBIX: init exited with code 0
 | `test_kernel.py` | Boots QEMU, captures serial output, verifies boot banner |
 | `run_qemu.sh` | QEMU runner with debug logging (`-d int,cpu_reset`) |
 | `SYSCALL.md` | Formal system call ABI specification for userspace programs |
+| `docs/scheduler-design.md` | Scheduler and multi-process architecture |
+| `docs/vfs-design.md` | Virtual File System architecture |
+| `docs/phase3c.md` | Phase 3c roadmap: shell, terminal, next steps |
 
 ---
 

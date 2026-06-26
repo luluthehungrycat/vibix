@@ -14,12 +14,13 @@
 ;   6 = printenv    — print environment variables
 ;   7 = clear_demo  — ANSI ESC[2J ESC[H
 ;   8 = yes_cmd     — infinite "y\n" loop
+;   9 = vfs_test    — VFS syscall exercise test
 ;==============================================================================
 
 ORG 0x2000000
 bits 64
 
-NUM_COMMANDS equ 9
+NUM_COMMANDS equ 10
 
 section .text
 global _start
@@ -115,6 +116,7 @@ dispatch_table:
     dq printenv_demo    ; 6: print environment
     dq clear_demo       ; 7: clear terminal (ANSI)
     dq yes_cmd          ; 8: infinite y loop
+    dq vfs_test          ; 9: VFS syscall exercise
 
 ; ── String data ──────────────────────────────────────────────────────────────
 str_echo:       db "echo", 0
@@ -139,3 +141,4 @@ args_e_octal:   dq str_echo, str_e_flag, str_octal_test
 ; Shell includes writable buffers (resb/resq), so keep it in .text
 section .text
 %include "vibix_shell.inc"
+%include "vibix_vfstest.inc"
