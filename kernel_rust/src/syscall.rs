@@ -60,13 +60,40 @@ const MAP_FAILED: u64 = u64::MAX;
 
 /// Syscall 0: exit(int code) — marks process as Zombie and triggers reschedule.
 fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
+    let pid = current_pid();
     let mut serial = SerialPort::new();
     serial.init();
-    serial.writestrs(&["exit\n"]);
+    serial.writestrs(&["VIBIX: PID "]);
+    // Write PID in decimal (at most 2 digits)
+    let p = pid;
+    if p >= 10 { serial.putchar((b'0' + (p / 10) as u8) as char); }
+    serial.putchar((b'0' + (p % 10) as u8) as char);
+    serial.writestrs(&[" exited with code "]);
+    // Write exit code in decimal
+    let c = code;
+    if c >= 10 { serial.putchar((b'0' + ((c / 10) % 10) as u8) as char); }
+    serial.putchar((b'0' + (c % 10) as u8) as char);
+    serial.putchar('\n');
 
-    let cur = process_mut(current_pid());
+    let cur = process_mut(pid);
     cur.state = process::ProcessState::Zombie;
     cur.exit_code = code;
+
+    // Wake parent if it's blocked waiting for us
+    let parent_pid = cur.parent_pid;
+    if parent_pid != 0 {
+        let parent = process_mut(parent_pid);
+        if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
+            unsafe {
+                let parent_rsp = parent.kernel_rsp;
+                if parent_rsp != 0 {
+                    *(parent_rsp as *mut u64) = pid;
+                }
+            }
+            parent.state = process::ProcessState::Ready;
+            parent.wait_for_pid = 0;
+        }
+    }
 
     unsafe {
         core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);

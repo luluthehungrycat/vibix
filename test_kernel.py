@@ -23,7 +23,7 @@ CHECKLIST = {
     "VIBIX: Starting scheduler...":       "Scheduler start",
     "Hello, world!":                      "User-mode init output",
     "From PID 1 (init)":                  "Init process message",
-    "exit\n":                             "Init exit",
+    "VIBIX: PID 1 exited with code 0":   "Init exit",
 }
 
 OPTIONAL = {
