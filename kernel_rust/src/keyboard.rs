@@ -5,8 +5,6 @@
 // to the serial console for echo.
 //==============================================================================
 
-use crate::serial::SerialPort;
-
 //--- Circular buffer for keyboard input -------------------------------------
 
 /// Size of the keyboard input ring buffer.
@@ -173,11 +171,8 @@ pub fn handle_keyboard() {
     let shifted = unsafe { SHIFT };
     let table = if shifted { &SCANCODE_MAKE_SHIFT } else { &SCANCODE_MAKE };
     if let Some(byte) = table[scancode as usize] {
-        // Echo to serial console.
-        let mut serial = SerialPort::new();
-        serial.putchar(byte as char);
-
         // Push into the circular keyboard buffer (non-blocking, drops on full).
+        // (Echo is handled by the Tty line discipline during read().)
         unsafe {
             let next_head = (HEAD + 1) % BUF_SIZE;
             if next_head != TAIL {

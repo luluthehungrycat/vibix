@@ -9,7 +9,7 @@ use crate::pmm::PmmAllocator;
 use crate::gdt;
 
 const MAX_PROCS: usize = 64;
-const KERNEL_STACK_SIZE: usize = 4096;
+const KERNEL_STACK_SIZE: usize = 12288;  // 12 KB (3 pages)
 const USER_CODE_ADDR: u64 = 0x2000000;
 const USER_STACK_ADDR: u64 = 0x2002000;
 
@@ -51,6 +51,7 @@ pub struct Process {
     pub errno: i64,
     pub name: [u8; 32],
     pub fd_table: crate::vfs::FdTable,
+    pub cwd: [u8; 256],
 }
 
 pub struct ProcessTable {
@@ -280,12 +281,12 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
 
     // ── PID 1: init ──
-    let kstack_page = pmm.alloc();
+    let kstack_page = pmm.alloc_pages(3);
+
     if kstack_page.is_null() {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
     }
     let ktop = kstack_page as u64 + KERNEL_STACK_SIZE as u64;
-
     // Build synthetic frame with command_id=1 (init_demo, not shell)
     let krsp = build_init_frame(ktop, USER_CODE_ADDR, USER_STACK_ADDR + 0x1000, 1);
 
@@ -311,6 +312,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             n
         },
             fd_table: crate::vfs::FdTable::new(),
+        cwd: {
+            let mut c = [0u8; 256];
+            c[0] = b'/';
+            c
+        },
     });
     table.count = 1;
     table.next_pid = 2;
@@ -341,7 +347,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
 
     // ── PID 2: idle ──
-    let idle_kstack = pmm.alloc();
+    let idle_kstack = pmm.alloc_pages(3);
     if idle_kstack.is_null() {
         // No memory for idle stack — halt (should never happen)
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
@@ -389,6 +395,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             n
         },
             fd_table: crate::vfs::FdTable::new(),
+        cwd: {
+            let mut c = [0u8; 256];
+            c[0] = b'/';
+            c
+        },
     });
     table.count = 2;
     table.next_pid = 3;
@@ -495,7 +506,7 @@ pub fn sys_fork() -> i64 {
     // Allocate new kernel stack for child
     let child_kstack = {
         let pmm = crate::pmm::global_pmm();
-        pmm.alloc()
+        pmm.alloc_pages(3)
     };
     if child_kstack.is_null() {
         return -1; // ENOMEM
@@ -545,6 +556,7 @@ pub fn sys_fork() -> i64 {
                         n
                     },
                     fd_table: parent.fd_table,
+                    cwd: parent.cwd,
                 });
                 // Increment refcount on shared OFT entries (child now shares them)
                 {

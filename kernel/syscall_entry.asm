@@ -64,6 +64,8 @@ syscall_entry:
     mov rsi, r9          ; rsi = arg1 = user rdi
     mov rdi, rax         ; rdi = num = syscall number
 
+
+
     call syscall_handler
 
     ; Check for pending reschedule

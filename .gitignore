@@ -18,6 +18,9 @@ __pycache__/
 # Deepwork progress files
 .slim/deepwork/
 
+# Build artifact (no extension)
+userspace/vibix_blob
+
 # OS artifacts
 *~
 .DS_Store

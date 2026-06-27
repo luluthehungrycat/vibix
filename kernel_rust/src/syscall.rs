@@ -60,36 +60,18 @@ const MAP_FAILED: u64 = u64::MAX;
 
 /// Syscall 0: exit(int code) — marks process as Zombie and triggers reschedule.
 fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
-    let pid = current_pid();
     let mut serial = SerialPort::new();
-    let _ = core::write!(serial, "VIBIX: PID {} exited with code {}\n", pid, code);
+    serial.init();
+    serial.writestrs(&["exit\n"]);
 
-    let cur = process_mut(pid);
+    let cur = process_mut(current_pid());
     cur.state = process::ProcessState::Zombie;
     cur.exit_code = code;
 
-    // Wake parent if it's blocked waiting for us
-    let parent_pid = cur.parent_pid;
-    if parent_pid != 0 {
-        let parent = process_mut(parent_pid);
-        if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
-            // Patch RAX in parent's saved frame to child PID (waitpid return value)
-            unsafe {
-                let parent_rsp = parent.kernel_rsp;
-                if parent_rsp != 0 {
-                    *(parent_rsp as *mut u64) = pid;
-                }
-            }
-            parent.state = process::ProcessState::Ready;
-            parent.wait_for_pid = 0;
-        }
-    }
-
-    // Signal the assembly stub to divert through scheduler
     unsafe {
-        process::should_schedule = 1;
+        core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
     }
-    0  // value ignored; asm diverts to scheduler
+    0
 }
 
 /// Syscall 1: write(int fd, const void *buf, size_t len) → bytes written.
