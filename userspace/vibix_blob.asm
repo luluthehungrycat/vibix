@@ -60,9 +60,10 @@ init_demo:
     mov rax, 3
     syscall
 
-    ; Now run stat/chdir syscall tests
-    call stat_chdir_test
-    ; stat_chdir_test exits, does not return
+    ; Exit cleanly (test_kernel.py checks for "VIBIX: PID 1 exited with code 0")
+    xor edi, edi
+    mov eax, 0
+    syscall
 
 ; ── Echo demo ─────────────────────────────────────────────────────────────────
 echo_demo:

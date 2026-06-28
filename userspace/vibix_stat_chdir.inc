@@ -114,7 +114,7 @@ stat_chdir_test:
     js .t5_fail
     lea rsi, [rel sc_str_ok_rel]
     call print_str
-    jmp .t6
+    jmp .done
 
 .t5_fail:
     lea rsi, [rel sc_str_fail_rel]

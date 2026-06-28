@@ -378,13 +378,10 @@ pub fn vfs_resolve(path: &[u8]) -> Result<&'static mut Vnode, i32> {
     Ok(current)
 }
 
-/// Scratch buffer for vfs_resolve_relative concatenation.
-/// Safe because syscalls run with interrupts disabled (single-CPU).
-static mut VFS_REL_BUF: [u8; PATH_MAX] = [0; PATH_MAX];
-
 /// Resolve a path relative to a current working directory.
 /// If `path` starts with '/', it's treated as absolute and passed directly to `vfs_resolve`.
-/// Otherwise, concatenates `cwd + "/" + path` into an internal buffer and resolves the result.
+/// Otherwise, concatenates `cwd + "/" + path` into a stack buffer and resolves the result.
+/// Stack buffer is safe because kernel stack is 12 KiB (3 pages, KERNEL_STACK_SIZE=12288).
 /// Returns `Ok(vnode)` on success, `Err(i32)` with a negative errno on failure.
 pub fn vfs_resolve_relative(cwd: &[u8], path: &[u8]) -> Result<&'static mut Vnode, i32> {
     // If path starts with '/', it's absolute — resolve directly
@@ -392,28 +389,27 @@ pub fn vfs_resolve_relative(cwd: &[u8], path: &[u8]) -> Result<&'static mut Vnod
         return vfs_resolve(path);
     }
 
-    // Relative path: build cwd + "/" + path in static buffer (avoids stack pressure)
-    unsafe {
-        let mut pos = 0usize;
-        // Copy cwd (already stripped of NUL)
-        while pos < cwd.len() {
-            VFS_REL_BUF[pos] = cwd[pos];
-            pos += 1;
-        }
-        // Ensure separator
-        if pos == 0 || VFS_REL_BUF[pos - 1] != b'/' {
-            if pos >= PATH_MAX - 1 { return Err(ENAMETOOLONG); }
-            VFS_REL_BUF[pos] = b'/';
-            pos += 1;
-        }
-        // Copy path (already stripped of NUL)
-        for &b in path {
-            if pos >= PATH_MAX { return Err(ENAMETOOLONG); }
-            VFS_REL_BUF[pos] = b;
-            pos += 1;
-        }
-        vfs_resolve(&VFS_REL_BUF[..pos])
+    // Relative path: build cwd + "/" + path on the stack
+    let mut buf = [0u8; PATH_MAX];
+    let mut pos = 0usize;
+    // Copy cwd (already stripped of NUL)
+    while pos < cwd.len() {
+        buf[pos] = cwd[pos];
+        pos += 1;
     }
+    // Ensure separator
+    if pos == 0 || buf[pos - 1] != b'/' {
+        if pos >= PATH_MAX - 1 { return Err(ENAMETOOLONG); }
+        buf[pos] = b'/';
+        pos += 1;
+    }
+    // Copy path (already stripped of NUL)
+    for &b in path {
+        if pos >= PATH_MAX { return Err(ENAMETOOLONG); }
+        buf[pos] = b;
+        pos += 1;
+    }
+    vfs_resolve(&buf[..pos])
 }
 
 //==============================================================================
