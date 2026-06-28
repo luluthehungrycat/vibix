@@ -17,6 +17,7 @@ const USER_STACK_ADDR: u64 = 0x2002000;
 /// BRK start address (shared constant for per-process brk)
 pub const BRK_START: u64 = 0x201_0000;
 pub const BRK_MAX: u64 = 0x1000_0000;
+pub const SIGINT: u64 = 2;  // signal number 2 = SIGINT
 
 /// Idle process entry — runs in kernel mode, halts forever.
 extern "C" fn idle_entry() -> ! {
@@ -49,6 +50,7 @@ pub struct Process {
     pub wait_for_pid: u64,
     pub brk: u64,
     pub errno: i64,
+    pub sig_pending: u64,    // bitmask: bit N = signal N pending
     pub name: [u8; 32],
     pub fd_table: crate::vfs::FdTable,
     pub cwd: [u8; 256],
@@ -304,6 +306,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         wait_for_pid: 0,
         brk: BRK_START,
         errno: 0,
+        sig_pending: 0,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"init\0";
@@ -387,6 +390,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         wait_for_pid: 0,
         brk: 0,
         errno: 0,
+        sig_pending: 0,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"idle\0";
@@ -548,6 +552,7 @@ pub fn sys_fork() -> i64 {
                     wait_for_pid: 0,
                     brk: parent.brk,
                     errno: 0,
+                    sig_pending: 0,
                     name: {
                         let mut n = [0u8; 32];
                         let bytes = b"forked\0";

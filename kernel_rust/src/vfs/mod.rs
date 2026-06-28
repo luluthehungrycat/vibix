@@ -470,6 +470,9 @@ pub unsafe fn vfs_init() {
     crate::syscall::register(21, sys_stat);
     crate::syscall::register(22, sys_fstat);
     crate::syscall::register(23, sys_chdir);
+    crate::syscall::register(24, sys_isatty);
+    crate::syscall::register(25, sys_tcgetattr);
+    crate::syscall::register(26, sys_tcsetattr);
 }
 
 //==============================================================================
@@ -879,5 +882,99 @@ fn sys_chdir(path: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
         proc.cwd[i] = 0; // NUL-terminate
 
         0
+    }
+}
+
+//==============================================================================
+// isatty(24) — test whether a file descriptor refers to a terminal
+//==============================================================================
+
+fn sys_isatty(fd: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        if (*vn).ops == core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+//==============================================================================
+// tcgetattr(25) — get terminal attributes
+//==============================================================================
+
+fn sys_tcgetattr(fd: u64, arg: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 || arg == 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        // Check if this is a TTY device
+        if (*vn).ops != core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            return (-ENOTTY as i64) as u64;
+        }
+        // Delegate to the TTY ioctl handler (TCGETS = 0x5401)
+        let rc = crate::vfs::tty::tty_ioctl(vn, 0x5401, arg);
+        if rc < 0 { (-rc as i64) as u64 } else { 0 }
+    }
+}
+
+//==============================================================================
+// tcsetattr(26) — set terminal attributes
+//==============================================================================
+
+fn sys_tcsetattr(fd: u64, arg: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 || arg == 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        // Check if this is a TTY device
+        if (*vn).ops != core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            return (-ENOTTY as i64) as u64;
+        }
+        // Delegate to TTY ioctl (TCSETS = 0x5402)
+        let rc = crate::vfs::tty::tty_ioctl(vn, 0x5402, arg);
+        if rc < 0 { (-rc as i64) as u64 } else { 0 }
     }
 }

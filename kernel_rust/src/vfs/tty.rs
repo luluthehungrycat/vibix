@@ -243,7 +243,7 @@ unsafe fn tty_write(_vnode: *mut Vnode, buf: *const u8, len: usize, _offset: &mu
     tty.write(slice) as isize
 }
 
-unsafe fn tty_ioctl(_vnode: *mut Vnode, request: u64, arg: u64) -> i32 {
+pub unsafe fn tty_ioctl(_vnode: *mut Vnode, request: u64, arg: u64) -> i32 {
     if arg == 0 {
         return -EFAULT;
     }

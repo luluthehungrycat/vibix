@@ -468,6 +468,23 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     arg4: u64,
 ) -> u64 {
+    // Check for pending signals — if SIGINT is pending, exit with 128+SIGINT
+    let pid = crate::process::current_pid();
+    if pid != 0 {
+        let proc = crate::process::process_mut(pid);
+        if proc.sig_pending & (1 << crate::process::SIGINT) != 0 {
+            // Clear the pending signal and exit
+            proc.sig_pending &= !(1 << crate::process::SIGINT);
+            // Call sys_exit logic inline: mark Zombie, schedule exit
+            proc.state = crate::process::ProcessState::Zombie;
+            proc.exit_code = 130;  // 128 + SIGINT
+            unsafe {
+                core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+            }
+            return 0;
+        }
+    }
+
     if (num as usize) < MAX_SYSCALLS {
         unsafe {
             if let Some(handler) = SYSCALL_TABLE[num as usize] {
