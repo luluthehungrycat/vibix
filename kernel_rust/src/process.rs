@@ -359,8 +359,12 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
     let idle_ktop = idle_kstack as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Build frame for idle — uses build_init_frame then overrides CS to kernel CS
-    let idle_krsp = build_init_frame(idle_ktop, idle_entry as *const () as u64, 0, 0);
+    // Build frame for idle — uses build_init_frame then overrides CS to kernel CS.
+    // RSP must point to a valid kernel stack address (idle_ktop) because iretq
+    // pops SS:RSP even for same-privilege returns in 64-bit mode. With RSP=0,
+    // the first interrupt (e.g. PIT timer) would try to push onto RSP=0 and
+    // cause a page fault (observed in TCG mode).
+    let idle_krsp = build_init_frame(idle_ktop, idle_entry as *const () as u64, idle_ktop, 0);
     // Debug: print idle frame and kernel stack addresses (enable with `make DEBUG=1`)
     if cfg!(feature = "debug") {
         use core::fmt::Write;

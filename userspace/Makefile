@@ -36,6 +36,7 @@ VIBIT_BIN     = $(VIBIT_DIR)/vibit.bin
 VISH_DIR      = $(abspath $(BUILD_DIR)/../../vish)
 VISH_BIN      = $(VISH_DIR)/vish.bin
 GVIBU_DIR     = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/kernel)
+GVIBU_ELF_DIR = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/vibix-lib)
 
 .PHONY: all clean
 
@@ -57,11 +58,14 @@ ifeq ($(INIT),vibit)
 	# Build and copy vish shell binary for VIBIT to exec
 	$(MAKE) -C $(VISH_DIR) all
 	cp $(VISH_BIN) /tmp/vibix-initramfs/bin/vish
-	# Build and copy GVIBU coreutils
+	# Build and copy GVIBU coreutils (flat NASM binaries)
 	cd $(GVIBU_DIR) && for asm in user_*.asm; do \
 		out=$$(echo $$asm | sed 's/user_\(.*\)\.asm/\1/'); \
 		$(NASM) -f bin -I ./ $$asm -o /tmp/vibix-initramfs/bin/$$out 2>/dev/null; \
 	done
+	# Build and copy GVIBU Rust ELF binary (multicall: echo, true, false, yes, printenv)
+	$(MAKE) -C $(GVIBU_ELF_DIR) all
+	cp $(GVIBU_ELF_DIR)/target/x86_64-unknown-none/release/vibix /tmp/vibix-initramfs/bin/gvibu
 endif
 	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init bin/* 2>/dev/null || tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init
 	rm -rf /tmp/vibix-initramfs

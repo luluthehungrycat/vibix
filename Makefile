@@ -92,6 +92,10 @@ debug: $(USR_BIN) vibix.elf
 test: vibix.elf
 	python3 anti_cheat.py && python3 test_kernel.py
 
+test_vibit: clean
+	$(MAKE) INIT=vibit
+	python3 anti_cheat.py && python3 -c "from test_kernel import test_vibit; import sys; sys.exit(0 if test_vibit() else 1)"
+
 clean:
 	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o kernel/context_switch.o
 	$(MAKE) -C userspace clean

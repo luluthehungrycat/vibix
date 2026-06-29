@@ -116,5 +116,65 @@ def test_kernel_alive():
             os.unlink(serial_path)
 
 
+# ── VIBIT init system markers ─────────────────────────────────────────────────
+VIBIT_CHECKLIST = {
+    "VIBIT v0.2.0: PID 1 init":       "VIBIT banner",
+    "VIBIT: init task complete":       "Init task",
+    "VIBIT: spawning shell":           "Shell spawn (fork)",
+    "VIBIT: reaper loop":              "Reaper loop (waitpid)",
+    "VIBIT: starting shell":           "Shell start",
+    "vish -- VIBIX SHell":             "vish exec",
+    "vish$ ":                          "Shell prompt (blocking read)",
+}
+
+
+def test_vibit():
+    """Test the kernel with VIBIT init system (make INIT=vibit)."""
+    print("🧪 Testing VIBIT init system...")
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".serial", delete=False) as f:
+        serial_path = f.name
+
+    accel = "kvm"
+    try:
+        with open("/dev/kvm", "rb"):
+            pass
+    except (FileNotFoundError, PermissionError, OSError):
+        accel = "tcg"
+
+    try:
+        subprocess.run(
+            [
+                QEMU,
+                "-accel", accel,
+                "-kernel", "vibix.elf",
+                "-serial", f"file:{serial_path}",
+                "-display", "none",
+                "-m", "512M",
+                "-no-reboot",
+                "-no-shutdown",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        pass  # Expected — shell blocks waiting for input
+
+    with open(serial_path, "r") as f:
+        serial_output = f.read()
+
+    all_ok = True
+    for marker, label in VIBIT_CHECKLIST.items():
+        if marker in serial_output:
+            print(f"  ✅ {label}")
+        else:
+            print(f"  ❌ {label} (missing: {marker!r})")
+            all_ok = False
+
+    os.unlink(serial_path)
+    return all_ok
+
+
 if __name__ == "__main__":
     sys.exit(0 if test_kernel_alive() else 1)
