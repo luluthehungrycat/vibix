@@ -615,6 +615,7 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 
     // 4. Check for ELF magic and dispatch accordingly
     let entry: u64;
+    let mut is_elf = false;
     unsafe {
         let magic = core::slice::from_raw_parts(data, 4);
         if magic == b"ELF" {
@@ -622,18 +623,34 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             let data_slice = core::slice::from_raw_parts(data, size);
             match crate::elf::load(data_slice, pmm) {
                 Ok(ep) => {
-                    // ELF loader maps segments but NOT the user stack
+                    // ELF loader maps segments but NOT the user stack.
+                    // Place stack at a high address (0x2005000) to avoid
+                    // overlapping ELF segments that extend past 0x2002000.
                     let stack_page = pmm.alloc();
                     if stack_page.is_null() {
                         return -12; // ENOMEM
                     }
+                    let elf_stack: u64 = 0x2005000;
                     crate::paging::map_4k(
-                        USER_STACK_ADDR,
+                        elf_stack,
                         stack_page as u64,
                         crate::paging::PAGE_USER_RW,
                         pmm,
                     );
+                    paging::invlpg(elf_stack);
+                    // Map a second page for larger stack depth
+                    let stack_page2 = pmm.alloc();
+                    if !stack_page2.is_null() {
+                        crate::paging::map_4k(
+                            elf_stack - 0x1000,
+                            stack_page2 as u64,
+                            crate::paging::PAGE_USER_RW,
+                            pmm,
+                        );
+                        paging::invlpg(elf_stack - 0x1000);
+                    }
                     entry = ep;
+                    is_elf = true;
                 }
                 Err(e) => {
                     return match e {
@@ -651,18 +668,23 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             // Flat binary — use load_flat_binary (handles stack page internally)
             load_flat_binary(data, size, pmm);
             entry = USER_CODE_ADDR;
+            is_elf = false;
         }
     }
 
     // 5. Update syscall_state with new entry point and stack
+    // ELF binaries use 0x2005000 to avoid conflicting with ELF segments;
+    // flat binaries use the traditional USER_STACK_ADDR + 0x1000.
     unsafe {
-        syscall_state.rip = entry;
-        syscall_state.rsp = USER_STACK_ADDR + 0x1000;
-        syscall_state.rflags = 0x202;
+        let user_rsp = if is_elf { 0x2006000u64 } else { USER_STACK_ADDR + 0x1000 };
+        core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
+        core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
+        core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
     }
 
     proc.brk = BRK_START;
     proc.errno = 0;
+    proc.sig_pending = 0;  // child gets fresh signal state
 
     // 6. Close all fds except 0/1/2 on exec
     for fd in 3..crate::vfs::MAX_FDS {
