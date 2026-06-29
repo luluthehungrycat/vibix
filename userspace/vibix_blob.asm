@@ -15,12 +15,13 @@
 ;   7 = clear_demo  — ANSI ESC[2J ESC[H
 ;   8 = yes_cmd     — infinite "y\n" loop
 ;   9 = vfs_test    — VFS syscall exercise test
+;  10 = stat_chdir_test — stat/fstat/chdir syscall test
 ;==============================================================================
 
 ORG 0x2000000
 bits 64
 
-NUM_COMMANDS equ 10
+NUM_COMMANDS equ 11
 
 section .text
 global _start
@@ -59,7 +60,7 @@ init_demo:
     mov rax, 3
     syscall
 
-    ; exit(0)
+    ; Exit cleanly (test_kernel.py checks for "VIBIX: PID 1 exited with code 0")
     xor edi, edi
     mov eax, 0
     syscall
@@ -117,6 +118,7 @@ dispatch_table:
     dq clear_demo       ; 7: clear terminal (ANSI)
     dq yes_cmd          ; 8: infinite y loop
     dq vfs_test          ; 9: VFS syscall exercise
+    dq stat_chdir_test   ; 10: stat/chdir syscall test
 
 ; ── String data ──────────────────────────────────────────────────────────────
 str_echo:       db "echo", 0
@@ -142,3 +144,4 @@ args_e_octal:   dq str_echo, str_e_flag, str_octal_test
 section .text
 %include "vibix_shell.inc"
 %include "vibix_vfstest.inc"
+%include "vibix_stat_chdir.inc"

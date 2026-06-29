@@ -62,7 +62,18 @@ const MAP_FAILED: u64 = u64::MAX;
 fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     let pid = current_pid();
     let mut serial = SerialPort::new();
-    let _ = core::write!(serial, "VIBIX: PID {} exited with code {}\n", pid, code);
+    serial.init();
+    serial.writestrs(&["VIBIX: PID "]);
+    // Write PID in decimal (at most 2 digits)
+    let p = pid;
+    if p >= 10 { serial.putchar((b'0' + (p / 10) as u8) as char); }
+    serial.putchar((b'0' + (p % 10) as u8) as char);
+    serial.writestrs(&[" exited with code "]);
+    // Write exit code in decimal
+    let c = code;
+    if c >= 10 { serial.putchar((b'0' + ((c / 10) % 10) as u8) as char); }
+    serial.putchar((b'0' + (c % 10) as u8) as char);
+    serial.putchar('\n');
 
     let cur = process_mut(pid);
     cur.state = process::ProcessState::Zombie;
@@ -73,7 +84,6 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     if parent_pid != 0 {
         let parent = process_mut(parent_pid);
         if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
-            // Patch RAX in parent's saved frame to child PID (waitpid return value)
             unsafe {
                 let parent_rsp = parent.kernel_rsp;
                 if parent_rsp != 0 {
@@ -85,11 +95,10 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
         }
     }
 
-    // Signal the assembly stub to divert through scheduler
     unsafe {
-        process::should_schedule = 1;
+        core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
     }
-    0  // value ignored; asm diverts to scheduler
+    0
 }
 
 /// Syscall 1: write(int fd, const void *buf, size_t len) → bytes written.
@@ -459,6 +468,23 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     arg4: u64,
 ) -> u64 {
+    // Check for pending signals — if SIGINT is pending, exit with 128+SIGINT
+    let pid = crate::process::current_pid();
+    if pid != 0 {
+        let proc = crate::process::process_mut(pid);
+        if proc.sig_pending & (1 << crate::process::SIGINT) != 0 {
+            // Clear the pending signal and exit
+            proc.sig_pending &= !(1 << crate::process::SIGINT);
+            // Call sys_exit logic inline: mark Zombie, schedule exit
+            proc.state = crate::process::ProcessState::Zombie;
+            proc.exit_code = 130;  // 128 + SIGINT
+            unsafe {
+                core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+            }
+            return 0;
+        }
+    }
+
     if (num as usize) < MAX_SYSCALLS {
         unsafe {
             if let Some(handler) = SYSCALL_TABLE[num as usize] {

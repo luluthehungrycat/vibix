@@ -9,7 +9,7 @@ use crate::pmm::PmmAllocator;
 use crate::gdt;
 
 const MAX_PROCS: usize = 64;
-const KERNEL_STACK_SIZE: usize = 4096;
+const KERNEL_STACK_SIZE: usize = 12288;  // 12 KB (3 pages)
 const USER_CODE_ADDR: u64 = 0x2000000;
 const USER_STACK_ADDR: u64 = 0x2002000;
 
@@ -17,6 +17,7 @@ const USER_STACK_ADDR: u64 = 0x2002000;
 /// BRK start address (shared constant for per-process brk)
 pub const BRK_START: u64 = 0x201_0000;
 pub const BRK_MAX: u64 = 0x1000_0000;
+pub const SIGINT: u64 = 2;  // signal number 2 = SIGINT
 
 /// Idle process entry — runs in kernel mode, halts forever.
 extern "C" fn idle_entry() -> ! {
@@ -49,8 +50,10 @@ pub struct Process {
     pub wait_for_pid: u64,
     pub brk: u64,
     pub errno: i64,
+    pub sig_pending: u64,    // bitmask: bit N = signal N pending
     pub name: [u8; 32],
     pub fd_table: crate::vfs::FdTable,
+    pub cwd: [u8; 256],
 }
 
 pub struct ProcessTable {
@@ -252,6 +255,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
             );
         }
         paging::map_4k(virt_addr, page as u64, paging::PAGE_USER_RW, pmm);
+        paging::invlpg(virt_addr);  // Flush TLB for this page
         src_offset += 0x1000;
         virt_addr += 0x1000;
         bytes_left = bytes_left.saturating_sub(0x1000);
@@ -263,6 +267,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
     }
     paging::map_4k(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm);
+    paging::invlpg(USER_STACK_ADDR);  // Flush TLB for stack page
 }
 
 // --- Init process + idle process ---
@@ -280,12 +285,12 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
 
     // ── PID 1: init ──
-    let kstack_page = pmm.alloc();
+    let kstack_page = pmm.alloc_pages(3);
+
     if kstack_page.is_null() {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
     }
     let ktop = kstack_page as u64 + KERNEL_STACK_SIZE as u64;
-
     // Build synthetic frame with command_id=1 (init_demo, not shell)
     let krsp = build_init_frame(ktop, USER_CODE_ADDR, USER_STACK_ADDR + 0x1000, 1);
 
@@ -303,6 +308,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         wait_for_pid: 0,
         brk: BRK_START,
         errno: 0,
+        sig_pending: 0,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"init\0";
@@ -311,6 +317,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             n
         },
             fd_table: crate::vfs::FdTable::new(),
+        cwd: {
+            let mut c = [0u8; 256];
+            c[0] = b'/';
+            c
+        },
     });
     table.count = 1;
     table.next_pid = 2;
@@ -341,15 +352,19 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
 
     // ── PID 2: idle ──
-    let idle_kstack = pmm.alloc();
+    let idle_kstack = pmm.alloc_pages(3);
     if idle_kstack.is_null() {
         // No memory for idle stack — halt (should never happen)
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
     }
     let idle_ktop = idle_kstack as u64 + KERNEL_STACK_SIZE as u64;
 
-    // Build frame for idle — uses build_init_frame then overrides CS to kernel CS
-    let idle_krsp = build_init_frame(idle_ktop, idle_entry as *const () as u64, 0, 0);
+    // Build frame for idle — uses build_init_frame then overrides CS to kernel CS.
+    // RSP must point to a valid kernel stack address (idle_ktop) because iretq
+    // pops SS:RSP even for same-privilege returns in 64-bit mode. With RSP=0,
+    // the first interrupt (e.g. PIT timer) would try to push onto RSP=0 and
+    // cause a page fault (observed in TCG mode).
+    let idle_krsp = build_init_frame(idle_ktop, idle_entry as *const () as u64, idle_ktop, 0);
     // Debug: print idle frame and kernel stack addresses (enable with `make DEBUG=1`)
     if cfg!(feature = "debug") {
         use core::fmt::Write;
@@ -381,6 +396,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         wait_for_pid: 0,
         brk: 0,
         errno: 0,
+        sig_pending: 0,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"idle\0";
@@ -389,6 +405,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             n
         },
             fd_table: crate::vfs::FdTable::new(),
+        cwd: {
+            let mut c = [0u8; 256];
+            c[0] = b'/';
+            c
+        },
     });
     table.count = 2;
     table.next_pid = 3;
@@ -495,7 +516,7 @@ pub fn sys_fork() -> i64 {
     // Allocate new kernel stack for child
     let child_kstack = {
         let pmm = crate::pmm::global_pmm();
-        pmm.alloc()
+        pmm.alloc_pages(3)
     };
     if child_kstack.is_null() {
         return -1; // ENOMEM
@@ -537,6 +558,7 @@ pub fn sys_fork() -> i64 {
                     wait_for_pid: 0,
                     brk: parent.brk,
                     errno: 0,
+                    sig_pending: 0,
                     name: {
                         let mut n = [0u8; 32];
                         let bytes = b"forked\0";
@@ -545,6 +567,7 @@ pub fn sys_fork() -> i64 {
                         n
                     },
                     fd_table: parent.fd_table,
+                    cwd: parent.cwd,
                 });
                 // Increment refcount on shared OFT entries (child now shares them)
                 {
@@ -596,6 +619,7 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 
     // 4. Check for ELF magic and dispatch accordingly
     let entry: u64;
+    let mut is_elf = false;
     unsafe {
         let magic = core::slice::from_raw_parts(data, 4);
         if magic == b"ELF" {
@@ -603,18 +627,34 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             let data_slice = core::slice::from_raw_parts(data, size);
             match crate::elf::load(data_slice, pmm) {
                 Ok(ep) => {
-                    // ELF loader maps segments but NOT the user stack
+                    // ELF loader maps segments but NOT the user stack.
+                    // Place stack at a high address (0x2005000) to avoid
+                    // overlapping ELF segments that extend past 0x2002000.
                     let stack_page = pmm.alloc();
                     if stack_page.is_null() {
                         return -12; // ENOMEM
                     }
+                    let elf_stack: u64 = 0x2005000;
                     crate::paging::map_4k(
-                        USER_STACK_ADDR,
+                        elf_stack,
                         stack_page as u64,
                         crate::paging::PAGE_USER_RW,
                         pmm,
                     );
+                    paging::invlpg(elf_stack);
+                    // Map a second page for larger stack depth
+                    let stack_page2 = pmm.alloc();
+                    if !stack_page2.is_null() {
+                        crate::paging::map_4k(
+                            elf_stack - 0x1000,
+                            stack_page2 as u64,
+                            crate::paging::PAGE_USER_RW,
+                            pmm,
+                        );
+                        paging::invlpg(elf_stack - 0x1000);
+                    }
                     entry = ep;
+                    is_elf = true;
                 }
                 Err(e) => {
                     return match e {
@@ -632,18 +672,23 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             // Flat binary — use load_flat_binary (handles stack page internally)
             load_flat_binary(data, size, pmm);
             entry = USER_CODE_ADDR;
+            is_elf = false;
         }
     }
 
     // 5. Update syscall_state with new entry point and stack
+    // ELF binaries use 0x2005000 to avoid conflicting with ELF segments;
+    // flat binaries use the traditional USER_STACK_ADDR + 0x1000.
     unsafe {
-        syscall_state.rip = entry;
-        syscall_state.rsp = USER_STACK_ADDR + 0x1000;
-        syscall_state.rflags = 0x202;
+        let user_rsp = if is_elf { 0x2006000u64 } else { USER_STACK_ADDR + 0x1000 };
+        core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
+        core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
+        core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
     }
 
     proc.brk = BRK_START;
     proc.errno = 0;
+    proc.sig_pending = 0;  // child gets fresh signal state
 
     // 6. Close all fds except 0/1/2 on exec
     for fd in 3..crate::vfs::MAX_FDS {

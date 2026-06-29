@@ -64,6 +64,8 @@ syscall_entry:
     mov rsi, r9          ; rsi = arg1 = user rdi
     mov rdi, rax         ; rdi = num = syscall number
 
+
+
     call syscall_handler
 
     ; Check for pending reschedule
@@ -73,6 +75,11 @@ syscall_entry:
     ; ── Normal return via sysretq ──
     mov rcx, [rel syscall_state.rip]
     mov r11, [rel syscall_state.rflags]
+    ; Zero user-space argument registers to avoid leaking kernel/old-process
+    ; pointers to the restored process (critical after exec()).
+    xor edi, edi
+    xor esi, esi
+    xor edx, edx
     mov rsp, [rel syscall_state.rsp]
     db 0x48, 0x0f, 0x07    ; sysretq
 

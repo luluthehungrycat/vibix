@@ -15,6 +15,7 @@ pub mod chardev;
 pub mod pipe;
 pub mod initramfs;
 pub mod rootfs;
+pub mod tty;
 
 //==============================================================================
 // Vnode type flags (Unix-style mode bits)
@@ -42,6 +43,7 @@ pub const MAX_FDS: usize = 16;
 pub const OFT_SIZE: usize = 64;
 pub const MAX_MOUNTS: usize = 4;
 pub const PATH_MAX: usize = 256;
+pub const VFS_MAX_COMPONENTS: usize = 16;
 
 //==============================================================================
 // Errno values
@@ -120,6 +122,61 @@ pub struct Vnode {
 }
 
 //==============================================================================
+// Stat — x86_64 Linux struct stat layout (144 bytes)
+//==============================================================================
+
+/// x86_64 Linux struct stat layout.
+/// Must match what userspace `fstat/stat` expects.
+#[repr(C)]
+pub struct Stat {
+    pub st_dev:     u64,      // 0
+    pub st_ino:     u64,      // 8
+    pub st_nlink:   u64,      // 16
+    pub st_mode:    u32,      // 24
+    pub st_uid:     u32,      // 28
+    pub st_gid:     u32,      // 32
+    __pad0:         u32,      // 36
+    pub st_rdev:    u64,      // 40
+    pub st_size:    i64,      // 48
+    pub st_blksize: i64,      // 56
+    pub st_blocks:  i64,      // 64
+    pub st_atim_sec:  i64,    // 72
+    pub st_atim_nsec: i64,    // 80
+    pub st_mtim_sec:  i64,    // 88
+    pub st_mtim_nsec: i64,    // 96
+    pub st_ctim_sec:  i64,    // 104
+    pub st_ctim_nsec: i64,    // 112
+    __unused:       [i64; 3], // 120
+} // total: 144 bytes
+
+//==============================================================================
+// stat_from_vnode — fill a Stat struct from a Vnode
+//==============================================================================
+
+pub fn stat_from_vnode(vn: &Vnode, st: &mut Stat) {
+    st.st_dev = 0;
+    st.st_ino = vn.ino;
+    st.st_nlink = 1;
+    st.st_mode = vn.mode as u32;
+    st.st_uid = 0;
+    st.st_gid = 0;
+    st.__pad0 = 0;
+    st.st_rdev = if vn.mode & V_CHR != 0 {
+        0x0101
+    } else {
+        0
+    };
+    st.st_size = vn.size as i64;
+    st.st_blksize = 512;
+    st.st_blocks = ((vn.size + 511) / 512) as i64;
+    st.st_atim_sec = 0;
+    st.st_atim_nsec = 0;
+    st.st_mtim_sec = 0;
+    st.st_mtim_nsec = 0;
+    st.st_ctim_sec = 0;
+    st.st_ctim_nsec = 0;
+    st.__unused = [0; 3];
+}
 
 //==============================================================================
 // FdTable — per-process file descriptor table
@@ -224,6 +281,12 @@ pub fn vfs_lookup(dir: &mut Vnode, name: &[u8]) -> Result<&'static mut Vnode, i3
 //==============================================================================
 
 /// Resolve an absolute path to a `&'static mut Vnode`.
+///
+/// Uses a two-pass approach:
+///   1. Collect path components, handling `.` and `..` natively.
+///   2. Resolve accumulated components from root.
+/// This avoids recursive parent-pointer lookups while correctly handling
+///   `..`, `.`, `//`, and trailing `/`.
 pub fn vfs_resolve(path: &[u8]) -> Result<&'static mut Vnode, i32> {
     let root = crate::vfs::mount::mount_get_root()
         .ok_or(ENODEV)?;
@@ -241,28 +304,53 @@ pub fn vfs_resolve(path: &[u8]) -> Result<&'static mut Vnode, i32> {
         return Ok(root);
     }
 
-    let mut current = root;
+    //──────────────────────────────────────────────────────────────
+    // Pass 1: collect components, handle `.` and `..`
+    //──────────────────────────────────────────────────────────────
+    let mut comp_start: [usize; VFS_MAX_COMPONENTS] = [0; VFS_MAX_COMPONENTS];
+    let mut comp_end:   [usize; VFS_MAX_COMPONENTS] = [0; VFS_MAX_COMPONENTS];
+    let mut ncomp: usize = 0;
     let mut pos = start;
 
     while pos < path.len() {
+        // Skip consecutive slashes
         while pos < path.len() && path[pos] == b'/' {
             pos += 1;
         }
         if pos >= path.len() {
             break;
         }
-        let comp_start = pos;
+
+        let cs = pos;
         while pos < path.len() && path[pos] != b'/' {
             pos += 1;
         }
-        let component = &path[comp_start..pos];
 
-        if component == b"." {
-            continue;
+        if ncomp < VFS_MAX_COMPONENTS {
+            if &path[cs..pos] == b".." {
+                // Pop the previous component — go up one level
+                if ncomp > 0 {
+                    ncomp -= 1;
+                }
+                // Already at root — `..` is a no-op (POSIX)
+            } else if &path[cs..pos] != b"." {
+                // Track this component
+                comp_start[ncomp] = cs;
+                comp_end[ncomp]   = pos;
+                ncomp += 1;
+            }
+            // `.` → skip (no-op)
+        } else {
+            return Err(ENAMETOOLONG);
         }
-        if component == b".." {
-            return Err(EINVAL);
-        }
+    }
+
+    //──────────────────────────────────────────────────────────────
+    // Pass 2: resolve accumulated components from root
+    //──────────────────────────────────────────────────────────────
+    let mut current = root;
+    for i in 0..ncomp {
+        let component = &path[comp_start[i]..comp_end[i]];
 
         match vfs_lookup(&mut current, component) {
             Ok(next) => {
@@ -274,9 +362,9 @@ pub fn vfs_resolve(path: &[u8]) -> Result<&'static mut Vnode, i32> {
                 }
             }
             Err(e) => {
-                // Fallback: try accumulated path against initramfs
-                // `path[start..pos]` is the full path consumed so far (no leading /)
-                let accumulated = &path[start..pos];
+                // Fallback: try accumulated path against initramfs.
+                // The accumulated path has `..` already normalised out.
+                let accumulated = &path[start..comp_end[i]];
                 if !accumulated.is_empty() {
                     if let Some(vn) = unsafe { crate::vfs::initramfs::initramfs_build_vnode(accumulated) } {
                         return Ok(vn);
@@ -286,7 +374,42 @@ pub fn vfs_resolve(path: &[u8]) -> Result<&'static mut Vnode, i32> {
             }
         }
     }
+
     Ok(current)
+}
+
+/// Resolve a path relative to a current working directory.
+/// If `path` starts with '/', it's treated as absolute and passed directly to `vfs_resolve`.
+/// Otherwise, concatenates `cwd + "/" + path` into a stack buffer and resolves the result.
+/// Stack buffer is safe because kernel stack is 12 KiB (3 pages, KERNEL_STACK_SIZE=12288).
+/// Returns `Ok(vnode)` on success, `Err(i32)` with a negative errno on failure.
+pub fn vfs_resolve_relative(cwd: &[u8], path: &[u8]) -> Result<&'static mut Vnode, i32> {
+    // If path starts with '/', it's absolute — resolve directly
+    if !path.is_empty() && path[0] == b'/' {
+        return vfs_resolve(path);
+    }
+
+    // Relative path: build cwd + "/" + path on the stack
+    let mut buf = [0u8; PATH_MAX];
+    let mut pos = 0usize;
+    // Copy cwd (already stripped of NUL)
+    while pos < cwd.len() {
+        buf[pos] = cwd[pos];
+        pos += 1;
+    }
+    // Ensure separator
+    if pos == 0 || buf[pos - 1] != b'/' {
+        if pos >= PATH_MAX - 1 { return Err(ENAMETOOLONG); }
+        buf[pos] = b'/';
+        pos += 1;
+    }
+    // Copy path (already stripped of NUL)
+    for &b in path {
+        if pos >= PATH_MAX { return Err(ENAMETOOLONG); }
+        buf[pos] = b;
+        pos += 1;
+    }
+    vfs_resolve(&buf[..pos])
 }
 
 //==============================================================================
@@ -322,6 +445,12 @@ pub unsafe fn vfs_init() {
     if rc != 0 {
         let mut serial = crate::serial::SerialPort::new();
         serial.writestrs(&["VFS: WARNING — mount /dev failed.\n"]);
+    } else {
+        // Set the mount field on rootfs /dev vnode so vfs_resolve
+        // can follow the mount point when resolving paths.
+        if let Some(dev_mnt) = crate::vfs::mount::mount_find(b"/dev") {
+            crate::vfs::rootfs::DEV_DIR.mount = Some(dev_mnt);
+        }
     }
 
     // 5. Register VFS syscalls (12-17)
@@ -332,6 +461,14 @@ pub unsafe fn vfs_init() {
     crate::syscall::register(15, sys_write_vfs);
     crate::syscall::register(16, sys_lseek);
     crate::syscall::register(17, sys_getdents);
+
+    // 6. Register VIBIX-local VFS syscalls (21-23)
+    crate::syscall::register(21, sys_stat);
+    crate::syscall::register(22, sys_fstat);
+    crate::syscall::register(23, sys_chdir);
+    crate::syscall::register(24, sys_isatty);
+    crate::syscall::register(25, sys_tcgetattr);
+    crate::syscall::register(26, sys_tcsetattr);
 }
 
 //==============================================================================
@@ -565,5 +702,275 @@ fn sys_getdents(fd: u64, dirent: u64, count: u64, _arg4: u64) -> u64 {
             entries_written += 1;
         }
         entries_written
+    }
+}
+
+//==============================================================================
+// stat(21) — get file status by path
+//==============================================================================
+
+fn sys_stat(path: u64, statbuf: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        // 1. Copy path from user space
+        let buf = match cstr_from_user(path as *const u8, PATH_MAX) {
+            Ok(b) => b,
+            Err(e) => return (-e as i64) as u64,
+        };
+        let path_len = buf.iter().position(|&b| b == 0).unwrap_or(PATH_MAX);
+        let path_slice = &buf[..path_len];
+
+        // 2. Get current process cwd
+        let cwd = crate::process::process_mut(crate::process::current_pid()).cwd;
+        // Find NUL terminator in cwd
+        let cwd_len = cwd.iter().position(|&b| b == 0).unwrap_or(PATH_MAX);
+        let cwd_slice = &cwd[..cwd_len];
+
+        // 3. Resolve path (relative to cwd)
+        let vn = match vfs_resolve_relative(cwd_slice, path_slice) {
+            Ok(vn) => vn,
+            Err(e) => return (-e as i64) as u64,
+        };
+
+        // 4. Fill stat struct
+        let mut st: Stat = core::mem::zeroed();
+        stat_from_vnode(&*vn, &mut st);
+
+        // 5. Copy to user space
+        core::ptr::copy_nonoverlapping(
+            &st as *const Stat as *const u8,
+            statbuf as *mut u8,
+            core::mem::size_of::<Stat>(),
+        );
+
+        0
+    }
+}
+
+//==============================================================================
+// fstat(22) — get file status by fd
+//==============================================================================
+
+fn sys_fstat(fd: u64, statbuf: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        if statbuf == 0 {
+            return (-EFAULT as i64) as u64;
+        }
+
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ptr = of as *mut open_file::OpenFile;
+
+        let vn = match &mut (*of_ptr).vnode {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+
+        let mut st: Stat = core::mem::zeroed();
+        stat_from_vnode(&*vn, &mut st);
+
+        core::ptr::copy_nonoverlapping(
+            &st as *const Stat as *const u8,
+            statbuf as *mut u8,
+            core::mem::size_of::<Stat>(),
+        );
+
+        0
+    }
+}
+
+//==============================================================================
+// chdir(23) — change current working directory
+//==============================================================================
+
+fn sys_chdir(path: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        // 1. Copy path from user space
+        let buf = match cstr_from_user(path as *const u8, PATH_MAX) {
+            Ok(b) => b,
+            Err(e) => return (-e as i64) as u64,
+        };
+        let path_len = buf.iter().position(|&b| b == 0).unwrap_or(PATH_MAX);
+        let path_slice = &buf[..path_len];
+
+        // 2. Get current process cwd
+        let cwd = crate::process::process_mut(crate::process::current_pid()).cwd;
+        let cwd_len = cwd.iter().position(|&b| b == 0).unwrap_or(PATH_MAX);
+        let cwd_slice = &cwd[..cwd_len];
+
+        // 3. Resolve path
+        let vn = match vfs_resolve_relative(cwd_slice, path_slice) {
+            Ok(vn) => vn,
+            Err(e) => return (-e as i64) as u64,
+        };
+
+        // 4. Must be a directory
+        if (*vn).mode & V_DIR == 0 {
+            return (-ENOTDIR as i64) as u64;
+        }
+
+        // 5. Build new cwd string
+        // If path is absolute, use it directly; otherwise, resolve canonical form
+        let is_absolute = !path_slice.is_empty() && path_slice[0] == b'/';
+        let new_cwd_buf: [u8; PATH_MAX];
+        let new_cwd_len: usize;
+
+        if is_absolute {
+            // Use the path directly
+            new_cwd_len = path_slice.len().min(PATH_MAX - 1);
+            new_cwd_buf = {
+                let mut c = [0u8; PATH_MAX];
+                let mut i = 0;
+                while i < new_cwd_len {
+                    c[i] = path_slice[i];
+                    i += 1;
+                }
+                c
+            };
+        } else {
+            // Relative path: concatenate cwd + "/" + path
+            let cwd_nul = cwd_len; // length without NUL
+            let _total = cwd_nul + 1 + path_slice.len().min(PATH_MAX - cwd_nul - 2);
+            new_cwd_buf = {
+                let mut c = [0u8; PATH_MAX];
+                let mut i = 0;
+                while i < cwd_nul {
+                    c[i] = cwd_slice[i];
+                    i += 1;
+                }
+                // Ensure trailing slash
+                if i > 0 && c[i-1] != b'/' {
+                    c[i] = b'/';
+                    i += 1;
+                }
+                let mut j = 0;
+                while j < path_slice.len() && i < PATH_MAX - 1 {
+                    c[i] = path_slice[j];
+                    i += 1;
+                    j += 1;
+                }
+                c
+            };
+            new_cwd_len = {
+                let mut len = 0;
+                while len < PATH_MAX && new_cwd_buf[len] != 0 {
+                    len += 1;
+                }
+                len
+            };
+        }
+
+        // 6. Update process cwd (write into the process's cwd buffer)
+        let proc = crate::process::process_mut(crate::process::current_pid());
+        let mut i = 0;
+        while i < new_cwd_len && i < PATH_MAX - 1 {
+            proc.cwd[i] = new_cwd_buf[i];
+            i += 1;
+        }
+        proc.cwd[i] = 0; // NUL-terminate
+
+        0
+    }
+}
+
+//==============================================================================
+// isatty(24) — test whether a file descriptor refers to a terminal
+//==============================================================================
+
+fn sys_isatty(fd: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        if (*vn).ops == core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+//==============================================================================
+// tcgetattr(25) — get terminal attributes
+//==============================================================================
+
+fn sys_tcgetattr(fd: u64, arg: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 || arg == 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        // Check if this is a TTY device
+        if (*vn).ops != core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            return (-ENOTTY as i64) as u64;
+        }
+        // Delegate to the TTY ioctl handler (TCGETS = 0x5401)
+        let rc = crate::vfs::tty::tty_ioctl(vn, 0x5401, arg);
+        if rc < 0 { (-rc as i64) as u64 } else { 0 }
+    }
+}
+
+//==============================================================================
+// tcsetattr(26) — set terminal attributes
+//==============================================================================
+
+fn sys_tcsetattr(fd: u64, arg: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        if fd >= MAX_FDS as u64 || arg == 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let fd_entry = crate::process::process_mut(crate::process::current_pid()).fd_table.fds[fd as usize];
+        if fd_entry < 0 {
+            return (-EBADF as i64) as u64;
+        }
+        let of = match open_file::oft_get(fd_entry as usize) {
+            Some(of) => of,
+            None => return (-EBADF as i64) as u64,
+        };
+        let of_ref = &mut *(of as *mut open_file::OpenFile);
+        let vn = match of_ref.vnode.as_mut() {
+            Some(v) => *v as *mut Vnode,
+            None => return (-EBADF as i64) as u64,
+        };
+        // Check if this is a TTY device
+        if (*vn).ops != core::ptr::addr_of!(crate::vfs::tty::TTY_OPS) as *const VnodeOps {
+            return (-ENOTTY as i64) as u64;
+        }
+        // Delegate to TTY ioctl (TCSETS = 0x5402)
+        let rc = crate::vfs::tty::tty_ioctl(vn, 0x5402, arg);
+        if rc < 0 { (-rc as i64) as u64 } else { 0 }
     }
 }

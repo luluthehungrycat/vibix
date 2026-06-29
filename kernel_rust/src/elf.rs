@@ -151,17 +151,23 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator) -> Result<u64, ElfError> {
         let page_start = seg_start & !0xFFF;
         let page_end = (seg_end + 0xFFF) & !0xFFF;
 
-        // Determine page flags from p_flags:
+        // Determine final page flags from p_flags:
         //   PF_R (4)  → PAGE_PRESENT
         //   PF_W (2)  → PAGE_WRITABLE
-        //   PF_X (1)  → if NOT executable, add PAGE_NO_EXEC
+        //   PF_X (1)  → (reserved for future NX support — EFER.NXE not enabled yet)
         let pf = phdr.p_flags;
-        let mut page_flags = paging::PAGE_PRESENT | paging::PAGE_USER;
-        if pf & 2 != 0 { page_flags |= paging::PAGE_WRITABLE; }
-        // If NOT executable, set NX bit
-        if pf & 1 == 0 { page_flags |= paging::PAGE_NO_EXEC; }
+        // Map all pages RW initially so the loader can write segment data.
+        // NOTE: NO_EXEC (NX bit) is deliberately omitted — EFER.NXE is not
+        // enabled in the current kernel, and setting bit 63 in a page table
+        // entry causes a reserved-bit Page Fault (#PF with ERR bit 3).
+        let mut page_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
+        if pf & 2 == 0 {
+            // Read-only segments: map RW for the loader, then relax below.
+            page_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
+        }
+        let final_no_write = pf & 2 == 0; // true → need to remove WRITABLE after copy
 
-        // Allocate and map each page in the segment's virtual address range
+        // Allocate and map each page in the segment's virtual address range.
         let mut vaddr_page = page_start;
         while vaddr_page < page_end {
             let phys = pmm.alloc();
@@ -200,7 +206,20 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator) -> Result<u64, ElfError> {
                 );
             }
         }
-        // BSS (memsz > filesz) is already zeroed since we zeroed all pages
+
+        // BSS (memsz > filesz) is already zeroed since we zeroed all pages.
+        // If the segment is read-only, remove WRITABLE flag now.
+        if final_no_write {
+            let mut vaddr_page = page_start;
+            let ro_flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+            while vaddr_page < page_end {
+                if let Some(paddr) = paging::translate(vaddr_page) {
+                    paging::map_4k(vaddr_page, paddr, ro_flags, pmm);
+                    paging::invlpg(vaddr_page);
+                }
+                vaddr_page += 4096;
+            }
+        }
     }
 
     Ok(ehdr.e_entry)
