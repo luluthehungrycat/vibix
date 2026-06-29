@@ -162,5 +162,83 @@ without these binaries — they're packaged separately in a distro model.
   directly. These MUST be updated before the assembly return reads them.
   Use `core::ptr::write_volatile` to prevent the release-mode compiler from
   reordering or caching these writes.
+- `syscall_entry.asm` now zeros `rdi`/`rsi`/`rdx` before `sysretq` to prevent
+  leaking stale kernel or old-process pointers to the restored process.
+
+### ELF Loader: Map RW Then Relax
+The ELF loader (`elf.rs`) must map pages as writable first, copy segment data,
+then relax to read-only. Mapping directly as read-only causes a page fault when
+the loader tries to write segment data to the virtual address.
+
+**NX bit caution**: `PAGE_NO_EXEC` (bit 63) causes a reserved-bit Page Fault
+(#PF with ERR bit 3) unless `EFER.NXE` is enabled. Currently NX is not enabled,
+so the ELF loader does NOT use the NX bit. All pages remain executable.
+
+**Relevant files**: `kernel_rust/src/elf.rs`
+
+### TCG Triple Fault: Idle Process RSP
+The idle process's register frame (built by `build_init_frame`) had `user_rsp=0`.
+In 64-bit mode, `iretq` always pops SS:RSP even for same-privilege returns.
+With RSP=0, the first interrupt (PIT timer) tries to push to address 0 and
+causes a page fault. On KVM this is masked by VM entry/exit TLB handling, but
+on TCG it triggers a triple fault (page fault → double fault → triple fault).
+
+**Fix**: Pass `idle_ktop` (a valid kernel stack address) as the RSP value when
+building the idle process frame.
+
+### `make test_vibit`
+```bash
+make test_vibit   # Build with INIT=vibit, run 7 extra checks
+```
+Checks fork, exec, waitpid, blocking TTY read via VIBIT + vish markers.
+
+---
+
+## **Next Session: Per-Process Page Tables + vish Rust Frontend**
+
+### Per-Process Page Tables (P₃)
+Currently all processes share the same page tables (single address space).
+To implement proper process isolation:
+
+1. **Add `pml4` field to `Process` struct** — each process has its own PML4 table.
+2. **Initialize PML4 at fork/spawn** — copy kernel mappings, create new user mapping.
+3. **Switch CR3 on context switch** — in `scheduler_tick()` and `scheduler_switch_exit()`.
+4. **Update `load_flat_binary` and ELF loader** — map pages into the process's own page tables instead of the global ones.
+5. **Fix `tty_wake` and cross-process IPI** — blocking read wake-up needs the target process's page tables.
+
+**Key challenge**: VIBIX currently modifies the ACTIVE page tables directly.
+With per-process tables, the kernel must either:
+- Map all process page tables into the kernel's address space (e.g., at a fixed
+  virtual address range like `0xFFFF8000_00000000`) for modification, or
+- Temporarily switch CR3 to the target process's tables when modifying them.
+
+**Suggested approach**: Reserve a fixed virtual address range in the kernel for
+accessing process page tables (recursive mapping). This avoids expensive CR3
+switches.
+
+### vish Rust Frontend on VIBIX
+vish has a cross-platform Rust core (`src/lib.rs`, `src/parse.rs`, `src/readline.rs`,
+`src/exec.rs`) with platform backends:
+- `src/linux/` — Linux ELF backend (uses libc)
+- `src/vibix/` — VIBIX flat binary backend (currently just `vish.asm`)
+
+To port the Rust frontend:
+
+1. **Build Rust for VIBIX** — vish's Rust core compiles with `#![no_std]` for VIBIX.
+   It needs a minimal platform layer (`src/vibix/mod.rs`) providing:
+   - `sys_read(fd, buf, len)` → syscall 2
+   - `sys_write(fd, buf, len)` → syscall 1
+   - `sys_fork()` → syscall 8
+   - `sys_exec(path, argv, envp)` → syscall 9
+   - `sys_waitpid(pid, wstatus, flags)` → syscall 10
+   - `sys_open(path, flags)` → syscall 12 (for PATH-based command search)
+   - `sys_isatty(fd)` → syscall 24
+   - `sys_tcgetattr(fd, termios)` → syscall 25
+   - `sys_tcsetattr(fd, termios)` → syscall 26
+2. **Link as ELF** — The Rust compiler produces ELF, which the kernel's ELF loader
+   already supports (with the RW-then-relax fix).
+
+**Relevant repos**: `../vish` (source), `../gvibu-ai-lab/vibix-lib/` (reference for
+Rust ELF build setup for VIBIX).
 
 --
