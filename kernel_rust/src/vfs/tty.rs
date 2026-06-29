@@ -40,6 +40,9 @@ pub struct Tty {
     echo: bool,
     /// Canonical mode — line buffered vs raw.
     canonical: bool,
+
+    /// PID of process blocked waiting for TTY input (0 = none).
+    waiting_pid: u64,
 }
 
 //==============================================================================
@@ -60,6 +63,7 @@ impl Tty {
             line_len: 0,
             echo: true,
             canonical: true,
+            waiting_pid: 0,
         }
     }
 
@@ -168,6 +172,18 @@ impl Tty {
             self.buf[self.head] = b;
             self.head = next;
         }
+        // Wake any process blocked waiting for TTY input
+        if self.waiting_pid != 0 {
+            let pid = self.waiting_pid;
+            self.waiting_pid = 0;
+            let proc = crate::process::process_mut(pid);
+            if proc.state == crate::process::ProcessState::Blocked {
+                proc.state = crate::process::ProcessState::Ready;
+                unsafe {
+                    core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+                }
+            }
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -182,13 +198,29 @@ impl Tty {
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         self.process_input();
 
-        let mut count = 0;
-        while self.tail != self.head && count < buf.len() {
-            buf[count] = self.buf[self.tail];
-            self.tail = (self.tail + 1) % BUF_SIZE;
-            count += 1;
+        // If data available, return it
+        if self.tail != self.head {
+            let mut count = 0;
+            while self.tail != self.head && count < buf.len() {
+                buf[count] = self.buf[self.tail];
+                self.tail = (self.tail + 1) % BUF_SIZE;
+                count += 1;
+            }
+            return count;
         }
-        count
+
+        // No data — block the current process until input arrives.
+        // The process will be woken by push_byte() when keyboard data arrives.
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            let proc = crate::process::process_mut(pid);
+            proc.state = crate::process::ProcessState::Blocked;
+            self.waiting_pid = pid;
+            unsafe {
+                core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+            }
+        }
+        0
     }
 
     /// Write to serial output.
