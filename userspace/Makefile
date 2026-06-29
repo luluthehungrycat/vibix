@@ -33,6 +33,8 @@ VIBIX_INC     = $(BUILD_DIR)/vibix_core.inc   \
 # ── VIBIT init: use the external VIBIT repo's binary if INIT=vibit ──────────
 VIBIT_DIR     = $(abspath $(BUILD_DIR)/../../vibit)
 VIBIT_BIN     = $(VIBIT_DIR)/vibit.bin
+VISH_DIR      = $(abspath $(BUILD_DIR)/../../vish)
+VISH_BIN      = $(VISH_DIR)/vish.bin
 
 .PHONY: all clean
 
@@ -48,9 +50,14 @@ else
 endif
 
 $(INITRAMFS): $(OUTPUT)
-	mkdir -p /tmp/vibix-initramfs/sbin
+	mkdir -p /tmp/vibix-initramfs/sbin /tmp/vibix-initramfs/bin
 	cp $(OUTPUT) /tmp/vibix-initramfs/sbin/init
-	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init
+ifeq ($(INIT),vibit)
+	# Build and copy vish shell binary for VIBIT to exec
+	$(MAKE) -C $(VISH_DIR) all
+	cp $(VISH_BIN) /tmp/vibix-initramfs/bin/vish
+endif
+	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init bin/vish 2>/dev/null || tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init
 	rm -rf /tmp/vibix-initramfs
 
 clean:
