@@ -22,6 +22,9 @@ RUST_LD     = $(RUST_DIR)/kernel64_elf.ld
 DEBUG ?= 0
 RUST_FEATURES = $(if $(filter 1,$(DEBUG)),--features debug,)
 
+# Init selection: make INIT=vibit to use VIBIT init system from ../vibit
+INIT ?= default
+
 # Final 32-bit ELF flags (Multiboot wrapper)
 ASMFLAGS32  = -f elf32
 LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
@@ -36,7 +39,7 @@ USR_BIN = userspace/vibix_blob.bin
 USR_TAR = userspace/initramfs.tar
 
 $(USR_BIN) $(USR_TAR):
-	$(MAKE) -C userspace all
+	$(MAKE) -C userspace all INIT=$(INIT)
 
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────
 
@@ -78,12 +81,12 @@ vibix.elf: boot.o
 # ── Convenience targets ──────────────────────────────────────────────────────
 
 QEMU        = /usr/bin/qemu-system-x86_64
-QEMU_FLAGS  = -accel tcg -kernel vibix.elf -m 512M -no-reboot -no-shutdown
+QEMU_FLAGS  = -accel kvm -kernel vibix.elf -m 512M -no-reboot -no-shutdown
 
-run: vibix.elf
+run: $(USR_BIN) vibix.elf
 	$(QEMU) $(QEMU_FLAGS) -serial stdio -display none
 
-debug: vibix.elf
+debug: $(USR_BIN) vibix.elf
 	$(QEMU) $(QEMU_FLAGS) -serial stdio -display none -s -S
 
 test: vibix.elf
