@@ -84,10 +84,10 @@ QEMU        = /usr/bin/qemu-system-x86_64
 QEMU_FLAGS  = -accel kvm -kernel vibix.elf -m 512M -no-reboot -no-shutdown
 
 run: $(USR_BIN) vibix.elf
-	$(QEMU) $(QEMU_FLAGS) -serial stdio -display none
+	$(QEMU) $(QEMU_FLAGS) -L /usr/share/qemu -serial stdio -display none
 
 debug: $(USR_BIN) vibix.elf
-	$(QEMU) $(QEMU_FLAGS) -serial stdio -display none -s -S
+	$(QEMU) $(QEMU_FLAGS) -L /usr/share/qemu -serial stdio -display none -s -S
 
 test: vibix.elf
 	python3 test_kernel.py
