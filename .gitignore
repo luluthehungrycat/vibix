@@ -27,3 +27,4 @@ userspace/vibix_blob
 
 # Generated userspace test artifacts
 userspace/vibix_vfstest.inc
+session-ses_*.md
