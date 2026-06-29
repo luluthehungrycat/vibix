@@ -149,8 +149,24 @@ Source code for userspace programs lives in their own repos:
 - `../vish` — Cross-platform shell (Rust + NASM flat binary)
 - `../gvibu-ai-lab` — Coreutils (Rust + NASM)
 
-Only binaries are copied to `userspace/` for testing. The VIBIX repo ships
-without these binaries — they're packaged separately in a distro model.
+**Rules:**
+1. **All source code changes** to VIBIT, vish, or GVIBU must be made in their
+   respective repos (not in the VIBIX repo). Commit and push to their own
+   feature branches, then file PRs to their `main` branches.
+2. **Only binaries** (`.bin` or compiled ELFs) are copied to the VIBIX repo's
+   `userspace/` directory for integration testing. The Makefile's `INIT=vibit`
+   target handles this automatically — it runs `make` in each external repo
+   and copies the output binary.
+3. **The VIBIX kernel repo ships without userspace binaries.** In production,
+   the kernel and userspace programs are packaged separately (distro model),
+   just like other UNIXoid operating systems. The `userspace/` directory and
+   its contents exist only for development and testing.
+4. **Kernel source code** stays in `kernel_rust/src/` and `kernel/`. Never mix
+   userspace source code into these directories.
+5. **Anti-plagiarism**: The `anti_cheat.py` check runs as part of `make test`
+   and scans ALL source files (including `.rs`, `.asm`, `.inc`) for
+   Linux/BSD/GPL patterns. False positives for ABI compatibility references
+   are handled via the exception system in `anti_cheat.py`.
 
 ### exec() Caveats
 - `exec()` does NOT reset `sig_pending`. The child inherits the parent's
