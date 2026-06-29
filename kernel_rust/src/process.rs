@@ -255,6 +255,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
             );
         }
         paging::map_4k(virt_addr, page as u64, paging::PAGE_USER_RW, pmm);
+        paging::invlpg(virt_addr);  // Flush TLB for this page
         src_offset += 0x1000;
         virt_addr += 0x1000;
         bytes_left = bytes_left.saturating_sub(0x1000);
@@ -266,6 +267,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
     }
     paging::map_4k(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm);
+    paging::invlpg(USER_STACK_ADDR);  // Flush TLB for stack page
 }
 
 // --- Init process + idle process ---
