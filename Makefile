@@ -90,7 +90,7 @@ debug: $(USR_BIN) vibix.elf
 	$(QEMU) $(QEMU_FLAGS) -L /usr/share/qemu -serial stdio -display none -s -S
 
 test: vibix.elf
-	python3 test_kernel.py
+	python3 anti_cheat.py && python3 test_kernel.py
 
 clean:
 	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o kernel/context_switch.o

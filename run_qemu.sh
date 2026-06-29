@@ -1,6 +1,6 @@
 #!/bin/sh
 exec /usr/bin/qemu-system-x86_64 \
-    -accel tcg \
+    -accel kvm \
     -kernel vibix.elf \
     -serial stdio \
     -display none \
