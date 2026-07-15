@@ -180,6 +180,38 @@ irq_common:
     ; Clean up int_no and err_code pushed by IRQ stub
     add rsp, 16
 
+%ifdef DEBUG
+    ;--- DEBUG: print iretq frame SS if != 0x1B (would cause GPF #13) ---
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    mov rax, [rsp + 64]
+    cmp al, 0x1B
+    je .irq_skip_dbg
+    lea rsi, [rel .irq_dbg_excl]
+    call serial_puts
+    mov rax, [rsp + 64]
+    call serial_print_hex8
+    lea rsi, [rel .irq_dbg_rsp]
+    call serial_puts
+    mov rax, rsp
+    add rax, 32
+    call serial_print_hex64
+    lea rsi, [rel .irq_dbg_nl]
+    call serial_puts
+.irq_skip_dbg:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .irq_dbg_end
+.irq_dbg_excl:  db "!SS=", 0
+.irq_dbg_rsp:   db " RSP=0x", 0
+.irq_dbg_nl:    db 0x0D, 0x0A, 0
+.irq_dbg_end:
+%endif
+
     ; Return to interrupted code
     iretq
 
@@ -259,3 +291,104 @@ isr_common:
 
     ; Return to interrupted code
     iretq
+
+%ifdef DEBUG
+;==============================================================================
+; Serial debug subroutines — raw COM1 output (no Rust calls)
+; COM1 base = 0x3F8, LSR = 0x3FD (bit 5 = THR empty)
+;==============================================================================
+
+global serial_putc, serial_puts, serial_print_hex8, serial_print_hex64
+
+; serial_putc — write AL to COM1. Preserves all other registers.
+serial_putc:
+    push rdx
+    push rax
+    mov dx, 0x3FD
+.wait_tx:
+    in al, dx
+    test al, 0x20
+    jz .wait_tx
+    pop rax
+    mov dx, 0x3F8
+    out dx, al
+    pop rdx
+    ret
+
+; serial_puts — write null-terminated string at RSI. Preserves all regs.
+serial_puts:
+    push rax
+    push rdx
+    push rsi
+.loop:
+    lodsb
+    test al, al
+    jz .done
+    call serial_putc
+    jmp .loop
+.done:
+    pop rsi
+    pop rdx
+    pop rax
+    ret
+
+; serial_print_hex8 — print AL as 2 hex digits. Preserves all regs.
+serial_print_hex8:
+    push rax
+    push rdx
+    push rcx
+    mov cl, al
+    shr al, 4
+    and al, 0x0F
+    cmp al, 10
+    jb .hdigit
+    add al, 'A' - 10
+    jmp .hput
+.hdigit:
+    add al, '0'
+.hput:
+    call serial_putc
+    mov al, cl
+    and al, 0x0F
+    cmp al, 10
+    jb .ldigit
+    add al, 'A' - 10
+    jmp .lput
+.ldigit:
+    add al, '0'
+.lput:
+    call serial_putc
+    pop rcx
+    pop rdx
+    pop rax
+    ret
+
+; serial_print_hex64 — print RAX as 16 hex digits. Preserves all regs.
+serial_print_hex64:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    mov rbx, rax
+    mov rcx, 16
+.hexloop:
+    mov rax, rbx
+    shr rax, 60
+    and al, 0x0F
+    cmp al, 10
+    jb .hexdig
+    add al, 'A' - 10
+    jmp .hexput
+.hexdig:
+    add al, '0'
+.hexput:
+    call serial_putc
+    shl rbx, 4
+    dec rcx
+    jnz .hexloop
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+%endif

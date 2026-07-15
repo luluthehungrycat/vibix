@@ -15,9 +15,10 @@ const USER_STACK_ADDR: u64 = 0x2002000;
 
 
 /// BRK start address (shared constant for per-process brk)
-pub const BRK_START: u64 = 0x201_0000;
+pub const BRK_START: u64 = 0x500_0000;  // Start well above ELF stack (0x2010000) and flat binary stack
 pub const BRK_MAX: u64 = 0x1000_0000;
-pub const SIGINT: u64 = 2;  // signal number 2 = SIGINT
+// SIGINT constant moved to signal.rs (crate::signal::SIGINT)
+pub const WNOHANG: u64 = 1;
 
 /// Idle process entry — runs in kernel mode, halts forever.
 extern "C" fn idle_entry() -> ! {
@@ -39,6 +40,7 @@ pub enum ProcessState {
 #[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u64,
+    pub pml4_phys: u64,
     pub state: ProcessState,
     pub entry: u64,
     pub user_rsp: u64,
@@ -51,6 +53,10 @@ pub struct Process {
     pub brk: u64,
     pub errno: i64,
     pub sig_pending: u64,    // bitmask: bit N = signal N pending
+    pub sigactions: [crate::signal::SigAction; 32],
+    pub in_signal: bool,
+    pub sigframe_rsp: u64,
+    pub stack_low: u64,
     pub name: [u8; 32],
     pub fd_table: crate::vfs::FdTable,
     pub cwd: [u8; 256],
@@ -230,7 +236,7 @@ fn build_fork_frame(kstack_top: u64) -> u64 {
 
 /// Load a flat binary from a raw data pointer to user pages.
 /// Maps pages at USER_CODE_ADDR (code) and USER_STACK_ADDR (stack).
-pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
+pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator, pml4_phys: u64) {
     use core::cmp::min;
     let mut bytes_left = size;
     let mut src_offset = 0usize;
@@ -254,7 +260,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
                 copy_len,
             );
         }
-        paging::map_4k(virt_addr, page as u64, paging::PAGE_USER_RW, pmm);
+        paging::map_4k_target(virt_addr, page as u64, paging::PAGE_USER_RW, pmm, pml4_phys);
         paging::invlpg(virt_addr);  // Flush TLB for this page
         src_offset += 0x1000;
         virt_addr += 0x1000;
@@ -266,7 +272,7 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
     if stack_page.is_null() {
         loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
     }
-    paging::map_4k(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm);
+    paging::map_4k_target(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm, pml4_phys);
     paging::invlpg(USER_STACK_ADDR);  // Flush TLB for stack page
 }
 
@@ -275,16 +281,18 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator) {
 /// Create and register the init process (PID 1) and idle process (PID 2).
 /// Returns PID of init.
 pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
+    // Create PID 1 PML4 — kernel mappings only
+    let pid1_pml4 = crate::paging::create_pml4(pmm, false);
+
     // Load PID 1 binary from initramfs via VFS
     if let Ok(vn) = crate::vfs::vfs_resolve(b"/sbin/init") {
         let data = vn.data as *const u8;
         let size = vn.size as usize;
         if !data.is_null() && size > 0 {
-            load_flat_binary(data, size, pmm);
+            load_flat_binary(data, size, pmm, pid1_pml4);
         }
     }
 
-    // ── PID 1: init ──
     let kstack_page = pmm.alloc_pages(3);
 
     if kstack_page.is_null() {
@@ -297,6 +305,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     let table = unsafe { &mut PROCESS_TABLE };
     table.slots[0] = Some(Process {
         pid: 1,
+        pml4_phys: pid1_pml4,
         state: ProcessState::Ready,
         entry: USER_CODE_ADDR,
         user_rsp: USER_STACK_ADDR + 0x1000,
@@ -309,6 +318,10 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         brk: BRK_START,
         errno: 0,
         sig_pending: 0,
+        sigactions: [Default::default(); 32],
+        in_signal: false,
+        sigframe_rsp: 0,
+        stack_low: USER_STACK_ADDR,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"init\0";
@@ -383,8 +396,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         *ptr.add(168/8) = 0x10;  // SS = kernel data segment (CPL=0)
     }
 
+    // Create idle PML4 — kernel mappings only
+    let idle_pml4 = crate::paging::create_pml4(pmm, false);
     table.slots[1] = Some(Process {
         pid: 2,
+        pml4_phys: idle_pml4,
         state: ProcessState::Ready,
         entry: idle_entry as *const () as u64,
         user_rsp: 0,
@@ -397,6 +413,10 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         brk: 0,
         errno: 0,
         sig_pending: 0,
+        sigactions: [Default::default(); 32],
+        in_signal: false,
+        sigframe_rsp: 0,
+        stack_low: 0,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"idle\0";
@@ -463,20 +483,50 @@ pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
     cur.kernel_rsp = current_rsp;
     cur.state = ProcessState::Ready;
 
-    let next_pid = sched_next();
-    set_current_pid(next_pid);
+    loop {
+        let next_pid = sched_next();
+        set_current_pid(next_pid);
 
-    let next = process(next_pid);
-    if next.state != ProcessState::Ready {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+        // Check if next process is runnable (immutable borrow)
+        {
+            let next = process(next_pid);
+            if next.state != ProcessState::Ready {
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+            }
+        }
+
+        // Set up resources for the selected process
+        unsafe { gdt::set_rsp0(process(next_pid).kernel_stack_top); }
+        set_syscall_kstack(process(next_pid).kernel_stack_top);
+        unsafe { crate::paging::write_cr3(process(next_pid).pml4_phys); }
+
+        // Deliver pending signals (modifies iretq frame, may kill process)
+        let krsp = process(next_pid).kernel_rsp;
+        let mut process_killed = false;
+        let final_krsp = crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
+
+        if process_killed {
+            // Process was terminated by signal — re-select
+            continue;
+        }
+
+        // DEBUG: inspect the frame before returning it
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(serial, "DBG tick: pid={} krsp={:016x}\n", next_pid, final_krsp);
+            for i in 0..22 {
+                let off = i * 8;
+                let val: u64 = unsafe { core::ptr::read_volatile((final_krsp + off) as *const u64) };
+                let _ = write!(serial, "DBG tick:  [{:3}]: {:016x}\n", off, val);
+            }
+        }
+
+        let next = process_mut(next_pid);
+        next.state = ProcessState::Running;
+        return final_krsp;
     }
-
-    let next = process_mut(next_pid);
-    unsafe { gdt::set_rsp0(next.kernel_stack_top); }
-    set_syscall_kstack(next.kernel_stack_top);
-
-    next.state = ProcessState::Running;
-    next.kernel_rsp
 }
 
 /// Called from syscall_entry.asm when should_schedule is set.
@@ -486,24 +536,52 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
     let cur_pid = current_pid();
     let cur = process_mut(cur_pid);
     cur.kernel_rsp = current_rsp;
-    // state already set by handler (Zombie or Blocked)
 
-    let next_pid = sched_next();
-    set_current_pid(next_pid);
-
-    // Check if next process is actually runnable
-    let next = process(next_pid);
-    if next.state != ProcessState::Ready {
-        // No runnable process — halt CPU indefinitely
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "DBG sw_exit: pid={} saved_krsp={:016x}\n", cur_pid, current_rsp);
     }
 
-    let next = process_mut(next_pid);
-    unsafe { gdt::set_rsp0(next.kernel_stack_top); }
-    set_syscall_kstack(next.kernel_stack_top);
+    // state already set by handler (e.g. Zombie for exit, Blocked for blocked I/O)
+    // If the current process is still Running, mark it Ready for scheduling.
+    // Explicitly-set states (Zombie, Blocked) are preserved.
+    if cur.state == ProcessState::Running {
+        cur.state = ProcessState::Ready;
+    }
 
-    next.state = ProcessState::Running;
-    next.kernel_rsp
+    loop {
+        let next_pid = sched_next();
+        set_current_pid(next_pid);
+
+        // Check if next process is runnable
+        {
+            let next = process(next_pid);
+            if next.state != ProcessState::Ready {
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+            }
+        }
+
+        // Set up resources for the selected process
+        unsafe { gdt::set_rsp0(process(next_pid).kernel_stack_top); }
+        set_syscall_kstack(process(next_pid).kernel_stack_top);
+        unsafe { crate::paging::write_cr3(process(next_pid).pml4_phys); }
+
+        // Deliver pending signals (may kill process or modify iretq frame)
+        let krsp = process(next_pid).kernel_rsp;
+        let mut process_killed = false;
+        let final_krsp = crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
+
+        if process_killed {
+            // Process terminated by signal — re-select
+            continue;
+        }
+
+        let next = process_mut(next_pid);
+        next.state = ProcessState::Running;
+        return final_krsp;
+    }
 }
 
 // --- Syscall implementations ---
@@ -527,6 +605,12 @@ pub fn sys_fork() -> i64 {
 
     // Build synthetic frame for child using saved syscall state.
     // Child returns to the instruction after fork syscall with RAX=0.
+
+    // Create child PML4 — copy kernel + user mappings from parent
+    let child_pml4 = {
+        let pmm = crate::pmm::global_pmm();
+        crate::paging::create_pml4(pmm, true)
+    };
     let child_krsp = build_fork_frame(child_ktop);
 
     // Assign child PID
@@ -547,6 +631,7 @@ pub fn sys_fork() -> i64 {
             unsafe {
                 PROCESS_TABLE.slots[idx] = Some(Process {
                     pid: child_pid,
+                    pml4_phys: child_pml4,
                     state: ProcessState::Ready,
                     entry: parent.entry,
                     user_rsp: syscall_state.rsp,  // use saved syscall RSP
@@ -559,6 +644,10 @@ pub fn sys_fork() -> i64 {
                     brk: parent.brk,
                     errno: 0,
                     sig_pending: 0,
+                    sigactions: parent.sigactions,
+                    in_signal: false,
+                    sigframe_rsp: 0,
+                    stack_low: parent.stack_low,
                     name: {
                         let mut n = [0u8; 32];
                         let bytes = b"forked\0";
@@ -620,39 +709,33 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     // 4. Check for ELF magic and dispatch accordingly
     let entry: u64;
     let mut is_elf = false;
+    let mut elf_user_rsp: u64 = USER_STACK_ADDR + 0x1000;
     unsafe {
         let magic = core::slice::from_raw_parts(data, 4);
         if magic == b"ELF" {
             // ELF64 binary — use the ELF loader
             let data_slice = core::slice::from_raw_parts(data, size);
-            match crate::elf::load(data_slice, pmm) {
+            match crate::elf::load(data_slice, pmm, proc.pml4_phys) {
                 Ok(ep) => {
                     // ELF loader maps segments but NOT the user stack.
-                    // Place stack at a high address (0x2005000) to avoid
-                    // overlapping ELF segments that extend past 0x2002000.
-                    let stack_page = pmm.alloc();
-                    if stack_page.is_null() {
-                        return -12; // ENOMEM
-                    }
-                    let elf_stack: u64 = 0x2005000;
-                    crate::paging::map_4k(
-                        elf_stack,
-                        stack_page as u64,
-                        crate::paging::PAGE_USER_RW,
-                        pmm,
-                    );
-                    paging::invlpg(elf_stack);
-                    // Map a second page for larger stack depth
-                    let stack_page2 = pmm.alloc();
-                    if !stack_page2.is_null() {
+                    // Use a larger stack (64 KiB, 16 pages) starting at 0x2020000
+                    // (top) growing down to accommodate Rust's format! and allocator calls.
+                    const ELF_STACK_PAGES: u64 = 16;
+                    const ELF_STACK_TOP_PAGE: u64 = 0x2020000;
+                    let mut page_addr = ELF_STACK_TOP_PAGE;
+                    for _ in 0..ELF_STACK_PAGES {
+                        let sp = pmm.alloc();
+                        if sp.is_null() { return -12; }
                         crate::paging::map_4k(
-                            elf_stack - 0x1000,
-                            stack_page2 as u64,
+                            page_addr,
+                            sp as u64,
                             crate::paging::PAGE_USER_RW,
                             pmm,
                         );
-                        paging::invlpg(elf_stack - 0x1000);
+                        paging::invlpg(page_addr);
+                        page_addr -= 0x1000;
                     }
+                    elf_user_rsp = ELF_STACK_TOP_PAGE + 0x1000;
                     entry = ep;
                     is_elf = true;
                 }
@@ -670,17 +753,16 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             }
         } else {
             // Flat binary — use load_flat_binary (handles stack page internally)
-            load_flat_binary(data, size, pmm);
+            load_flat_binary(data, size, pmm, proc.pml4_phys);
             entry = USER_CODE_ADDR;
             is_elf = false;
         }
     }
 
     // 5. Update syscall_state with new entry point and stack
-    // ELF binaries use 0x2005000 to avoid conflicting with ELF segments;
-    // flat binaries use the traditional USER_STACK_ADDR + 0x1000.
+    // ELF binaries use computed stack; flat binaries use USER_STACK_ADDR.
     unsafe {
-        let user_rsp = if is_elf { 0x2006000u64 } else { USER_STACK_ADDR + 0x1000 };
+        let user_rsp = if is_elf { elf_user_rsp } else { USER_STACK_ADDR + 0x1000 };
         core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
         core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
         core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
@@ -688,7 +770,14 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 
     proc.brk = BRK_START;
     proc.errno = 0;
-    proc.sig_pending = 0;  // child gets fresh signal state
+    proc.sig_pending = 0;  // fresh signal state for new program
+    proc.in_signal = false;
+    proc.sigframe_rsp = 0;
+    proc.stack_low = if is_elf { 0x2010000 } else { USER_STACK_ADDR };
+    // Reset all sigactions to SIG_DFL for the new program image
+    for i in 0..32 {
+        proc.sigactions[i] = Default::default();
+    }
 
     // 6. Close all fds except 0/1/2 on exec
     for fd in 3..crate::vfs::MAX_FDS {
@@ -704,7 +793,7 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 /// Wait for a child process. Returns PID on success, -1 on error.
 /// For MVP: non-blocking — if child is Zombie, reap and return.
 /// If child is still running, block the parent.
-pub fn sys_waitpid(requested_pid: i64, wstatus: u64, _flags: u64) -> i64 {
+pub fn sys_waitpid(requested_pid: i64, wstatus: u64, flags: u64) -> i64 {
     let cur_pid = current_pid();
 
     // Find a matching child (scoped to release the immutable borrow)
@@ -736,7 +825,11 @@ pub fn sys_waitpid(requested_pid: i64, wstatus: u64, _flags: u64) -> i64 {
             pid as i64
         }
         Some((pid, _)) => {
-            // Child still running — block parent
+            // Child still running
+            if flags & WNOHANG != 0 {
+                return 0;  // Non-blocking: return 0 immediately
+            }
+            // Block parent until child exits
             let cur = process_mut(cur_pid);
             cur.wait_for_pid = pid;
             cur.state = ProcessState::Blocked;
@@ -754,6 +847,8 @@ pub unsafe fn start_scheduler(init_pid: u64) -> ! {
         let proc = process(init_pid);
         set_syscall_kstack(proc.kernel_stack_top);
         gdt::set_rsp0(proc.kernel_stack_top);
+        // Switch to init process's page tables before jumping
+        crate::paging::write_cr3(proc.pml4_phys);
         // Mark running
         process_mut(init_pid).state = ProcessState::Running;
         context_switch_to(proc.kernel_rsp)

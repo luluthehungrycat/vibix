@@ -38,6 +38,14 @@ const GDT_USER_DATA: u64 = seg_entry(0xF2, 0x00);
 /// User code 64-bit: P=1, DPL=3, S=1, E=1, R=1, L=1 — Access=0xFA, Flags=0x20.
 const GDT_USER_CODE: u64 = seg_entry(0xFA, 0x20);
 
+/// SYSRET code 64-bit: same as USER_CODE but at a different index for SYSRET selector math.
+/// P=1, DPL=3, S=1, E=1, R=1, L=1 — Access=0xFA, Flags=0x20.
+const GDT_SYSRET_CODE: u64 = seg_entry(0xFA, 0x20);
+
+/// SYSRET data: same as USER_DATA but at a different index.
+/// P=1, DPL=3, S=1, E=0, W=1 — Access=0xF2.
+const GDT_SYSRET_DATA: u64 = seg_entry(0xF2, 0x00);
+
 /// Selector values (index << 3).
 pub const KERNEL_CS: u16 = 1 << 3;     // 0x08
 pub const KERNEL_DS: u16 = 2 << 3;     // 0x10
@@ -45,6 +53,19 @@ pub const KERNEL_DS: u16 = 2 << 3;     // 0x10
 pub const USER_DS:  u16 = 3 << 3;      // 0x18
 #[allow(dead_code)]
 pub const USER_CS:  u16 = 4 << 3;      // 0x20
+
+/// User-mode selectors with RPL=3 ORed in.
+/// Use these in iretq frames and segment loads targeting Ring 3.
+#[allow(dead_code)]
+pub const USER_DS_RPL3: u16 = USER_DS | 3;  // 0x1B
+#[allow(dead_code)]
+pub const USER_CS_RPL3: u16 = USER_CS | 3;  // 0x23
+
+/// SYSRET-code selector (index 5).
+pub const SYSRET_CS: u16 = 5 << 3;     // 0x28
+
+/// SYSRET-data selector (index 6).
+pub const SYSRET_DS: u16 = 6 << 3;     // 0x30
 
 //------------------------------------------------------------------------------
 // TSS (Task State Segment) — 104 bytes
@@ -108,23 +129,26 @@ fn tss_descriptor(tss_addr: u64, size: u32) -> (u64, u64) {
 // Full GDT table
 //------------------------------------------------------------------------------
 
-/// Full GDT: null, kernel code, kernel data, user data, user code, TSS low, TSS high.
+/// Full GDT: null, kernel code, kernel data, user data, user code,
+/// sysret code, sysret data, TSS low, TSS high.
 #[repr(C, align(16))]
 pub struct Gdt {
-    entries: [u64; 7],
+    entries: [u64; 9],
 }
 
 impl Gdt {
     const fn new() -> Self {
         Self {
             entries: [
-                GDT_NULL,
-                GDT_KERNEL_CODE,
-                GDT_KERNEL_DATA,
-                GDT_USER_DATA,
-                GDT_USER_CODE,
-                0,  // TSS low — set at runtime
-                0,  // TSS high — set at runtime
+                GDT_NULL,          // [0]
+                GDT_KERNEL_CODE,   // [1]
+                GDT_KERNEL_DATA,   // [2]
+                GDT_USER_DATA,     // [3]
+                GDT_USER_CODE,     // [4]
+                GDT_SYSRET_CODE,   // [5] — SYSRET CS
+                GDT_SYSRET_DATA,   // [6] — SYSRET SS
+                0,                 // [7] — TSS low (set at runtime)
+                0,                 // [8] — TSS high (set at runtime)
             ],
         }
     }
@@ -133,8 +157,8 @@ impl Gdt {
         let addr = tss as *const TaskStateSegment as u64;
         let size = core::mem::size_of::<TaskStateSegment>() as u32;
         let (low, high) = tss_descriptor(addr, size);
-        self.entries[5] = low;   // TSS descriptor (index 5)
-        self.entries[6] = high;
+        self.entries[7] = low;   // TSS descriptor (index 7)
+        self.entries[8] = high;
     }
 }
 
@@ -205,27 +229,50 @@ unsafe fn load_gdt(gdt: &Gdt) {
 ///
 /// # Safety
 ///
-/// Requires a valid TSS descriptor at GDT index 5.
+/// Requires a valid TSS descriptor at GDT index 7.
 unsafe fn load_tss() {
-    // TSS descriptor is at GDT index 5 → selector = 5 << 3 = 0x28
-    asm!("ltr {0:x}", in(reg) 0x28u16, options(nostack, preserves_flags));
+    // TSS descriptor is at GDT index 7 → selector = 7 << 3 = 0x38
+    asm!("ltr {0:x}", in(reg) 0x38u16, options(nostack, preserves_flags));
 }
 
 /// Initialise MSRs for SYSCALL/SYSRET.
 ///
-/// STAR:
-///   [47:32] = kernel CS (SYSCALL loads CS from here)
-///   [63:48] = kernel DS (SYSRET computes CS=star[63:48]+16|3, SS=star[63:48]+8|3)
+/// SYSRETQ in 64-bit mode (Intel SDM Vol 2B, SYSRET):
+///   CS = STAR[63:48] & 0xFFFC, then RPL=3 forced
+///   SS = (STAR[63:48] + 8) & 0xFFFC, then RPL=3 forced
 ///
-/// With star[63:48] = KERNEL_DS (0x10):
-///   SYSRET CS = 0x10 + 16 | 3 = 0x23 (USER_CS | 3)
-///   SYSRET SS = 0x10 + 8  | 3 = 0x1B (USER_DS  | 3)
+/// GDT layout:
+///   [0] NULL
+///   [1] KERNEL_CODE  (0x08)
+///   [2] KERNEL_DATA  (0x10)
+///   [3] USER_DATA    (0x18)
+///   [4] USER_CODE    (0x20)
+///   [5] SYSRET_CODE  (0x28) — DPL=3, L=1
+///   [6] SYSRET_DATA  (0x30) — DPL=3, W=1
+///   [7] TSS low      (0x38)
+///   [8] TSS high     (0x40)
+///
+/// STAR[63:48] = 0x13 (compatibility):
+///   SYSRET CS = 0x13 (GDT index 2, data descriptor — non-standard but works)
+///   SYSRET SS = 0x1B (GDT index 3, USER_DATA | 3)
+///
+/// STAR[47:32] = KERNEL_CS = 0x08:
+///   SYSCALL CS = 0x08 (kernel code)
+///   SYSCALL SS = 0x10 (kernel data)
 ///
 /// LSTAR = address of syscall_entry.
-/// SF_MASK = mask RFLAGS bits (at minimum IF to prevent interrupts during syscall).
+/// SF_MASK = mask RFLAGS IF to prevent interrupts during syscall.
 unsafe fn setup_syscall_msrs(syscall_entry: u64) {
-    let star: u64 = (KERNEL_DS as u64) << 48   // SYSRET target base
-                  | (KERNEL_CS as u64) << 32;   // SYSCALL CS
+    // SYSRETQ computes:
+    //   CS = STAR[63:48] & 0xFFFC, then RPL forced to 3
+    //   SS = (STAR[63:48] + 8) & 0xFFFC, then RPL forced to 3
+    //
+    // With STAR[63:48] = 0x13 (compatibility value):
+    //   SYSRET CS = 0x13 (GDT index 2, data descriptor — works but non-standard)
+    //   SYSRET SS = 0x1B (GDT index 3, USER_DATA with RPL=3)
+    const STAR_SYSRET_SS_BASE: u64 = 0x13;
+    let star: u64 = (STAR_SYSRET_SS_BASE) << 48   // SYSRET SS base
+                  | (KERNEL_CS as u64) << 32;      // SYSCALL CS
 
     asm!(
         "wrmsr",

@@ -6,7 +6,8 @@
 ## **General Rules**
 1. **Primary workflow**: OpenCode agents handle all development — Rust kernel code, NASM assembly, build system, and testing.
 2. **Orchestration**: High-level planning, architecture, and multi-phase refactors use the orchestrator with deepwork skill. Implementation is delegated to specialist agents (fixer, coder).
-3. **Avoid**:
+3. **Changelog**: All agents must log every change to `CHANGELOG.md` at the end of each session. The changelog entry must include: date, a brief description of what was changed, files modified, and test results. This keeps the project history accessible to all agents (and humans).
+4. **Avoid**:
    - Copying foreign kernel source code verbatim (anti-plagiarism checker scans for Linux/BSD patterns).
    - Re-using any GPL-licensed source code.
    - Using Mistral models (known flaky behavior with low-level kernel code).
@@ -129,12 +130,14 @@ is empty. For interactive shells, this causes busy-looping. Use the
 ### Initramfs Layout for `INIT=vibit`
 When building with `INIT=vibit`:
 - `sbin/init` = VIBIT init system (from `../vibit/vibit.bin`)
-- `bin/vish` = vish shell (from `../vish/vish.bin`)
+- `bin/vish` = NASM flat binary shell (from `../vish/vish.bin`)
+- `bin/vish_rust` = Rust ELF shell (from `../vish/target/.../vibix`, experimental)
 - `bin/{echo,cat,clear,false,printenv,true,yes}` = GVIBU coreutils
   (from `../gvibu-ai-lab/kernel/user_*.asm`)
+- `bin/gvibu` = GVIBU multicall ELF (from `../gvibu-ai-lab/vibix-lib/`)
 
 VIBIT spawns vish via `fork()` + `exec("/bin/vish")`. The vish binary is a
-flat NASM binary at USER_CODE_ADDR (0x2000000).
+flat NASM binary at USER_CODE_ADDR (0x2000000). The Rust ELF is at `/bin/vish_rust`.
 
 ### `make test` Now Includes Anti-Plagiarism Check
 ```bash
@@ -210,51 +213,49 @@ Checks fork, exec, waitpid, blocking TTY read via VIBIT + vish markers.
 
 ---
 
-## **Next Session: Per-Process Page Tables + vish Rust Frontend**
+## **Phase 2 Implementation (Per-Process Page Tables)**
 
-### Per-Process Page Tables (P₃)
-Currently all processes share the same page tables (single address space).
-To implement proper process isolation:
+### Architecture
+Each process has its own PML4 (`pml4_phys: u64` on `Process`). The kernel uses `map_4k_target()`
+to map pages into a target process's PML4 by temporarily switching CR3. On context switch,
+`scheduler_tick()` and `scheduler_switch_exit()` call `write_cr3(next.pml4_phys)`.
 
-1. **Add `pml4` field to `Process` struct** — each process has its own PML4 table.
-2. **Initialize PML4 at fork/spawn** — copy kernel mappings, create new user mapping.
-3. **Switch CR3 on context switch** — in `scheduler_tick()` and `scheduler_switch_exit()`.
-4. **Update `load_flat_binary` and ELF loader** — map pages into the process's own page tables instead of the global ones.
-5. **Fix `tty_wake` and cross-process IPI** — blocking read wake-up needs the target process's page tables.
+### create_pml4(pmm, copy_user) → phys addr
+Creates a per-process PML4:
+1. Allocates new PML4 page, copies PML4[1..511] from active (kernel upper-half entries)
+2. For PML4[0]: allocates new PDPT, then for each PDPT entry allocates new PD
+3. Copies kernel PD entries (vaddr < USER_CODE_ADDR = 0x2000000) from active table
+4. For user PD entries (vaddr ≥ 0x2000000):
+   - If `!copy_user`: leaves as 0 (not present) — used for `spawn_init`, `exec`
+   - If `copy_user`: deep-copies the PT page (new PT, copies all 512 entries) — used for fork
 
-**Key challenge**: VIBIX currently modifies the ACTIVE page tables directly.
-With per-process tables, the kernel must either:
-- Map all process page tables into the kernel's address space (e.g., at a fixed
-  virtual address range like `0xFFFF8000_00000000`) for modification, or
-- Temporarily switch CR3 to the target process's tables when modifying them.
+The deep-copy in `copy_user=true` prevents the parent and child from sharing PT pages.
+When the child execs an ELF and the loader changes page permissions, the parent's mappings
+are not affected.
 
-**Suggested approach**: Reserve a fixed virtual address range in the kernel for
-accessing process page tables (recursive mapping). This avoids expensive CR3
-switches.
+### map_4k_target(vaddr, paddr, flags, pmm, target_pml4_phys)
+Switches CR3 to target_pml4_phys (if different from current), calls `map_4k`, flushes TLB
+with `invlpg`, then restores CR3. If target == current CR3, the switch is skipped (no-op).
 
-### vish Rust Frontend on VIBIX
-vish has a cross-platform Rust core (`src/lib.rs`, `src/parse.rs`, `src/readline.rs`,
-`src/exec.rs`) with platform backends:
-- `src/linux/` — Linux ELF backend (uses libc)
-- `src/vibix/` — VIBIX flat binary backend (currently just `vish.asm`)
+### ELF Loader (`elf.rs`)
+- Pages are zeroed via virtual address in target PML4 (`write_bytes(vaddr_page, ...)`)
+  NOT via physical address (no identity-map dependency)
+- `translate_in_pml4(vaddr, pml4_phys)` detects overlapping segments between .text and .rodata
+- Relaxation (RW→RO) is disabled — all pages stay RW (no NX bit anyway)
 
-To port the Rust frontend:
+### Known Issue: GPF #13 with Multi-Segment Rust ELF
+When VIBIT fork-execs a Rust ELF with multiple LOAD segments (.text + .rodata), a GPF #13
+occurs at the kernel's `iretq` in `irq_common` (kernel/interrupts.asm:184) with error code 0x18
+(SS selector mismatch). The target frame has CS=0x08 + SS=0x1B.
 
-1. **Build Rust for VIBIX** — vish's Rust core compiles with `#![no_std]` for VIBIX.
-   It needs a minimal platform layer (`src/vibix/mod.rs`) providing:
-   - `sys_read(fd, buf, len)` → syscall 2
-   - `sys_write(fd, buf, len)` → syscall 1
-   - `sys_fork()` → syscall 8
-   - `sys_exec(path, argv, envp)` → syscall 9
-   - `sys_waitpid(pid, wstatus, flags)` → syscall 10
-   - `sys_open(path, flags)` → syscall 12 (for PATH-based command search)
-   - `sys_isatty(fd)` → syscall 24
-   - `sys_tcgetattr(fd, termios)` → syscall 25
-   - `sys_tcsetattr(fd, termios)` → syscall 26
-2. **Link as ELF** — The Rust compiler produces ELF, which the kernel's ELF loader
-   already supports (with the RW-then-relax fix).
+Single-segment ELFs (text only) work. NASM flat binaries work. The corruption happens between
+`scheduler_tick` returning `next.kernel_rsp` and the assembly `iretq`, likely caused by
+`map_4k`'s `|= PAGE_USER` on PML4[0]/PDPT[0] during ELF loading. See NEXT_SESSION.md for
+detailed debugging history.
 
-**Relevant repos**: `../vish` (source), `../gvibu-ai-lab/vibix-lib/` (reference for
-Rust ELF build setup for VIBIX).
+### translate_in_pml4(vaddr, pml4_phys) → Option(u64)
+Walks a specific PML4 table (not the active CR3). Used by the ELF loader to check if a
+virtual address is already mapped in the target process's page tables (for overlapping segments).
 
---
+---
+

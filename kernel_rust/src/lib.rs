@@ -20,6 +20,7 @@ mod gdt;
 mod syscall;
 mod paging;
 mod process;
+mod signal;
 
 mod vfs;
 use core::panic::PanicInfo;
@@ -159,4 +160,68 @@ fn panic(info: &PanicInfo) -> ! {
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
     }
+}
+
+//------------------------------------------------------------------------------
+// Debug: print iretq frame values right before iretq instruction.
+// Called from assembly (irq_common, .exit_or_block) BEFORE iretq.
+//
+// rsp — kernel RSP pointing at RIP in the iretq frame
+// path — 1 = irq_common, 2 = .exit_or_block
+//------------------------------------------------------------------------------
+#[no_mangle]
+pub extern "C" fn debug_iretq_ss(rsp: u64, path: u64) {
+    if cfg!(feature = "debug") {
+        // Use the already-initialized serial port (no init() call needed).
+        // init() clears the TX FIFO which fragments output and causes
+        // invalid UTF-8 in the test harness.
+        let mut serial = serial::SerialPort::new();
+
+        unsafe {
+            // Frame layout at iretq: RSP points at RIP
+            let rip = core::ptr::read_volatile((rsp) as *const u64);
+            let cs = core::ptr::read_volatile((rsp + 8) as *const u64);
+            let rflags = core::ptr::read_volatile((rsp + 16) as *const u64);
+            let user_rsp = core::ptr::read_volatile((rsp + 24) as *const u64);
+            let ss = core::ptr::read_volatile((rsp + 32) as *const u64);
+
+            // GPR slots: RSP-136=RAX, RSP-128=RCX, RSP-16=int_no, RSP-8=err_code
+            let rax = core::ptr::read_volatile((rsp.wrapping_sub(136)) as *const u64);
+            let rcx = core::ptr::read_volatile((rsp.wrapping_sub(128)) as *const u64);
+            let int_no = core::ptr::read_volatile((rsp.wrapping_sub(16)) as *const u64);
+            let err_code = core::ptr::read_volatile((rsp.wrapping_sub(8)) as *const u64);
+
+            // Use writestrs to avoid format_args! / write! macro overhead
+            // which might reference pageable memory at interrupt time.
+            hex_out(&mut serial, b"DBG iretq_pre: path=", path);
+            hex_out(&mut serial, b" RSP=", rsp);
+            serial.writestrs(&["\n"]);
+
+            hex_out(&mut serial, b"  RIP=", rip);
+            hex_out(&mut serial, b" CS=", cs);
+            hex_out(&mut serial, b" RFLAGS=", rflags);
+            hex_out(&mut serial, b" userRSP=", user_rsp);
+            serial.writestrs(&["\n"]);
+
+            hex_out(&mut serial, b"  SS=", ss);
+            hex_out(&mut serial, b" int=", int_no);
+            hex_out(&mut serial, b" err=", err_code);
+            hex_out(&mut serial, b" RAX=", rax);
+            hex_out(&mut serial, b" RCX=", rcx);
+            serial.writestrs(&["\n"]);
+        }
+    }
+}
+
+/// Write a label + u64 hex value to serial without fmt machinery.
+fn hex_out(serial: &mut serial::SerialPort, label: &[u8], val: u64) {
+    serial.writestrs(&[core::str::from_utf8(label).unwrap_or("??")]);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[17 - i] = HEX[((val >> (4 * i)) & 0xF) as usize];
+    }
+    serial.writestrs(&[core::str::from_utf8(&buf).unwrap_or("??")]);
 }

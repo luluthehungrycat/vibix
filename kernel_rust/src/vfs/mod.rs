@@ -469,6 +469,7 @@ pub unsafe fn vfs_init() {
     crate::syscall::register(24, sys_isatty);
     crate::syscall::register(25, sys_tcgetattr);
     crate::syscall::register(26, sys_tcsetattr);
+    crate::syscall::register(27, sys_getcwd);
 }
 
 //==============================================================================
@@ -878,6 +879,36 @@ fn sys_chdir(path: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
         proc.cwd[i] = 0; // NUL-terminate
 
         0
+    }
+}
+
+//==============================================================================
+// getcwd(27) — get current working directory
+//==============================================================================
+
+fn sys_getcwd(buf: u64, size: u64, _arg3: u64, _arg4: u64) -> u64 {
+    unsafe {
+        // 1. Get the current process cwd
+        let proc = crate::process::process_mut(crate::process::current_pid());
+
+        // 2. Find the NUL terminator to determine the actual cwd length
+        let cwd_len = proc.cwd.iter().position(|&b| b == 0).unwrap_or(255);
+
+        // 3. If buf is NULL, return -EFAULT
+        if buf == 0 {
+            return (-EFAULT as i64) as u64;
+        }
+
+        // 4. Copy cwd to user space if size allows
+        if size > 0 {
+            let copy_len = core::cmp::min(cwd_len, size as usize - 1);
+            core::ptr::copy_nonoverlapping(proc.cwd.as_ptr(), buf as *mut u8, copy_len);
+            // 5. NUL-terminate
+            *(buf as *mut u8).add(copy_len) = 0;
+        }
+
+        // 6. Return the buffer address on success
+        buf
     }
 }
 

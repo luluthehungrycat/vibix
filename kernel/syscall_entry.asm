@@ -18,6 +18,9 @@ section .text
 
 extern syscall_handler
 extern scheduler_switch_exit
+%ifdef DEBUG
+extern serial_puts, serial_print_hex8, serial_print_hex64
+%endif
 
 ;------------------------------------------------------------------------------
 ; Per-process globals (updated by scheduler)
@@ -37,6 +40,14 @@ syscall_state:
 
 global should_schedule
 should_schedule: db 0
+
+global sigreturn_pending
+sigreturn_pending: db 0
+
+; 18 qwords for sigreturn: [0..14]=RAX..R15, [15]=RIP, [16]=userRSP, [17]=RFLAGS
+global sigreturn_frame
+sigreturn_frame:
+    times 18 dq 0
 
 ;------------------------------------------------------------------------------
 ; Syscall entry point
@@ -93,9 +104,6 @@ syscall_entry:
     ; Clear flag BEFORE building frame (avoid recursive entry)
     mov byte [rel should_schedule], 0
 
-    ; Discard the call return address from syscall_handler call
-    add rsp, 8
-
     ; Build frame HIGH→LOW (matching irq_common pop order).
     ; Individual pushes in reverse order: r15 first (highest), rax last (RSP).
 
@@ -110,7 +118,46 @@ syscall_entry:
     push 0                          ; err_code
     push 0                          ; int_no
 
-    ; GPRs (reverse push: r15 first, rax last = RSP)
+    ; GPRs — check sigreturn frame first
+    cmp byte [rel sigreturn_pending], 0
+    je .normal_push
+
+    ; Restore saved GPRs from sigreturn_frame
+    mov byte [rel sigreturn_pending], 0
+    ; Push in reverse order: R15 first (highest address), RAX last (RSP points here)
+    ; Push order: R15, R14, ..., RAX
+    push qword [rel sigreturn_frame + (14*8)]   ; R15
+    push qword [rel sigreturn_frame + (13*8)]   ; R14
+    push qword [rel sigreturn_frame + (12*8)]   ; R13
+    push qword [rel sigreturn_frame + (11*8)]   ; R12
+    push qword [rel sigreturn_frame + (10*8)]   ; R11
+    push qword [rel sigreturn_frame + (9*8)]    ; R10
+    push qword [rel sigreturn_frame + (8*8)]    ; R9
+    push qword [rel sigreturn_frame + (7*8)]    ; R8
+    push qword [rel sigreturn_frame + (6*8)]    ; RDI
+    push qword [rel sigreturn_frame + (5*8)]    ; RSI
+    push qword [rel sigreturn_frame + (4*8)]    ; RBP
+    push qword [rel sigreturn_frame + (3*8)]    ; RBX
+    push qword [rel sigreturn_frame + (2*8)]    ; RDX
+    push qword [rel sigreturn_frame + (1*8)]    ; RCX
+    push qword [rel sigreturn_frame + (0*8)]    ; RAX  ← RSP now points here
+
+    ; Also restore iretq frame fields (RIP, RFLAGS, user RSP) from
+    ; sigreturn_frame[15..17].  The iretq frame was pre-built at lines 111-115
+    ; with syscall_state values; overwrite them now.
+    ; Offsets from RSP (points at RAX):
+    ;   +136 = RIP, +152 = RFLAGS, +160 = user RSP
+    mov rcx, [rel sigreturn_frame + (15*8)]    ; saved RIP
+    mov [rsp + 136], rcx
+    mov rcx, [rel sigreturn_frame + (17*8)]    ; saved RFLAGS
+    mov [rsp + 152], rcx
+    mov rcx, [rel sigreturn_frame + (16*8)]    ; saved user RSP
+    mov [rsp + 160], rcx
+
+    jmp .after_push
+
+.normal_push:
+    ; Original all-zeros push
     push 0                          ; R15
     push 0                          ; R14
     push 0                          ; R13
@@ -126,8 +173,7 @@ syscall_entry:
     push 0                          ; RDX
     push 0                          ; RCX
     push 0                          ; RAX  ← RSP now points here
-
-    ; RSP now points at RAX — pass as argument
+.after_push:
     mov rdi, rsp
     call scheduler_switch_exit
     mov rsp, rax
@@ -149,5 +195,38 @@ syscall_entry:
     pop r14
     pop r15
 
+%ifdef DEBUG
+    ;--- DEBUG: print iretq frame SS if != 0x1B ---
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    mov rax, [rsp + 80]
+    cmp al, 0x1B
+    je .sys_skip_dbg
+    lea rsi, [rel .sys_dbg_excl]
+    call serial_puts
+    mov rax, [rsp + 80]
+    call serial_print_hex8
+    lea rsi, [rel .sys_dbg_rsp]
+    call serial_puts
+    mov rax, rsp
+    add rax, 32
+    call serial_print_hex64
+    lea rsi, [rel .sys_dbg_nl]
+    call serial_puts
+.sys_skip_dbg:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .sys_dbg_end
+.sys_dbg_excl:  db "!SYS SS=", 0
+.sys_dbg_rsp:   db " RSP=0x", 0
+.sys_dbg_nl:    db 0x0D, 0x0A, 0
+.sys_dbg_end:
+%endif
+
     add rsp, 16    ; skip int_no + err_code
+
     iretq

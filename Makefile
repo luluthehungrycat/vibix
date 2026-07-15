@@ -21,6 +21,7 @@ RUST_LD     = $(RUST_DIR)/kernel64_elf.ld
 # Debug flag: make DEBUG=1 to enable kernel debug output
 DEBUG ?= 0
 RUST_FEATURES = $(if $(filter 1,$(DEBUG)),--features debug,)
+NASMFLAGS = $(if $(filter 1,$(DEBUG)),-d DEBUG,)
 
 # Init selection: make INIT=vibit to use VIBIT init system from ../vibit
 INIT ?= default
@@ -44,20 +45,20 @@ $(USR_BIN) $(USR_TAR):
 # ── Stage 1: 64-bit flat binary ─────────────────────────────────────────────
 
 kernel64_entry.o: kernel/kernel64_entry.asm
-	$(NASM) -f elf64 $< -o $@
+	$(NASM) -f elf64 $(NASMFLAGS) $< -o $@
 
 interrupts.o: kernel/interrupts.asm
-	$(NASM) -f elf64 $< -o $@
+	$(NASM) -f elf64 $(NASMFLAGS) $< -o $@
 
 syscall_entry.o: kernel/syscall_entry.asm
-	$(NASM) -f elf64 $< -o $@
+	$(NASM) -f elf64 $(NASMFLAGS) $< -o $@
 
 context_switch.o: kernel/context_switch.asm
-	$(NASM) -f elf64 $< -o $@
+	$(NASM) -f elf64 $(NASMFLAGS) $< -o $@
 
 # Build the Rust staticlib (produces libvibix_kernel.a)
 # Use `make DEBUG=1` to enable kernel debug output
-$(RUST_LIB): $(USR_BIN) $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
+$(RUST_LIB): $(USR_BIN) $(USR_TAR) $(wildcard $(RUST_DIR)/src/*.rs) $(RUST_DIR)/Cargo.toml
 	cd $(RUST_DIR) && \
 	RUSTFLAGS="-C code-model=kernel" \
 	$(CARGO) build --target $(RUST_TARGET) --release $(RUST_FEATURES)

@@ -52,7 +52,6 @@ pub fn read_cr3() -> u64 {
 ///
 /// # Safety
 /// `cr3` must be a valid physical address of a 4 KiB aligned PML4 page table.
-#[allow(dead_code)]
 pub unsafe fn write_cr3(cr3: u64) {
     core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
 }
@@ -100,9 +99,128 @@ fn indices(vaddr: u64) -> (usize, usize, usize, usize) {
 }
 
 /// Return a mutable reference to the active L4 (PML4) page table.
-fn active_l4() -> &'static mut PageTable {
+pub(crate) fn active_l4() -> &'static mut PageTable {
     unsafe { &mut *(read_cr3() as *mut PageTable) }
 }
+/// Create a new per-process PML4 page table.
+///
+/// Allocates a fresh PML4, copies kernel mappings from the active PML4, and
+/// sets up a per-process PDPT for the identity-mapped low address range
+/// (PML4[0]).  User-space PDPT entries are zeroed (not present) unless
+/// `copy_user` is true (for fork).
+///
+/// Returns the physical address of the new PML4.
+pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
+    let src_l4 = active_l4();
+    let user_code_addr: u64 = 0x2000000; // USER_CODE_ADDR
+
+    // 1. Allocate and zero new PML4 page
+    let new_l4_phys = pmm.alloc();
+    if new_l4_phys.is_null() {
+        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+    }
+    let new_l4 = unsafe { &mut *(new_l4_phys as *mut PageTable) };
+    for slot in new_l4.iter_mut() { *slot = 0; }
+
+    // 2. Copy PML4 entries from active table.
+    //    PML4[0] is special (kernel + user identity map) — needs per-process PDPT.
+    //    Other entries (1..511) are kernel-only and can be shared.
+    for i in 1..512 {
+        new_l4[i] = src_l4[i];
+    }
+
+    // 3. Handle PML4[0] — create per-process PDPT with isolated user entries.
+    let src_pml4e_0 = src_l4[0];
+    if src_pml4e_0 & PAGE_PRESENT != 0 {
+        let src_pdpt_phys = src_pml4e_0 & ADDR_MASK;
+        let src_pdpt = unsafe { &*(src_pdpt_phys as *const PageTable) };
+
+        // Allocate new PDPT
+        let new_pdpt_phys = pmm.alloc();
+        if new_pdpt_phys.is_null() {
+            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        }
+        let new_pdpt = unsafe { &mut *(new_pdpt_phys as *mut PageTable) };
+        for slot in new_pdpt.iter_mut() { *slot = 0; }
+
+        // For each PDPT entry that is present
+        for pdpt_idx in 0..512 {
+            let src_pdpte = src_pdpt[pdpt_idx];
+            if src_pdpte & PAGE_PRESENT == 0 { continue; }
+
+            // If it's a 1 GiB huge page, copy directly (rare in kernel identity map)
+            if src_pdpte & PAGE_HUGE != 0 {
+                // Check if this huge page covers user addresses
+                let base_vaddr = (pdpt_idx as u64) << 30; // 1 GiB per PDPT entry
+                if base_vaddr >= user_code_addr && !copy_user {
+                    continue; // skip user 1 GiB mapping
+                }
+                // Preserve flags, strip accessed/dirty for fresh tables
+                new_pdpt[pdpt_idx] = src_pdpte & !(PAGE_ACCESSED | PAGE_DIRTY);
+                continue;
+            }
+
+            // Allocate new PD page for this PDPT entry
+            let src_pd_phys = src_pdpte & ADDR_MASK;
+            let src_pd = unsafe { &*(src_pd_phys as *const PageTable) };
+
+            let new_pd_phys = pmm.alloc();
+            if new_pd_phys.is_null() {
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+            }
+            let new_pd = unsafe { &mut *(new_pd_phys as *mut PageTable) };
+            for slot in new_pd.iter_mut() { *slot = 0; }
+
+            // Copy PD entries, skipping user entries if !copy_user
+            for pd_idx in 0..512 {
+                let src_pde = src_pd[pd_idx];
+                if src_pde & PAGE_PRESENT == 0 { continue; }
+
+                // Compute virtual address for this PD entry to check if it's user
+                let vaddr = ((pdpt_idx as u64) << 30) | ((pd_idx as u64) << 21);
+
+                if vaddr >= user_code_addr && !copy_user {
+                    continue; // skip user mapping
+                }
+
+                // For fork (copy_user=true): deep-copy PT tables for user entries
+                // to prevent parent/child from sharing the same page table entries.
+                // When the child execs an ELF and relaxes page permissions, the
+                // parent's pages (flat binary stack at 0x2002000) would also become
+                // read-only if they shared the same PT.
+                if copy_user && vaddr >= user_code_addr && (src_pde & PAGE_HUGE) == 0 {
+                    let src_pt_phys = src_pde & ADDR_MASK;
+                    let src_pt = unsafe { &*(src_pt_phys as *const PageTable) };
+                    let new_pt_phys = pmm.alloc();
+                    if new_pt_phys.is_null() {
+                        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+                    }
+                    let new_pt = unsafe { &mut *(new_pt_phys as *mut PageTable) };
+                    for slot in new_pt.iter_mut() { *slot = 0; }
+                    for k in 0..512 {
+                        new_pt[k] = src_pt[k];
+                    }
+                    let pt_flags = src_pde & !ADDR_MASK;
+                    new_pd[pd_idx] = (new_pt_phys as u64) | pt_flags;
+                } else {
+                    new_pd[pd_idx] = src_pde;
+                }
+            }
+
+            // Wire the new PD into the new PDPT
+            // Strip accessed/dirty from intermediate entry for fresh tables
+            let flags = src_pdpte & (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE | PAGE_GLOBAL | PAGE_NO_EXEC);
+            new_pdpt[pdpt_idx] = (new_pd_phys as u64) | (flags & !(PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE));
+        }
+
+        // Wire the new PDPT into the new PML4[0]
+        let flags = src_pml4e_0 & (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE | PAGE_GLOBAL | PAGE_NO_EXEC);
+        new_l4[0] = (new_pdpt_phys as u64) | (flags & !(PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE));
+    }
+
+    new_l4_phys as u64
+}
+
 
 //==============================================================================
 // Mapping
@@ -139,6 +257,26 @@ pub fn map_4k(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator) {
         }
     }
 }
+
+/// Map a single 4 KiB page in a target process's address space.
+///
+/// Temporarily switches CR3 to `target_pml4_phys`, maps the page via `map_4k`,
+/// flushes the TLB entry (while target CR3 is active), then restores the
+/// original CR3.
+///
+/// Both `vaddr` and `paddr` must be 4 KiB aligned.
+pub fn map_4k_target(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator, target_pml4_phys: u64) {
+    let saved_cr3 = read_cr3();
+    if target_pml4_phys != saved_cr3 {
+        unsafe { write_cr3(target_pml4_phys); }
+    }
+    map_4k(vaddr, paddr, flags, pmm);
+    invlpg(vaddr); // flush TLB for this vaddr while target CR3 is active
+    if target_pml4_phys != saved_cr3 {
+        unsafe { write_cr3(saved_cr3); }
+    }
+}
+
 
 /// Map a 2 MiB huge page in the active address space.
 ///
@@ -234,6 +372,31 @@ pub fn unmap(vaddr: u64) -> Option<u64> {
 pub fn translate(vaddr: u64) -> Option<u64> {
     let (l4i, l3i, l2i, l1i) = indices(vaddr);
     let l4 = unsafe { &*(read_cr3() as *const PageTable) };
+
+    if l4[l4i] & PAGE_PRESENT == 0 { return None; }
+    let l3 = unsafe { &*((l4[l4i] & ADDR_MASK) as *const PageTable) };
+    if l3[l3i] & PAGE_PRESENT == 0 { return None; }
+    let l2 = unsafe { &*((l3[l3i] & ADDR_MASK) as *const PageTable) };
+    if l2[l2i] & PAGE_PRESENT == 0 { return None; }
+
+    if l2[l2i] & PAGE_HUGE != 0 {
+        let base = l2[l2i] & ADDR_MASK;
+        return Some(base | (vaddr & 0x1F_FFFF));
+    }
+
+    let l1 = unsafe { &*((l2[l2i] & ADDR_MASK) as *const PageTable) };
+    if l1[l1i] & PAGE_PRESENT == 0 { return None; }
+    let base = l1[l1i] & ADDR_MASK;
+    Some(base | (vaddr & 0xFFF))
+}
+
+/// Translate a virtual address in a SPECIFIC PML4 table.
+/// This does NOT use `read_cr3()` — it walks the given PML4 directly.
+/// Useful for checking if a page is already mapped in a target process's
+/// page tables during ELF loading, without having to switch CR3.
+pub fn translate_in_pml4(vaddr: u64, pml4_phys: u64) -> Option<u64> {
+    let (l4i, l3i, l2i, l1i) = indices(vaddr);
+    let l4 = unsafe { &*(pml4_phys as *const PageTable) };
 
     if l4[l4i] & PAGE_PRESENT == 0 { return None; }
     let l3 = unsafe { &*((l4[l4i] & ADDR_MASK) as *const PageTable) };

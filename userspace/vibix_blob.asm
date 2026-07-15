@@ -16,12 +16,13 @@
 ;   8 = yes_cmd     — infinite "y\n" loop
 ;   9 = vfs_test    — VFS syscall exercise test
 ;  10 = stat_chdir_test — stat/fstat/chdir syscall test
+;  11 = user_test   — pipe, dup, dup2, getcwd, chdir test
 ;==============================================================================
 
 ORG 0x2000000
 bits 64
 
-NUM_COMMANDS equ 11
+NUM_COMMANDS equ 12
 
 section .text
 global _start
@@ -60,6 +61,10 @@ init_demo:
     mov rax, 3
     syscall
 
+    ; Run user tests
+    call user_test
+    ; Run signal tests
+    call sig_test
     ; Exit cleanly (test_kernel.py checks for "VIBIX: PID 1 exited with code 0")
     xor edi, edi
     mov eax, 0
@@ -119,6 +124,7 @@ dispatch_table:
     dq yes_cmd          ; 8: infinite y loop
     dq vfs_test          ; 9: VFS syscall exercise
     dq stat_chdir_test   ; 10: stat/chdir syscall test
+    dq user_test         ; 11: user test (pipe, dup, chdir, getcwd)
 
 ; ── String data ──────────────────────────────────────────────────────────────
 str_echo:       db "echo", 0
@@ -145,3 +151,7 @@ section .text
 %include "vibix_shell.inc"
 %include "vibix_vfstest.inc"
 %include "vibix_stat_chdir.inc"
+section .text
+%include "vibix_user_test.inc"
+section .text
+%include "vibix_signal_test.inc"

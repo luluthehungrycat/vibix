@@ -26,5 +26,4 @@ userspace/vibix_blob
 .DS_Store
 
 # Generated userspace test artifacts
-userspace/vibix_vfstest.inc
 session-ses_*.md
