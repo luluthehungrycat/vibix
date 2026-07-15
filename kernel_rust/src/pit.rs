@@ -63,7 +63,8 @@ pub fn tick() {
         let ticks = PIT_TICKS;
 
         // Print a heartbeat every 100 ticks (≈ 1 second).
-        if ticks % 100 == 0 {
+        // Only printed when debug mode is enabled.
+        if cfg!(feature = "debug") && ticks % 100 == 0 {
             let mut serial = SerialPort::new();
             serial.writestrs(&["VIBIX: PIT tick #"]);
 

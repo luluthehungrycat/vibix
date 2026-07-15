@@ -18,7 +18,7 @@ scheduler, 64-process table, idle process), VFS layer (vnode abstraction, open
 file table, mount table, devfs, initramfs with ustar parser, rootfs), 19 syscalls
 (exit, write, read, getpid, brk, nanosleep, uname, reboot, fork, exec, waitpid,
 mmap, open, close, lseek, getdents, dup, dup2, pipe), ELF64 + flat binary loader,
-per-process fd table with /dev/ttyS0 for fd 0/1/2, and full interrupt handling
+per-process fd table with /dev/ttyS0 for fd 0/1/2, per-process PML4 page tables, and full interrupt handling
 (IDT, PIC, PIT at 100 Hz), VBE framebuffer, PMM, KMM, keyboard driver, GDT with
 Ring 3/TSS — all built in Rust (stable, no_std).**
 
@@ -46,7 +46,7 @@ boot.asm (ELF32, Multiboot v1) ──incbin──► kernel64.bin (flat 64-bit b
 | `boot.asm` | ELF32 | `_start` (MB1 entry) | Sets up GDT, PML4, enters long mode, `incbin`s kernel64.bin, calls `kernel_main` |
 | `kernel64.bin` | Flat binary | `_kernel64_start` | Rust kernel: serial driver, PMM bitmap allocator, idle loop |
 
-### Address Space Layout (boot stage)
+### Address Space Layout (boot stage — processes now have per-process page tables)
 
 ```
 0x001000  ┌──────────────────────────────┐

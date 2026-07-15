@@ -35,6 +35,7 @@ VIBIT_DIR     = $(abspath $(BUILD_DIR)/../../vibit)
 VIBIT_BIN     = $(VIBIT_DIR)/vibit.bin
 VISH_DIR      = $(abspath $(BUILD_DIR)/../../vish)
 VISH_BIN      = $(VISH_DIR)/vish.bin
+VISH_RUST_ELF = $(VISH_DIR)/target/x86_64-unknown-none/release/vibix
 GVIBU_DIR     = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/kernel)
 GVIBU_ELF_DIR = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/vibix-lib)
 
@@ -58,6 +59,8 @@ ifeq ($(INIT),vibit)
 	# Build and copy vish shell binary for VIBIT to exec
 	$(MAKE) -C $(VISH_DIR) all
 	cp $(VISH_BIN) /tmp/vibix-initramfs/bin/vish
+	# Build and copy vish Rust ELF binary (experimental)
+	cp $(VISH_RUST_ELF) /tmp/vibix-initramfs/bin/vish_rust
 	# Build and copy GVIBU coreutils (flat NASM binaries)
 	cd $(GVIBU_DIR) && for asm in user_*.asm; do \
 		out=$$(echo $$asm | sed 's/user_\(.*\)\.asm/\1/'); \

@@ -19,6 +19,7 @@ use crate::pmm;
 use crate::process::{current_pid, process_mut, BRK_START, BRK_MAX};
 use crate::process;
 use crate::vfs::{MAX_FDS, EBADF, EMFILE};
+use crate::signal::SignalResult;
 
 /// Syscall handler function pointer.
 pub type SyscallFn = fn(u64, u64, u64, u64) -> u64;
@@ -62,7 +63,6 @@ const MAP_FAILED: u64 = u64::MAX;
 fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     let pid = current_pid();
     let mut serial = SerialPort::new();
-    serial.init();
     serial.writestrs(&["VIBIX: PID "]);
     // Write PID in decimal (at most 2 digits)
     let p = pid;
@@ -448,6 +448,23 @@ pub fn init() {
     register(18, sys_dup);
     register(19, sys_dup2);
     register(20, sys_pipe);
+    // Signal syscalls
+    register(28, sys_kill);
+    register(29, sys_sigaction);
+    register(30, sys_sigreturn);
+}
+
+// Signal syscall shims — delegate to signal.rs
+fn sys_kill(arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+    crate::signal::sys_kill(arg1, arg2) as u64
+}
+
+fn sys_sigaction(arg1: u64, arg2: u64, arg3: u64, _arg4: u64) -> u64 {
+    crate::signal::sys_sigaction(arg1, arg2, arg3) as u64
+}
+
+fn sys_sigreturn(_arg1: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+    crate::signal::sys_sigreturn()
 }
 
 //==============================================================================
@@ -468,21 +485,20 @@ pub extern "C" fn syscall_handler(
     arg3: u64,
     arg4: u64,
 ) -> u64 {
-    // Check for pending signals — if SIGINT is pending, exit with 128+SIGINT
-    let pid = crate::process::current_pid();
-    if pid != 0 {
-        let proc = crate::process::process_mut(pid);
-        if proc.sig_pending & (1 << crate::process::SIGINT) != 0 {
-            // Clear the pending signal and exit
-            proc.sig_pending &= !(1 << crate::process::SIGINT);
-            // Call sys_exit logic inline: mark Zombie, schedule exit
-            proc.state = crate::process::ProcessState::Zombie;
-            proc.exit_code = 130;  // 128 + SIGINT
-            unsafe {
-                core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
-            }
+    // Check for pending signals before dispatching the syscall.
+    // SIG_DFL terminates the process immediately.  Custom handlers are
+    // deferred to the scheduler (which has a proper iretq frame to modify).
+    let pid = current_pid();
+    match crate::signal::check_signals_syscall(pid) {
+        SignalResult::Terminated => {
+            unsafe { core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1); }
             return 0;
         }
+        SignalResult::CustomPending => {
+            unsafe { core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1); }
+            return 0;
+        }
+        SignalResult::None => {}
     }
 
     if (num as usize) < MAX_SYSCALLS {

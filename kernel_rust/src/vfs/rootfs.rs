@@ -82,10 +82,10 @@ unsafe fn rootfs_readdir(vnode: *mut Vnode, dirent: *mut Dirent, index: u32) -> 
     if ino == 0 {
         let child_idx = (index - 2) as usize;
         let (child_ino, child_name, child_mode) = match child_idx {
-            0 => (1, b"sbin\0", V_DIR),
-            1 => (2, b"bin\0\0",  V_DIR),
-            2 => (3, b"etc\0\0",  V_DIR),
-            3 => (4, b"dev\0\0",  V_DIR),
+            0 => (1, &b"sbin\0"[..], V_DIR),
+            1 => (2, &b"bin\0"[..],  V_DIR),
+            2 => (3, &b"etc\0"[..],  V_DIR),
+            3 => (4, &b"dev\0"[..],  V_DIR),
             _ => return 0,
         };
         let de = &mut *dirent;

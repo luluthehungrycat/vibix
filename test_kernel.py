@@ -24,11 +24,24 @@ CHECKLIST = {
     "Hello, world!":                      "User-mode init output",
     "From PID 1 (init)":                  "Init process message",
     "VIBIX: PID 1 exited with code 0":   "Init exit",
+    # Userspace syscall tests
+    "User Test Begin":                    "Userspace test suite start",
+    "  [OK] pipe test: HELLO_PIPE":       "Pipe syscall test",
+    "  [OK] dup test: newfd=":           "Dup syscall test",
+    "  [OK] dup2 test: newfd=5":         "Dup2 syscall test",
+    "  [OK] getcwd test: ":              "Getcwd syscall test",
+    "User Test End":                      "Userspace test suite end",
 }
 
 OPTIONAL = {
     "VIBIX: Multiboot memory map:":       "Multiboot memory map",
     "VIBIX: EXCEPTION:":                  "Exception handler (future)",
+    # Signal tests (optional -- may hang on boot configs without signal delivery)
+    "Signal Test Begin":                  "Signal test suite start",
+    "  [SIGNAL] caught SIGUSR1":         "Custom SIGUSR1 handler delivery",
+    "  [OK] custom handler test":        "Custom handler survival check",
+    "  [OK] ignore test":                "SIG_IGN test",
+    "Signal Test End":                    "Signal test suite end",
 }
 
 

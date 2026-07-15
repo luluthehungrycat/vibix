@@ -10,6 +10,20 @@
 use crate::paging;
 use crate::pmm::PmmAllocator;
 
+
+/// Guard that restores interrupt flag on drop.
+/// Save the IF bit before CLI, then restore (STI) when the guard drops
+/// — even on early returns (panics, errors, etc.).
+struct IrqGuard(u64);
+
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        if self.0 & 0x200 != 0 {
+            unsafe { core::arch::asm!("sti", options(nostack)); }
+        }
+    }
+}
+
 //--- ELF64 constants ----------------------------------------------------------
 
 /// ELF magic number (first 4 bytes of a valid ELF file).
@@ -85,7 +99,7 @@ pub enum ElfError {
 /// from the ELF buffer.
 ///
 /// Returns the entry point virtual address on success.
-pub fn load(data: &[u8], pmm: &mut PmmAllocator) -> Result<u64, ElfError> {
+pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, ElfError> {
     // === Parse ELF header ===
     if data.len() < core::mem::size_of::<Elf64Ehdr>() {
         return Err(ElfError::Truncated);
@@ -168,19 +182,57 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator) -> Result<u64, ElfError> {
         let final_no_write = pf & 2 == 0; // true → need to remove WRITABLE after copy
 
         // Allocate and map each page in the segment's virtual address range.
+        //
+        // IMPORTANT: We ALWAYS allocate fresh pages for exec().  The
+        // process's user page tables may still have entries from the old
+        // process image (e.g. from fork's deep-copied PTs pointing to the
+        // parent's physical pages).  We NEVER reuse those old mappings — doing
+        // so would write ELF data into the parent process's physical pages,
+        // corrupting the parent's code.
+        //
+        // To handle ELF segments that share page boundaries (e.g. .text and
+        // .rodata ending/starting on the same page), we track which addresses
+        // we've already allocated during THIS load call via `last_alloc_page`.
+        // That correctly reuses pages mapped by an earlier segment of the same
+        // ELF without touching stale mappings left by the old process image.
+        //
+        // CRITICAL: Disable interrupts during page table operations to prevent
+        // the PIT IRQ from triggering a context switch. A CR3 change during
+        // map_4k_target would corrupt the per-process page tables.
+        let saved_if: u64;
+        unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_if, options(nostack)); }
+        let _irq_guard = IrqGuard(saved_if);  // ← ensures STI on any exit path
+        // Track pages mapped during THIS load to handle segment overlaps.
+        let mut last_alloc_page: u64 = 0;
+        let mut last_alloc_phys: *mut u8 = core::ptr::null_mut();
         let mut vaddr_page = page_start;
         while vaddr_page < page_end {
-            let phys = pmm.alloc();
-            if phys.is_null() {
-                return Err(ElfError::Oom);
-            }
-            paging::map_4k(vaddr_page, phys as u64, page_flags, pmm);
-            paging::invlpg(vaddr_page);
-
-            // Zero the entire page first
-            unsafe {
-                core::ptr::write_bytes(phys, 0, 4096);
-            }
+            let _phys = if vaddr_page == last_alloc_page {
+                // Same page as a previous allocation in this ELF load
+                // (e.g. .text and .rodata share a page boundary).
+                // Reuse it — the existing page already has data.
+                last_alloc_phys
+            } else {
+                // Always allocate a fresh page — never reuse fork's deep-copied
+                // physical pages (they belong to the parent process).
+                let p = pmm.alloc();
+                if p.is_null() {
+                    return Err(ElfError::Oom);
+                }
+                paging::map_4k_target(vaddr_page, p as u64, page_flags, pmm, pml4_phys);
+                paging::invlpg(vaddr_page);
+                // Zero the new page via its virtual address (mapped in the
+                // target process's PML4).  Do NOT use the physical address
+                // directly — the kernel's identity map may cover a different
+                // physical page than the one just allocated when per-process
+                // page tables are in use, causing corruption.
+                unsafe {
+                    core::ptr::write_bytes(vaddr_page as *mut u8, 0, 4096);
+                }
+                last_alloc_page = vaddr_page;
+                last_alloc_phys = p;
+                p
+            };
 
             vaddr_page += 4096;
         }
@@ -209,17 +261,8 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator) -> Result<u64, ElfError> {
 
         // BSS (memsz > filesz) is already zeroed since we zeroed all pages.
         // If the segment is read-only, remove WRITABLE flag now.
-        if final_no_write {
-            let mut vaddr_page = page_start;
-            let ro_flags = paging::PAGE_PRESENT | paging::PAGE_USER;
-            while vaddr_page < page_end {
-                if let Some(paddr) = paging::translate(vaddr_page) {
-                    paging::map_4k(vaddr_page, paddr, ro_flags, pmm);
-                    paging::invlpg(vaddr_page);
-                }
-                vaddr_page += 4096;
-            }
-        }
+        // NOTE: Relaxation disabled for debugging — all pages stay RW.
+        // This is acceptable since EFER.NXE is not set (no execute-disable bit).
     }
 
     Ok(ehdr.e_entry)

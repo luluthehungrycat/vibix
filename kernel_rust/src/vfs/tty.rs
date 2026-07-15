@@ -125,6 +125,14 @@ impl Tty {
         if self.echo {
             serial_write(b"^C\r\n");
         }
+        // Deliver SIGINT to the current process
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            let proc = crate::process::process_mut(pid);
+            proc.sig_pending |= 1 << crate::signal::SIGINT;
+        }
+        // Push a newline so tty.read() returns instead of blocking the process
+        self.push_byte(b'\n');
     }
 
     fn handle_enter(&mut self) {
