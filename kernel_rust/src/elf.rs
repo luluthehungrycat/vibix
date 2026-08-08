@@ -51,33 +51,33 @@ const EM_X86_64: u16 = 0x3E;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64Ehdr {
-    e_ident: [u8; 16],   // ELF identification
-    e_type: u16,          // Object file type
-    e_machine: u16,       // Architecture
-    e_version: u32,       // Object file version
-    e_entry: u64,         // Entry point virtual address
-    e_phoff: u64,         // Program header offset
-    e_shoff: u64,         // Section header offset
-    e_flags: u32,         // Processor-specific flags
-    e_ehsize: u16,        // ELF header size
-    e_phentsize: u16,     // Size of program header entry
-    e_phnum: u16,         // Number of program header entries
-    e_shentsize: u16,     // Size of section header entry
-    e_shnum: u16,         // Number of section header entries
-    e_shstrndx: u16,      // Section header string table index
+    e_ident: [u8; 16], // ELF identification
+    e_type: u16,       // Object file type
+    e_machine: u16,    // Architecture
+    e_version: u32,    // Object file version
+    e_entry: u64,      // Entry point virtual address
+    e_phoff: u64,      // Program header offset
+    e_shoff: u64,      // Section header offset
+    e_flags: u32,      // Processor-specific flags
+    e_ehsize: u16,     // ELF header size
+    e_phentsize: u16,  // Size of program header entry
+    e_phnum: u16,      // Number of program header entries
+    e_shentsize: u16,  // Size of section header entry
+    e_shnum: u16,      // Number of section header entries
+    e_shstrndx: u16,   // Section header string table index
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Elf64Phdr {
-    p_type: u32,    // Segment type
-    p_flags: u32,   // Segment flags
-    p_offset: u64,  // Segment file offset
-    p_vaddr: u64,   // Segment virtual address
-    p_paddr: u64,   // Segment physical address
-    p_filesz: u64,  // Segment size in file
-    p_memsz: u64,   // Segment size in memory
-    p_align: u64,   // Segment alignment
+    p_type: u32,   // Segment type
+    p_flags: u32,  // Segment flags
+    p_offset: u64, // Segment file offset
+    p_vaddr: u64,  // Segment virtual address
+    p_paddr: u64,  // Segment physical address
+    p_filesz: u64, // Segment size in file
+    p_memsz: u64,  // Segment size in memory
+    p_align: u64,  // Segment alignment
 }
 
 //--- Loader -------------------------------------------------------------------
@@ -92,6 +92,7 @@ pub enum ElfError {
     BadType,
     Truncated,
     Oom,
+    MetadataOom,
 }
 
 /// Provenance for a page allocated by one ELF load operation.
@@ -101,9 +102,211 @@ struct LoadedPage {
     paddr: u64,
 }
 
-// ELF images in this kernel are small and statically loaded. Keeping this
-// bounded avoids introducing allocator or hash-map behavior into exec().
-const MAX_LOADED_PAGES: usize = 256;
+const PROVENANCE_CHUNK_CAP: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LoadedPageChunk {
+    next: *mut LoadedPageChunk,
+    used: usize,
+    pages: [LoadedPage; PROVENANCE_CHUNK_CAP],
+}
+
+// Metadata is kept in a kernel-owned static arena rather than the general
+// heap.  The loader runs while changing CR3 and its cleanup must not depend on
+// kmm free-list state.  This supports 4096 tracked pages per load and returns
+// every chunk to the arena on success or failure.
+const PROVENANCE_CHUNK_COUNT: usize = 64;
+static mut PROVENANCE_POOL: [LoadedPageChunk; PROVENANCE_CHUNK_COUNT] = [LoadedPageChunk {
+    next: core::ptr::null_mut(),
+    used: 0,
+    pages: [LoadedPage { vaddr: 0, paddr: 0 }; PROVENANCE_CHUNK_CAP],
+}; PROVENANCE_CHUNK_COUNT];
+static mut PROVENANCE_FREE_MASK: u64 = u64::MAX;
+
+struct LoadedPages {
+    head: *mut LoadedPageChunk,
+    tail: *mut LoadedPageChunk,
+    len: usize,
+}
+
+impl LoadedPages {
+    const fn new() -> Self {
+        Self {
+            head: core::ptr::null_mut(),
+            tail: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    /// Reserve a slot before allocating or mapping its physical page.
+    fn reserve(&mut self) -> Result<*mut LoadedPage, ElfError> {
+        unsafe {
+            if self.tail.is_null() || (*self.tail).used == PROVENANCE_CHUNK_CAP {
+                let free_mask = PROVENANCE_FREE_MASK;
+                if free_mask == 0 {
+                    return Err(ElfError::MetadataOom);
+                }
+                let index = free_mask.trailing_zeros() as usize;
+                PROVENANCE_FREE_MASK &= !(1u64 << index);
+                let chunk = core::ptr::addr_of_mut!(PROVENANCE_POOL[index]);
+                (*chunk).next = core::ptr::null_mut();
+                (*chunk).used = 0;
+                if self.tail.is_null() {
+                    self.head = chunk;
+                } else {
+                    (*self.tail).next = chunk;
+                }
+                self.tail = chunk;
+            }
+            let slot = &mut (*self.tail).pages[(*self.tail).used] as *mut LoadedPage;
+            (*self.tail).used += 1;
+            self.len += 1;
+            Ok(slot)
+        }
+    }
+
+    fn cancel_reservation(&mut self) {
+        unsafe {
+            if !self.tail.is_null() && (*self.tail).used > 0 {
+                (*self.tail).used -= 1;
+                self.len -= 1;
+            }
+        }
+    }
+
+    fn find(&self, vaddr: u64) -> Option<u64> {
+        unsafe {
+            let mut chunk = self.head;
+            while !chunk.is_null() {
+                for page in &(&(*chunk).pages)[..(*chunk).used] {
+                    if page.vaddr == vaddr {
+                        return Some(page.paddr);
+                    }
+                }
+                chunk = (*chunk).next;
+            }
+        }
+        None
+    }
+
+    unsafe fn rollback(&mut self, pmm: &mut PmmAllocator, pml4_phys: u64) {
+        let saved_cr3 = paging::read_cr3();
+        if saved_cr3 != pml4_phys {
+            unsafe {
+                paging::write_cr3(pml4_phys);
+            }
+        }
+        let mut chunk = self.head;
+        while !chunk.is_null() {
+            for page in &(&(*chunk).pages)[..(*chunk).used] {
+                if let Some(entry) = paging::unmap(page.vaddr) {
+                    pmm.free((entry & 0x000F_FFFF_FFFF_F000u64) as *mut u8);
+                }
+            }
+            chunk = (*chunk).next;
+        }
+        if saved_cr3 != pml4_phys {
+            unsafe {
+                paging::write_cr3(saved_cr3);
+            }
+        }
+    }
+
+    unsafe fn release_metadata(&mut self) {
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(serial, "DBG ELF META: release pages={}\n", self.len);
+        }
+        let pool_start = core::ptr::addr_of_mut!(PROVENANCE_POOL) as usize;
+        let chunk_size = core::mem::size_of::<LoadedPageChunk>();
+        let mut chunk = self.head;
+        while !chunk.is_null() {
+            let next = (*chunk).next;
+            let offset = chunk as usize - pool_start;
+            if offset % chunk_size == 0 {
+                let index = offset / chunk_size;
+                if index < PROVENANCE_CHUNK_COUNT {
+                    PROVENANCE_FREE_MASK |= 1u64 << index;
+                    (*chunk).next = core::ptr::null_mut();
+                    (*chunk).used = 0;
+                }
+            }
+            chunk = next;
+        }
+        self.head = core::ptr::null_mut();
+        self.tail = core::ptr::null_mut();
+        self.len = 0;
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(serial, "DBG ELF META: release complete\n");
+        }
+    }
+}
+
+impl Drop for LoadedPages {
+    fn drop(&mut self) {
+        unsafe {
+            self.release_metadata();
+        }
+    }
+}
+
+/// DEBUG-only lower-level regression for the provenance arena.  This avoids
+/// depending on VIBIT shell timing while exercising the >256-page capacity and
+/// reclamation contract used by the ELF loader.
+pub fn test_provenance_arena(serial: &mut crate::serial::SerialPort) {
+    let mut ok = true;
+    {
+        let mut pages = LoadedPages::new();
+        for index in 0..257u64 {
+            match pages.reserve() {
+                Ok(slot) => unsafe {
+                    (*slot).vaddr = 0x0200_0000 + index * 0x1000;
+                    (*slot).paddr = 0x0040_0000 + index * 0x1000;
+                },
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        ok &= pages.len == 257;
+        ok &= pages.find(0x0200_0000) == Some(0x0040_0000);
+        ok &= pages.find(0x0200_0000 + 256 * 0x1000) == Some(0x0040_0000 + 256 * 0x1000);
+    }
+    {
+        let mut pages = LoadedPages::new();
+        for _ in 0..257 {
+            if pages.reserve().is_err() {
+                ok = false;
+                break;
+            }
+        }
+        ok &= pages.len == 257;
+    }
+    if ok {
+        serial.writestrs(["ELF: provenance arena >256 pages and cleanup OK.\\n"].as_slice());
+    } else {
+        serial.writestrs(["ELF: provenance arena regression FAILED.\\n"].as_slice());
+    }
+}
+
+fn rollback_error(
+    error: ElfError,
+    pages: &mut LoadedPages,
+    pmm: &mut PmmAllocator,
+    pml4_phys: u64,
+) -> Result<u64, ElfError> {
+    unsafe {
+        pages.rollback(pmm, pml4_phys);
+    }
+    Err(error)
+}
 
 /// Load an ELF64 executable into memory.
 ///
@@ -147,7 +350,17 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
     let phnum = ehdr.e_phnum as usize;
 
     // Sanity check: program headers must be within the data slice
-    if phoff.saturating_add(phnum.saturating_mul(phentsize)) > data.len() {
+    let ph_table_size = match phnum.checked_mul(phentsize) {
+        Some(size) => size,
+        None => return Err(ElfError::Truncated),
+    };
+    if phentsize < core::mem::size_of::<Elf64Phdr>() {
+        return Err(ElfError::Truncated);
+    }
+    if phoff
+        .checked_add(ph_table_size)
+        .map_or(true, |end| end > data.len())
+    {
         return Err(ElfError::Truncated);
     }
 
@@ -176,19 +389,27 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
 
     // This tracker is local to one load call. Existing mappings from fork or
     // the old image are never treated as loader-owned provenance.
-    let mut loaded_pages: [Option<LoadedPage>; MAX_LOADED_PAGES] = [None; MAX_LOADED_PAGES];
-    let mut loaded_page_count = 0usize;
+    let mut loaded_pages = LoadedPages::new();
 
     for i in 0..phnum {
-        let phdr_offset = phoff + i * phentsize;
-        if phdr_offset + core::mem::size_of::<Elf64Phdr>() > data.len() {
-            return Err(ElfError::Truncated);
+        let phdr_offset = match phoff.checked_add(match i.checked_mul(phentsize) {
+            Some(offset) => offset,
+            None => return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys),
+        }) {
+            Some(offset) => offset,
+            None => return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys),
+        };
+        if phdr_offset
+            .checked_add(core::mem::size_of::<Elf64Phdr>())
+            .map_or(true, |end| end > data.len())
+        {
+            return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys);
         }
 
         let phdr: &Elf64Phdr = unsafe { &*(data.as_ptr().add(phdr_offset) as *const Elf64Phdr) };
 
         if phdr.p_type != PT_LOAD {
-            continue;  // Skip non-loadable segments
+            continue; // Skip non-loadable segments
         }
 
         let vaddr = phdr.p_vaddr;
@@ -200,11 +421,17 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
         // contain the segment, then zero-fill BSS and copy data.
 
         let seg_start = vaddr;
-        let seg_end = vaddr + memsz as u64;
+        let seg_end = match vaddr.checked_add(memsz as u64) {
+            Some(end) => end,
+            None => return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys),
+        };
 
         // Round start down to page boundary, end up to page boundary
         let page_start = seg_start & !0xFFF;
-        let page_end = (seg_end + 0xFFF) & !0xFFF;
+        let page_end = match seg_end.checked_add(0xFFF) {
+            Some(end) => end & !0xFFF,
+            None => return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys),
+        };
 
         // Map every segment page RW while loading. Permission relaxation is not
         // enabled yet, and NX cannot be used until EFER.NXE is enabled.
@@ -224,15 +451,7 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
         let _irq_guard = IrqGuard(saved_if); // restores STI on exit
         let mut vaddr_page = page_start;
         while vaddr_page < page_end {
-            let mut tracked = None;
-            for slot in loaded_pages.iter() {
-                if let Some(page) = slot {
-                    if page.vaddr == vaddr_page {
-                        tracked = Some(page.paddr);
-                        break;
-                    }
-                }
-            }
+            let tracked = loaded_pages.find(vaddr_page);
 
             if let Some(paddr) = tracked {
                 if cfg!(feature = "debug") {
@@ -245,16 +464,22 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
                     paging::debug_dump_entry_evidence("elf PT_LOAD reuse", vaddr_page, pml4_phys);
                 }
             } else {
-                if loaded_page_count == MAX_LOADED_PAGES {
-                    return Err(ElfError::Oom);
-                }
+                let slot = match loaded_pages.reserve() {
+                    Ok(slot) => slot,
+                    Err(error) => return rollback_error(error, &mut loaded_pages, pmm, pml4_phys),
+                };
                 let p = pmm.alloc();
                 if p.is_null() {
-                    return Err(ElfError::Oom);
+                    loaded_pages.cancel_reservation();
+                    return rollback_error(ElfError::Oom, &mut loaded_pages, pmm, pml4_phys);
                 }
                 let paddr = p as u64;
                 paging::map_4k_target(vaddr_page, paddr, page_flags, pmm, pml4_phys);
                 paging::invlpg(vaddr_page);
+                unsafe {
+                    (*slot).vaddr = vaddr_page;
+                    (*slot).paddr = paddr;
+                }
                 paging::debug_dump_map_site(
                     "elf PT_LOAD map",
                     vaddr_page,
@@ -268,11 +493,6 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
                     core::ptr::write_bytes(vaddr_page as *mut u8, 0, 4096);
                 }
                 paging::debug_dump_entry_evidence("elf page zero", vaddr_page, pml4_phys);
-                loaded_pages[loaded_page_count] = Some(LoadedPage {
-                    vaddr: vaddr_page,
-                    paddr,
-                });
-                loaded_page_count += 1;
                 if cfg!(feature = "debug") {
                     let mut serial = crate::serial::SerialPort::new();
                     serial.init();
@@ -282,17 +502,28 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
                 }
             }
 
-            vaddr_page += 4096;
+            vaddr_page = match vaddr_page.checked_add(4096) {
+                Some(next) => next,
+                None => {
+                    return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys)
+                }
+            };
         }
 
         // Copy data from file (the portion that has file backing)
         let src_offset = phdr.p_offset as usize;
         if filesz > 0 {
             // Check bounds
-            if src_offset + filesz > data.len() {
-                return Err(ElfError::Truncated);
+            let src_end = match src_offset.checked_add(filesz) {
+                Some(end) => end,
+                None => {
+                    return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys)
+                }
+            };
+            if src_end > data.len() {
+                return rollback_error(ElfError::Truncated, &mut loaded_pages, pmm, pml4_phys);
             }
-            let src = &data[src_offset..src_offset + filesz];
+            let src = &data[src_offset..src_end];
 
             let copy_len = filesz.min(memsz);
             if cfg!(feature = "debug") {
@@ -311,7 +542,7 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr(),
-                    (seg_start) as *mut u8,  // vaddr after map_4k is accessible
+                    (seg_start) as *mut u8, // vaddr after map_4k is accessible
                     copy_len,
                 );
             }
@@ -333,5 +564,6 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
     if cfg!(feature = "debug") {
         paging::debug_dump_walk("after elf::load", 0x2000000, pml4_phys);
     }
-    Ok(ehdr.e_entry)
+    let entry = ehdr.e_entry;
+    Ok(entry)
 }
