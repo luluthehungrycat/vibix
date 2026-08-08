@@ -3,6 +3,7 @@
 import subprocess
 import sys
 import os
+import re
 import tempfile
 import selectors
 import time
@@ -193,7 +194,6 @@ def test_vibit():
     return all_ok and integration_ok
 
 
-
 def test_vibit_integration():
     """Exercise vish input and VIBIT shell respawn with bounded serial I/O."""
     print("🧪 Testing bounded VIBIT/vish shell handoff...")
@@ -295,3 +295,128 @@ def test_vibit_integration():
 
 if __name__ == "__main__":
     sys.exit(0 if test_kernel_alive() else 1)
+
+
+def test_vibit_rust():
+    """Run the Rust ELF probe and require global IRQ observations.
+
+    The probe is intentionally not a success test when the kernel faults before
+    the ELF entry point.  In that case it reports the blocked evidence gate and
+    returns failure rather than claiming a GPF regression passed.
+    """
+    print("🧪 Testing VIBIT with Rust ELF (multi-segment)...")
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".serial", delete=False) as f:
+        serial_path = f.name
+
+    accel = "kvm"
+    try:
+        with open("/dev/kvm", "rb"):
+            pass
+    except (FileNotFoundError, PermissionError, OSError):
+        accel = "tcg"
+
+    try:
+        required = {
+            "VIBIT v0.2.0: PID 1 init": "VIBIT banner",
+            "VIBIT: init task complete": "Init task",
+            "VIBIT: spawning shell": "Shell spawn (fork)",
+            "VIBIT: reaper loop": "Reaper loop (waitpid)",
+        }
+
+        # DEBUG serial traffic can leave an otherwise usable KVM probe before
+        # VIBIT reaches exec. Retry under TCG so the diagnostic target remains
+        # bounded and deterministic when KVM is present but unsuitable.
+        probe_accels = [accel] if accel == "tcg" else [accel, "tcg"]
+        serial_output = ""
+        for probe_accel in probe_accels:
+            # Each accelerator attempt gets an independent serial transcript.
+            open(serial_path, "w").close()
+            try:
+                subprocess.run(
+                    [QEMU, "-accel", probe_accel, "-kernel", "vibix.elf",
+                     "-serial", f"file:{serial_path}", "-display", "none",
+                     "-m", "512M", "-no-reboot", "-no-shutdown"],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # The successful probe intentionally loops.
+            with open(serial_path, "r") as f:
+                serial_output = f.read()
+            if ((all(marker in serial_output for marker in required)
+                    and ("OK\n" in serial_output or "OK\r\n" in serial_output))
+                    or "VIBIX: EXCEPTION:" in serial_output):
+                break
+
+        all_ok = True
+        for marker, label in required.items():
+            if marker in serial_output:
+                print(f"  ✅ {label}")
+            else:
+                print(f"  ❌ {label} (missing: {marker!r})")
+                all_ok = False
+
+        evidence_lines = [
+            line for line in serial_output.splitlines()
+            if line.startswith("DBG EXEC:")
+            or line.startswith("DBG ELF:")
+            or line.startswith("DBG ELF COPY:")
+            or line.startswith("DBG ELF WALK:")
+            or line.startswith("VIBIX: PF_CLASS:")
+        ]
+        if evidence_lines:
+            print("  DEBUG evidence capture:")
+            for line in evidence_lines:
+                print(f"    {line}")
+        else:
+            print("  DEBUG evidence capture: no loader/page-walk lines observed")
+
+        entry_ran = "OK\n" in serial_output or "OK\r\n" in serial_output
+        if entry_ran:
+            print("  ✅ Rust ELF entry output (OK; second PT_LOAD bytes survived)")
+        else:
+            print("  ❌ Rust ELF entry output missing")
+            all_ok = False
+
+        new_pages = {int(v, 16): int(p, 16) for v, p in re.findall(
+            r"DBG ELF TRACK: new vaddr=0x([0-9a-fA-F]+) paddr=0x([0-9a-fA-F]+)",
+            serial_output,
+        )}
+        reused_pages = {int(v, 16): int(p, 16) for v, p in re.findall(
+            r"DBG ELF REUSE: vaddr=0x([0-9a-fA-F]+) paddr=0x([0-9a-fA-F]+)",
+            serial_output,
+        )}
+        entry_page = 0x2000000
+        if new_pages.get(entry_page) and reused_pages.get(entry_page) == new_pages[entry_page]:
+            print(f"  ✅ Entry page provenance preserved (frame 0x{new_pages[entry_page]:x})")
+        else:
+            print("  ❌ Entry page provenance evidence missing or frame changed")
+            all_ok = False
+
+        exception = "VIBIX: EXCEPTION:" in serial_output
+        entry_page_fault = bool(
+            re.search(r"VIBIX: EXCEPTION:\s+Page Fault \(#14\)", serial_output)
+            and re.search(r"VIBIX:\s+RIP:\s+0x0000000002000000", serial_output)
+            and re.search(r"VIBIX:\s+CR2:\s+0x0000000002000000", serial_output)
+        )
+        if exception:
+            print("  ❌ Exception detected before scheduling evidence")
+            if entry_page_fault:
+                print("  BLOCKED: Page Fault (#14) with RIP=CR2=0x2000000")
+            else:
+                print("  BLOCKED: Exception did not match the Rust entry page-fault signature")
+        else:
+            print("  ✅ No exception detected")
+
+        global_irq_observations = serial_output.count("IRQ frame:")
+        if global_irq_observations >= 3:
+            print(f"  ◇ Global IRQ observation threshold met (IRQ frames: {global_irq_observations})")
+        else:
+            print(f"  ❌ Global IRQ observation threshold not met (IRQ frames: {global_irq_observations}, need 3)")
+            all_ok = False
+        print("  · Rust-process scheduling round trips are not claimed: IRQ lines have no PID/range correlation")
+
+        return all_ok and not exception
+    finally:
+        if os.path.exists(serial_path):
+            os.unlink(serial_path)

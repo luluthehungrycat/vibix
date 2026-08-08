@@ -9,7 +9,7 @@
 
 use crate::paging;
 use crate::pmm::PmmAllocator;
-
+use core::fmt::Write;
 
 /// Guard that restores interrupt flag on drop.
 /// Save the IF bit before CLI, then restore (STI) when the guard drops
@@ -19,7 +19,9 @@ struct IrqGuard(u64);
 impl Drop for IrqGuard {
     fn drop(&mut self) {
         if self.0 & 0x200 != 0 {
-            unsafe { core::arch::asm!("sti", options(nostack)); }
+            unsafe {
+                core::arch::asm!("sti", options(nostack));
+            }
         }
     }
 }
@@ -92,6 +94,17 @@ pub enum ElfError {
     Oom,
 }
 
+/// Provenance for a page allocated by one ELF load operation.
+#[derive(Clone, Copy)]
+struct LoadedPage {
+    vaddr: u64,
+    paddr: u64,
+}
+
+// ELF images in this kernel are small and statically loaded. Keeping this
+// bounded avoids introducing allocator or hash-map behavior into exec().
+const MAX_LOADED_PAGES: usize = 256;
+
 /// Load an ELF64 executable into memory.
 ///
 /// Scans program headers for PT_LOAD segments, allocates physical pages,
@@ -138,6 +151,34 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
         return Err(ElfError::Truncated);
     }
 
+    if cfg!(feature = "debug") {
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial,
+            "DBG ELF: entry=0x{:016x} phoff=0x{:016x} phentsize={} phnum={} target=0x0000000002000000\n",
+            ehdr.e_entry, ehdr.e_phoff, ehdr.e_phentsize, ehdr.e_phnum);
+        for i in 0..phnum {
+            let phdr_offset = phoff + i * phentsize;
+            let phdr: &Elf64Phdr =
+                unsafe { &*(data.as_ptr().add(phdr_offset) as *const Elf64Phdr) };
+            if phdr.p_type == PT_LOAD {
+                let seg_end = phdr.p_vaddr.saturating_add(phdr.p_memsz);
+                let covers_entry = phdr.p_vaddr <= 0x2000000 && 0x2000000 < seg_end;
+                let rounded_start = phdr.p_vaddr & !0xFFF;
+                let rounded_end = seg_end.saturating_add(0xFFF) & !0xFFF;
+                let _ = write!(serial,
+                    "DBG ELF: PT_LOAD[{}] vaddr=0x{:016x} end=0x{:016x} pages=[0x{:016x},0x{:016x}) off=0x{:016x} filesz=0x{:x} memsz=0x{:x} flags=0x{:x}{}\n",
+                    i, phdr.p_vaddr, seg_end, rounded_start, rounded_end, phdr.p_offset, phdr.p_filesz, phdr.p_memsz,
+                    phdr.p_flags, if covers_entry { " COVER_ENTRY" } else { "" });
+            }
+        }
+    }
+
+    // This tracker is local to one load call. Existing mappings from fork or
+    // the old image are never treated as loader-owned provenance.
+    let mut loaded_pages: [Option<LoadedPage>; MAX_LOADED_PAGES] = [None; MAX_LOADED_PAGES];
+    let mut loaded_page_count = 0usize;
+
     for i in 0..phnum {
         let phdr_offset = phoff + i * phentsize;
         if phdr_offset + core::mem::size_of::<Elf64Phdr>() > data.len() {
@@ -165,74 +206,81 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
         let page_start = seg_start & !0xFFF;
         let page_end = (seg_end + 0xFFF) & !0xFFF;
 
-        // Determine final page flags from p_flags:
-        //   PF_R (4)  → PAGE_PRESENT
-        //   PF_W (2)  → PAGE_WRITABLE
-        //   PF_X (1)  → (reserved for future NX support — EFER.NXE not enabled yet)
-        let pf = phdr.p_flags;
-        // Map all pages RW initially so the loader can write segment data.
-        // NOTE: NO_EXEC (NX bit) is deliberately omitted — EFER.NXE is not
-        // enabled in the current kernel, and setting bit 63 in a page table
-        // entry causes a reserved-bit Page Fault (#PF with ERR bit 3).
-        let mut page_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-        if pf & 2 == 0 {
-            // Read-only segments: map RW for the loader, then relax below.
-            page_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
-        }
-        let final_no_write = pf & 2 == 0; // true → need to remove WRITABLE after copy
+        // Map every segment page RW while loading. Permission relaxation is not
+        // enabled yet, and NX cannot be used until EFER.NXE is enabled.
+        let page_flags = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITABLE;
 
-        // Allocate and map each page in the segment's virtual address range.
-        //
-        // IMPORTANT: We ALWAYS allocate fresh pages for exec().  The
-        // process's user page tables may still have entries from the old
-        // process image (e.g. from fork's deep-copied PTs pointing to the
-        // parent's physical pages).  We NEVER reuse those old mappings — doing
-        // so would write ELF data into the parent process's physical pages,
-        // corrupting the parent's code.
-        //
-        // To handle ELF segments that share page boundaries (e.g. .text and
-        // .rodata ending/starting on the same page), we track which addresses
-        // we've already allocated during THIS load call via `last_alloc_page`.
-        // That correctly reuses pages mapped by an earlier segment of the same
-        // ELF without touching stale mappings left by the old process image.
+        // Allocate and map each segment page RW while loading. A page is
+        // allocated, mapped, and zeroed exactly once per load call. Later
+        // PT_LOAD segments reuse only pages recorded in loaded_pages.
         //
         // CRITICAL: Disable interrupts during page table operations to prevent
         // the PIT IRQ from triggering a context switch. A CR3 change during
         // map_4k_target would corrupt the per-process page tables.
         let saved_if: u64;
-        unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_if, options(nostack)); }
-        let _irq_guard = IrqGuard(saved_if);  // ← ensures STI on any exit path
-        // Track pages mapped during THIS load to handle segment overlaps.
-        let mut last_alloc_page: u64 = 0;
-        let mut last_alloc_phys: *mut u8 = core::ptr::null_mut();
+        unsafe {
+            core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_if, options(nostack));
+        }
+        let _irq_guard = IrqGuard(saved_if); // restores STI on exit
         let mut vaddr_page = page_start;
         while vaddr_page < page_end {
-            let _phys = if vaddr_page == last_alloc_page {
-                // Same page as a previous allocation in this ELF load
-                // (e.g. .text and .rodata share a page boundary).
-                // Reuse it — the existing page already has data.
-                last_alloc_phys
+            let mut tracked = None;
+            for slot in loaded_pages.iter() {
+                if let Some(page) = slot {
+                    if page.vaddr == vaddr_page {
+                        tracked = Some(page.paddr);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(paddr) = tracked {
+                if cfg!(feature = "debug") {
+                    let mut serial = crate::serial::SerialPort::new();
+                    serial.init();
+                    let _ =
+                        write!(serial,
+                        "DBG ELF REUSE: vaddr=0x{:016x} paddr=0x{:016x} target_pml4=0x{:016x}\n",
+                        vaddr_page, paddr, pml4_phys);
+                    paging::debug_dump_entry_evidence("elf PT_LOAD reuse", vaddr_page, pml4_phys);
+                }
             } else {
-                // Always allocate a fresh page — never reuse fork's deep-copied
-                // physical pages (they belong to the parent process).
+                if loaded_page_count == MAX_LOADED_PAGES {
+                    return Err(ElfError::Oom);
+                }
                 let p = pmm.alloc();
                 if p.is_null() {
                     return Err(ElfError::Oom);
                 }
-                paging::map_4k_target(vaddr_page, p as u64, page_flags, pmm, pml4_phys);
+                let paddr = p as u64;
+                paging::map_4k_target(vaddr_page, paddr, page_flags, pmm, pml4_phys);
                 paging::invlpg(vaddr_page);
-                // Zero the new page via its virtual address (mapped in the
-                // target process's PML4).  Do NOT use the physical address
-                // directly — the kernel's identity map may cover a different
-                // physical page than the one just allocated when per-process
-                // page tables are in use, causing corruption.
+                paging::debug_dump_map_site(
+                    "elf PT_LOAD map",
+                    vaddr_page,
+                    paddr,
+                    page_flags,
+                    pml4_phys,
+                );
+                // Zero through the target virtual mapping, never through an
+                // assumed physical alias.
                 unsafe {
                     core::ptr::write_bytes(vaddr_page as *mut u8, 0, 4096);
                 }
-                last_alloc_page = vaddr_page;
-                last_alloc_phys = p;
-                p
-            };
+                paging::debug_dump_entry_evidence("elf page zero", vaddr_page, pml4_phys);
+                loaded_pages[loaded_page_count] = Some(LoadedPage {
+                    vaddr: vaddr_page,
+                    paddr,
+                });
+                loaded_page_count += 1;
+                if cfg!(feature = "debug") {
+                    let mut serial = crate::serial::SerialPort::new();
+                    serial.init();
+                    let _ = write!(serial,
+                        "DBG ELF TRACK: new vaddr=0x{:016x} paddr=0x{:016x} target_pml4=0x{:016x}\n",
+                        vaddr_page, paddr, pml4_phys);
+                }
+            }
 
             vaddr_page += 4096;
         }
@@ -246,10 +294,20 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
             }
             let src = &data[src_offset..src_offset + filesz];
 
+            let copy_len = filesz.min(memsz);
+            if cfg!(feature = "debug") {
+                let mut serial = crate::serial::SerialPort::new();
+                serial.init();
+                let _ = write!(serial, "DBG ELF COPY BEFORE: active_cr3=0x{:016x} target_pml4=0x{:016x} dst=0x{:016x} src_off=0x{:x} len=0x{:x} src=", paging::read_cr3(), pml4_phys, seg_start, src_offset, copy_len);
+                for i in 0..core::cmp::min(copy_len, 16) {
+                    let _ = write!(serial, "{:02x}", src[i]);
+                }
+                serial.writestrs(&["\n"]);
+            }
+
             // Copy segment data into mapped pages.
             // Since segments may not be page-aligned, calculate the offset
             // within the first page.
-            let copy_len = filesz.min(memsz);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr(),
@@ -257,6 +315,13 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
                     copy_len,
                 );
             }
+            if cfg!(feature = "debug") {
+                paging::debug_dump_entry_evidence("elf copy after", seg_start, pml4_phys);
+            }
+        }
+
+        if cfg!(feature = "debug") {
+            paging::debug_dump_entry_evidence("after PT_LOAD", 0x2000000, pml4_phys);
         }
 
         // BSS (memsz > filesz) is already zeroed since we zeroed all pages.
@@ -265,5 +330,8 @@ pub fn load(data: &[u8], pmm: &mut PmmAllocator, pml4_phys: u64) -> Result<u64, 
         // This is acceptable since EFER.NXE is not set (no execute-disable bit).
     }
 
+    if cfg!(feature = "debug") {
+        paging::debug_dump_walk("after elf::load", 0x2000000, pml4_phys);
+    }
     Ok(ehdr.e_entry)
 }

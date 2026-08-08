@@ -101,3 +101,20 @@ clean:
 	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o kernel/context_switch.o
 	$(MAKE) -C userspace clean
 	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true
+
+test_vibit_rust: clean
+	# Build the kernel Rust library with DEBUG=1 so the loader diagnostics are present.
+	$(MAKE) DEBUG=1 INIT=vibit
+	# Replace /bin/vish with Rust ELF to test multi-segment ELF scheduling
+	rm -rf /tmp/vibix-initramfs
+	mkdir -p /tmp/vibix-initramfs/sbin /tmp/vibix-initramfs/bin
+	tar xf $(CURDIR)/userspace/initramfs.tar -C /tmp/vibix-initramfs
+	cp $(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix /tmp/vibix-initramfs/bin/vish
+	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/userspace/initramfs.tar sbin/init bin/*
+	rm -rf /tmp/vibix-initramfs
+	# Force only the DEBUG assembly objects; do not rebuild userspace after
+	# replacing /bin/vish with the Rust ELF above.
+	rm -f kernel64_entry.o interrupts.o syscall_entry.o context_switch.o
+	$(MAKE) DEBUG=1 kernel64_entry.o interrupts.o syscall_entry.o context_switch.o
+	$(MAKE) DEBUG=1 kernel64.elf kernel64.bin boot.o vibix.elf
+	python3 anti_cheat.py && python3 -c "from test_kernel import test_vibit_rust; import sys; sys.exit(0 if test_vibit_rust() else 1)"

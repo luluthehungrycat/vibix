@@ -44,7 +44,9 @@ pub type PageTable = [u64; 512];
 /// Read CR3 (physical address of current PML4), with lower 12 bits masked off.
 pub fn read_cr3() -> u64 {
     let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3); }
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3);
+    }
     cr3 & ADDR_MASK
 }
 
@@ -58,7 +60,9 @@ pub unsafe fn write_cr3(cr3: u64) {
 
 /// Invalidate the TLB entry for a single virtual address.
 pub fn invlpg(vaddr: u64) {
-    unsafe { core::arch::asm!("invlpg [{v}]", v = in(reg) vaddr, options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("invlpg [{v}]", v = in(reg) vaddr, options(nostack, preserves_flags));
+    }
 }
 
 //==============================================================================
@@ -77,10 +81,14 @@ pub fn get_or_create_table<'e>(entry: &'e mut u64, pmm: &mut PmmAllocator) -> &'
     let page = pmm.alloc();
     if page.is_null() {
         // Out of physical memory — halt.
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
     let table = unsafe { &mut *(page as *mut PageTable) };
-    for slot in table.iter_mut() { *slot = 0; }
+    for slot in table.iter_mut() {
+        *slot = 0;
+    }
     // Include USER in intermediate entries so user-mode (ring 3) page walks
     // succeed for pages mapped with PAGE_USER.  Kernel-only leaf entries
     // remain protected because they lack the USER bit.
@@ -117,10 +125,14 @@ pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
     // 1. Allocate and zero new PML4 page
     let new_l4_phys = pmm.alloc();
     if new_l4_phys.is_null() {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
     let new_l4 = unsafe { &mut *(new_l4_phys as *mut PageTable) };
-    for slot in new_l4.iter_mut() { *slot = 0; }
+    for slot in new_l4.iter_mut() {
+        *slot = 0;
+    }
 
     // 2. Copy PML4 entries from active table.
     //    PML4[0] is special (kernel + user identity map) — needs per-process PDPT.
@@ -138,15 +150,21 @@ pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
         // Allocate new PDPT
         let new_pdpt_phys = pmm.alloc();
         if new_pdpt_phys.is_null() {
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
         let new_pdpt = unsafe { &mut *(new_pdpt_phys as *mut PageTable) };
-        for slot in new_pdpt.iter_mut() { *slot = 0; }
+        for slot in new_pdpt.iter_mut() {
+            *slot = 0;
+        }
 
         // For each PDPT entry that is present
         for pdpt_idx in 0..512 {
             let src_pdpte = src_pdpt[pdpt_idx];
-            if src_pdpte & PAGE_PRESENT == 0 { continue; }
+            if src_pdpte & PAGE_PRESENT == 0 {
+                continue;
+            }
 
             // If it's a 1 GiB huge page, copy directly (rare in kernel identity map)
             if src_pdpte & PAGE_HUGE != 0 {
@@ -166,15 +184,21 @@ pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
 
             let new_pd_phys = pmm.alloc();
             if new_pd_phys.is_null() {
-                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+                loop {
+                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+                }
             }
             let new_pd = unsafe { &mut *(new_pd_phys as *mut PageTable) };
-            for slot in new_pd.iter_mut() { *slot = 0; }
+            for slot in new_pd.iter_mut() {
+                *slot = 0;
+            }
 
             // Copy PD entries, skipping user entries if !copy_user
             for pd_idx in 0..512 {
                 let src_pde = src_pd[pd_idx];
-                if src_pde & PAGE_PRESENT == 0 { continue; }
+                if src_pde & PAGE_PRESENT == 0 {
+                    continue;
+                }
 
                 // Compute virtual address for this PD entry to check if it's user
                 let vaddr = ((pdpt_idx as u64) << 30) | ((pd_idx as u64) << 21);
@@ -193,10 +217,14 @@ pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
                     let src_pt = unsafe { &*(src_pt_phys as *const PageTable) };
                     let new_pt_phys = pmm.alloc();
                     if new_pt_phys.is_null() {
-                        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+                        loop {
+                            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+                        }
                     }
                     let new_pt = unsafe { &mut *(new_pt_phys as *mut PageTable) };
-                    for slot in new_pt.iter_mut() { *slot = 0; }
+                    for slot in new_pt.iter_mut() {
+                        *slot = 0;
+                    }
                     for k in 0..512 {
                         new_pt[k] = src_pt[k];
                     }
@@ -209,18 +237,34 @@ pub fn create_pml4(pmm: &mut PmmAllocator, copy_user: bool) -> u64 {
 
             // Wire the new PD into the new PDPT
             // Strip accessed/dirty from intermediate entry for fresh tables
-            let flags = src_pdpte & (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE | PAGE_GLOBAL | PAGE_NO_EXEC);
-            new_pdpt[pdpt_idx] = (new_pd_phys as u64) | (flags & !(PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE));
+            let flags = src_pdpte
+                & (PAGE_PRESENT
+                    | PAGE_WRITABLE
+                    | PAGE_USER
+                    | PAGE_ACCESSED
+                    | PAGE_DIRTY
+                    | PAGE_HUGE
+                    | PAGE_GLOBAL
+                    | PAGE_NO_EXEC);
+            new_pdpt[pdpt_idx] =
+                (new_pd_phys as u64) | (flags & !(PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE));
         }
 
         // Wire the new PDPT into the new PML4[0]
-        let flags = src_pml4e_0 & (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE | PAGE_GLOBAL | PAGE_NO_EXEC);
+        let flags = src_pml4e_0
+            & (PAGE_PRESENT
+                | PAGE_WRITABLE
+                | PAGE_USER
+                | PAGE_ACCESSED
+                | PAGE_DIRTY
+                | PAGE_HUGE
+                | PAGE_GLOBAL
+                | PAGE_NO_EXEC);
         new_l4[0] = (new_pdpt_phys as u64) | (flags & !(PAGE_ACCESSED | PAGE_DIRTY | PAGE_HUGE));
     }
 
     new_l4_phys as u64
 }
-
 
 //==============================================================================
 // Mapping
@@ -251,9 +295,31 @@ pub fn map_4k(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator) {
         // page-table entries have the USER bit set.  The CPU checks USER
         // at EVERY level of the walk for Ring 3 accesses.
         if is_user {
+            if cfg!(feature = "debug") && l4i == 0 && vaddr == 0x2000000 {
+                use core::fmt::Write;
+                let mut ser = crate::serial::SerialPort::new();
+                ser.init();
+                let _ = write!(
+                    ser,
+                    "DBG map_4k: vaddr={:016x} l4[0]={:016x}",
+                    vaddr,
+                    (*l4)[0]
+                );
+            }
             (*l4)[l4i] |= PAGE_USER;
             (*l3_ptr)[l3i] |= PAGE_USER;
             (*l2_ptr)[l2i] |= PAGE_USER;
+            if cfg!(feature = "debug") && l4i == 0 && vaddr == 0x2000000 {
+                use core::fmt::Write;
+                let mut ser = crate::serial::SerialPort::new();
+                ser.init();
+                let _ = write!(
+                    ser,
+                    " -> {:016x}
+",
+                    (*l4)[0]
+                );
+            }
         }
     }
 }
@@ -265,18 +331,27 @@ pub fn map_4k(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator) {
 /// original CR3.
 ///
 /// Both `vaddr` and `paddr` must be 4 KiB aligned.
-pub fn map_4k_target(vaddr: u64, paddr: u64, flags: u64, pmm: &mut PmmAllocator, target_pml4_phys: u64) {
+pub fn map_4k_target(
+    vaddr: u64,
+    paddr: u64,
+    flags: u64,
+    pmm: &mut PmmAllocator,
+    target_pml4_phys: u64,
+) {
     let saved_cr3 = read_cr3();
     if target_pml4_phys != saved_cr3 {
-        unsafe { write_cr3(target_pml4_phys); }
+        unsafe {
+            write_cr3(target_pml4_phys);
+        }
     }
     map_4k(vaddr, paddr, flags, pmm);
     invlpg(vaddr); // flush TLB for this vaddr while target CR3 is active
     if target_pml4_phys != saved_cr3 {
-        unsafe { write_cr3(saved_cr3); }
+        unsafe {
+            write_cr3(saved_cr3);
+        }
     }
 }
-
 
 /// Map a 2 MiB huge page in the active address space.
 ///
@@ -332,15 +407,21 @@ pub fn unmap(vaddr: u64) -> Option<u64> {
     let (l4i, l3i, l2i, l1i) = indices(vaddr);
     let l4 = active_l4();
 
-    if l4[l4i] & PAGE_PRESENT == 0 { return None; }
+    if l4[l4i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l3_addr = l4[l4i] & ADDR_MASK;
     let l3 = unsafe { &mut *(l3_addr as *mut PageTable) };
 
-    if l3[l3i] & PAGE_PRESENT == 0 { return None; }
+    if l3[l3i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l2_addr = l3[l3i] & ADDR_MASK;
     let l2 = unsafe { &mut *(l2_addr as *mut PageTable) };
 
-    if l2[l2i] & PAGE_PRESENT == 0 { return None; }
+    if l2[l2i] & PAGE_PRESENT == 0 {
+        return None;
+    }
 
     if l2[l2i] & PAGE_HUGE != 0 {
         // 2 MiB huge page — unmap at L2.
@@ -353,7 +434,9 @@ pub fn unmap(vaddr: u64) -> Option<u64> {
     let l1_addr = l2[l2i] & ADDR_MASK;
     let l1 = unsafe { &mut *(l1_addr as *mut PageTable) };
 
-    if l1[l1i] & PAGE_PRESENT == 0 { return None; }
+    if l1[l1i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let entry = l1[l1i];
     l1[l1i] = 0;
     invlpg(vaddr);
@@ -373,11 +456,17 @@ pub fn translate(vaddr: u64) -> Option<u64> {
     let (l4i, l3i, l2i, l1i) = indices(vaddr);
     let l4 = unsafe { &*(read_cr3() as *const PageTable) };
 
-    if l4[l4i] & PAGE_PRESENT == 0 { return None; }
+    if l4[l4i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l3 = unsafe { &*((l4[l4i] & ADDR_MASK) as *const PageTable) };
-    if l3[l3i] & PAGE_PRESENT == 0 { return None; }
+    if l3[l3i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l2 = unsafe { &*((l3[l3i] & ADDR_MASK) as *const PageTable) };
-    if l2[l2i] & PAGE_PRESENT == 0 { return None; }
+    if l2[l2i] & PAGE_PRESENT == 0 {
+        return None;
+    }
 
     if l2[l2i] & PAGE_HUGE != 0 {
         let base = l2[l2i] & ADDR_MASK;
@@ -385,7 +474,9 @@ pub fn translate(vaddr: u64) -> Option<u64> {
     }
 
     let l1 = unsafe { &*((l2[l2i] & ADDR_MASK) as *const PageTable) };
-    if l1[l1i] & PAGE_PRESENT == 0 { return None; }
+    if l1[l1i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let base = l1[l1i] & ADDR_MASK;
     Some(base | (vaddr & 0xFFF))
 }
@@ -398,11 +489,17 @@ pub fn translate_in_pml4(vaddr: u64, pml4_phys: u64) -> Option<u64> {
     let (l4i, l3i, l2i, l1i) = indices(vaddr);
     let l4 = unsafe { &*(pml4_phys as *const PageTable) };
 
-    if l4[l4i] & PAGE_PRESENT == 0 { return None; }
+    if l4[l4i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l3 = unsafe { &*((l4[l4i] & ADDR_MASK) as *const PageTable) };
-    if l3[l3i] & PAGE_PRESENT == 0 { return None; }
+    if l3[l3i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let l2 = unsafe { &*((l3[l3i] & ADDR_MASK) as *const PageTable) };
-    if l2[l2i] & PAGE_PRESENT == 0 { return None; }
+    if l2[l2i] & PAGE_PRESENT == 0 {
+        return None;
+    }
 
     if l2[l2i] & PAGE_HUGE != 0 {
         let base = l2[l2i] & ADDR_MASK;
@@ -410,9 +507,132 @@ pub fn translate_in_pml4(vaddr: u64, pml4_phys: u64) -> Option<u64> {
     }
 
     let l1 = unsafe { &*((l2[l2i] & ADDR_MASK) as *const PageTable) };
-    if l1[l1i] & PAGE_PRESENT == 0 { return None; }
+    if l1[l1i] & PAGE_PRESENT == 0 {
+        return None;
+    }
     let base = l1[l1i] & ADDR_MASK;
     Some(base | (vaddr & 0xFFF))
+}
+
+/// DEBUG-only page-table and entry-page evidence helpers.
+///
+/// Physical bytes are read only after verifying that the active root identity-maps
+/// the requested physical page.  This keeps the diagnostic from accidentally
+/// treating an arbitrary physical address as a kernel virtual pointer.
+pub fn debug_dump_walk(label: &str, vaddr: u64, pml4_phys: u64) {
+    if !cfg!(feature = "debug") {
+        return;
+    }
+    debug_dump_root_walk(label, vaddr, pml4_phys);
+}
+
+pub fn debug_dump_root_walk(label: &str, vaddr: u64, pml4_phys: u64) {
+    if !cfg!(feature = "debug") {
+        return;
+    }
+    use core::fmt::Write;
+    let mut serial = crate::serial::SerialPort::new();
+    serial.init();
+    let active = read_cr3();
+    let (l4i, l3i, l2i, l1i) = indices(vaddr);
+    let l4 = unsafe { &*(pml4_phys as *const PageTable) };
+    let l4e = l4[l4i];
+    let _ = write!(serial,
+        "DBG ELF WALK: {} root=0x{:016x} active_cr3=0x{:016x} vaddr=0x{:016x} idx={}/{}/{}/{} PML4E=0x{:016x}\n",
+        label, pml4_phys, active, vaddr, l4i, l3i, l2i, l1i, l4e);
+    if l4e & PAGE_PRESENT == 0 {
+        return;
+    }
+    let l3 = unsafe { &*((l4e & ADDR_MASK) as *const PageTable) };
+    let l3e = l3[l3i];
+    let _ = write!(serial, "DBG ELF WALK: {} PDPTE=0x{:016x}\n", label, l3e);
+    if l3e & PAGE_PRESENT == 0 {
+        return;
+    }
+    if l3e & PAGE_HUGE != 0 {
+        let phys = (l3e & ADDR_MASK) | (vaddr & 0x3fff_ffff);
+        debug_dump_physical_if_identity(&mut serial, label, phys);
+        return;
+    }
+    let l2 = unsafe { &*((l3e & ADDR_MASK) as *const PageTable) };
+    let l2e = l2[l2i];
+    let _ = write!(serial, "DBG ELF WALK: {} PDE=0x{:016x}\n", label, l2e);
+    if l2e & PAGE_PRESENT == 0 {
+        return;
+    }
+    if l2e & PAGE_HUGE != 0 {
+        let phys = (l2e & ADDR_MASK) | (vaddr & 0x1f_ffff);
+        debug_dump_physical_if_identity(&mut serial, label, phys);
+        return;
+    }
+    let l1 = unsafe { &*((l2e & ADDR_MASK) as *const PageTable) };
+    let l1e = l1[l1i];
+    let _ = write!(serial, "DBG ELF WALK: {} PTE=0x{:016x}\n", label, l1e);
+    if l1e & PAGE_PRESENT == 0 {
+        return;
+    }
+    let phys = (l1e & ADDR_MASK) | (vaddr & 0xfff);
+    debug_dump_physical_if_identity(&mut serial, label, phys);
+}
+
+fn debug_dump_physical_if_identity(serial: &mut crate::serial::SerialPort, label: &str, phys: u64) {
+    use core::fmt::Write;
+    let page = phys & !0xfff;
+    let identity_ok = translate(page)
+        .map(|mapped| mapped & !0xfff == page)
+        .unwrap_or(false);
+    if !identity_ok {
+        let _ = write!(
+            serial,
+            "DBG ELF PHYS: {} frame=0x{:016x} identity_map=unverified bytes=unavailable\n",
+            label, page
+        );
+        return;
+    }
+    let _ = write!(
+        serial,
+        "DBG ELF PHYS: {} frame=0x{:016x} identity_map=verified bytes=",
+        label, page
+    );
+    for i in 0..16u64 {
+        let byte = unsafe { core::ptr::read_volatile((page | i) as *const u8) };
+        let _ = write!(serial, "{:02x}", byte);
+    }
+    serial.writestrs(["\n"].as_ref());
+}
+
+pub fn debug_dump_entry_evidence(label: &str, vaddr: u64, target_pml4: u64) {
+    if !cfg!(feature = "debug") {
+        return;
+    }
+    use core::fmt::Write;
+    let active = read_cr3();
+    let mut serial = crate::serial::SerialPort::new();
+    serial.init();
+    let _ = write!(
+        serial,
+        "DBG ELF ENTRY: {} vaddr=0x{:016x} active_cr3=0x{:016x} target_pml4=0x{:016x}\n",
+        label, vaddr, active, target_pml4
+    );
+    debug_dump_root_walk("active-root", vaddr, active);
+    debug_dump_root_walk("target-root", vaddr, target_pml4);
+    let _ = write!(serial, "DBG ELF ENTRY: {} virtual=", label);
+    for i in 0..16u64 {
+        let byte = unsafe { core::ptr::read_volatile((vaddr + i) as *const u8) };
+        let _ = write!(serial, "{:02x}", byte);
+    }
+    serial.writestrs(["\n"].as_ref());
+}
+
+pub fn debug_dump_map_site(label: &str, vaddr: u64, paddr: u64, flags: u64, target_pml4: u64) {
+    if !cfg!(feature = "debug") {
+        return;
+    }
+    use core::fmt::Write;
+    let mut serial = crate::serial::SerialPort::new();
+    serial.init();
+    let _ = write!(serial, "DBG ELF MAP: {} vaddr=0x{:016x} paddr=0x{:016x} flags=0x{:016x} active_cr3=0x{:016x} target_pml4=0x{:016x}\n", label, vaddr, paddr, flags, read_cr3(), target_pml4);
+    debug_dump_entry_evidence(label, vaddr, target_pml4);
 }
 
 //==============================================================================
@@ -439,7 +659,9 @@ pub fn test(pmm: &mut PmmAllocator, serial: &mut crate::serial::SerialPort) {
     invlpg(vaddr);
 
     // Write a pattern through the virtual mapping.
-    unsafe { *(vaddr as *mut u64) = 0xDEAD_BEEF_CAFE_F00D; }
+    unsafe {
+        *(vaddr as *mut u64) = 0xDEAD_BEEF_CAFE_F00D;
+    }
 
     // Translate back and verify the physical address matches.
     let translated = translate(vaddr);
