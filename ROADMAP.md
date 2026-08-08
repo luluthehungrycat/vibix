@@ -58,12 +58,23 @@ alarm, syslog, times, uname, uptime
 - `make test` — 21 required integration markers (as defined by `test_kernel.py`)
 - `make test_vibit` — 7 VIBIT init/shell fork/exec/blocking-read checks
 - VIBIT/vish integration — external VIBIT init launches the NASM vish shell; bounded shell handoff and continuation checks pass
-- `make test_vibit_rust` — Rust ELF `OK`, no exception, and shared-page provenance validation;
-  PID/range-correlated Rust scheduling evidence remains optional and unproven.
+- `make test_vibit_rust` — readiness-aware KVM/TCG retries, Rust ELF `OK`, no exception,
+  shared-page provenance, and bounded global IRQ observations; PID/range-correlated Rust
+  scheduling evidence remains unproven.
+- `make test_vibit_rust_large` — test-time 257-page synthetic ELF plus lower-level
+  provenance-arena capacity and cleanup regression; full VIBIT shell handoff is deferred.
 
 ---
 
 ## 📋 Short Tasks (Next)
+
+### Follow-up OpenSpec changes from PR #8 review
+- **TTY foreground SIGINT** (`fix-tty-sigint-foreground-reader`): completed foreground-reader routing,
+  wakeup, and bounded integration coverage; dedicated stale/no-reader fixtures remain open.
+- **Rust vish probe prerequisite** (`build-rust-vish-test-prerequisite`): completed sibling ELF build,
+  staging, and runtime Rust probe validation without sibling source changes.
+- **Scalable ELF provenance** (`remove-elf-page-provenance-ceiling`): completed reclaimed metadata arena,
+  cleanup, and >256-page lower-level regression; failure-injection coverage remains deferred.
 
 ### 3. Signal handling — userspace test
 - **File**: `userspace/vibix_signal_test.inc`
@@ -126,4 +137,4 @@ alarm, syslog, times, uname, uptime
 
 ---
 
-*Last updated: 2026-07-01*
+*Last updated: 2026-08-08*
