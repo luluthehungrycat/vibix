@@ -13,8 +13,8 @@ A Unixoid kernel for x86-64, written in Rust + NASM assembly.
 - Round-robin scheduler (100 Hz PIT timer)
 
 ### ELF Loader
-- ELF64 executable loading with multi-segment support
-- Loads via per-process PML4 (not identity map)
+- ELF64 executable loading with multi-segment support, including load-local shared-page provenance (Rust ELF probe reaches `OK` without exception)
+- Loads via per-process PML4 (not identity map) — current committed implementation
 - Pages always allocated fresh on exec (no parent-memory corruption)
 
 ### VFS
@@ -51,10 +51,15 @@ alarm, syslog, times, uname, uptime
   to 0x13 so `SS = 0x13 + 8 = 0x1B` with correct RPL=3.
 - **ELF after fork**: Removed `translate_in_pml4()` reuse — exec always
   allocates fresh pages, never writes onto parent's physical pages.
+- **Current ELF overlap-loader fix**: `elf::load` records pages allocated during one load call,
+  reuses shared PT_LOAD pages, and preserves later partial-page file bytes.
 
 ### Tests
-- `make test` — 22 integration checks (15 kernel + 7 userspace syscall tests)
+- `make test` — 21 required integration markers (as defined by `test_kernel.py`)
 - `make test_vibit` — 7 VIBIT init/shell fork/exec/blocking-read checks
+- VIBIT/vish integration — external VIBIT init launches the NASM vish shell; bounded shell handoff and continuation checks pass
+- `make test_vibit_rust` — Rust ELF `OK`, no exception, and shared-page provenance validation;
+  PID/range-correlated Rust scheduling evidence remains optional and unproven.
 
 ---
 
