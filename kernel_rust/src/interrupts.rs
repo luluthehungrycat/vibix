@@ -447,34 +447,93 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     // CR2 = linear address that caused the page fault (only valid for #PF, #14)
     let cr2: u64;
     if int_no == 14 {
-        unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2); }
+        unsafe {
+            core::arch::asm!("mov {}, cr2", out(reg) cr2);
+        }
     } else {
         cr2 = 0;
     }
 
     let rip_buf = hex_str(frame.rip);
-    serial.writestrs(&["VIBIX:   RIP: ", core::str::from_utf8(&rip_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RIP: ",
+        core::str::from_utf8(&rip_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let cs_buf = hex_str(frame.cs);
-    serial.writestrs(&["VIBIX:    CS: ", core::str::from_utf8(&cs_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:    CS: ",
+        core::str::from_utf8(&cs_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rflags_buf = hex_str(frame.rflags);
-    serial.writestrs(&["VIBIX: RFLAGS: ", core::str::from_utf8(&rflags_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX: RFLAGS: ",
+        core::str::from_utf8(&rflags_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let err_buf = hex_str(frame.err_code);
-    serial.writestrs(&["VIBIX:   ERR: ", core::str::from_utf8(&err_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   ERR: ",
+        core::str::from_utf8(&err_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let cr2_buf = hex_str(cr2);
-    serial.writestrs(&["VIBIX:   CR2: ", core::str::from_utf8(&cr2_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   CR2: ",
+        core::str::from_utf8(&cr2_buf).unwrap_or("???"),
+        "\n",
+    ]);
+
+    if cfg!(feature = "debug") && int_no == 14 {
+        let classification = if frame.err_code & (1 << 4) != 0 {
+            "instruction-fetch"
+        } else if frame.err_code & (1 << 1) != 0 {
+            "data-write"
+        } else {
+            "data-read"
+        };
+        let _ = write!(
+            serial,
+            "VIBIX: PF_CLASS: {} rip_cr2_match={}\n",
+            classification,
+            if frame.rip == cr2 { "yes" } else { "no" }
+        );
+        let active_cr3 = crate::paging::read_cr3();
+        let _ = write!(
+            serial,
+            "DBG PF RAW: error=0x{:016x} active_cr3=0x{:016x} rip=0x{:016x} cr2=0x{:016x}\n",
+            frame.err_code, active_cr3, frame.rip, cr2
+        );
+        crate::paging::debug_dump_walk("fault active-root entry", frame.rip, active_cr3);
+    }
 
     // Debug-only: extended register/stack dumps (enable with `make DEBUG=1`)
     if cfg!(feature = "debug") {
         let u_rsp_buf = hex_str(frame.user_rsp);
-        serial.writestrs(&["VIBIX:  U_RSP: ", core::str::from_utf8(&u_rsp_buf).unwrap_or("???"), "\n"]);
+        serial.writestrs(&[
+            "VIBIX:  U_RSP: ",
+            core::str::from_utf8(&u_rsp_buf).unwrap_or("???"),
+            "\n",
+        ]);
         let ss_buf = hex_str(frame.ss);
-        serial.writestrs(&["VIBIX:     SS: ", core::str::from_utf8(&ss_buf).unwrap_or("???"), "\n"]);
+        serial.writestrs(&[
+            "VIBIX:     SS: ",
+            core::str::from_utf8(&ss_buf).unwrap_or("???"),
+            "\n",
+        ]);
 
         // Read RSP inside handler (approximates fault RSP minus isr push offset)
         let handler_rsp: u64;
-        unsafe { core::arch::asm!("mov {}, rsp", out(reg) handler_rsp); }
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) handler_rsp);
+        }
         let hrsp_buf = hex_str(handler_rsp);
-        serial.writestrs(&["VIBIX: HND_RSP: ", core::str::from_utf8(&hrsp_buf).unwrap_or("???"), "\n"]);
+        serial.writestrs(&[
+            "VIBIX: HND_RSP: ",
+            core::str::from_utf8(&hrsp_buf).unwrap_or("???"),
+            "\n",
+        ]);
 
         // Compute frame pointer = address of InterruptFrame (= RAX address)
         let frame_ptr = core::ptr::addr_of!(*frame) as u64;

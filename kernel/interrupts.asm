@@ -181,33 +181,60 @@ irq_common:
     add rsp, 16
 
 %ifdef DEBUG
-    ;--- DEBUG: print iretq frame SS if != 0x1B (would cause GPF #13) ---
+    ;--- DEBUG: dump full iretq frame via COM1 before iretq ---
+    ; Frame after GPR pops + add rsp,16:
+    ;   [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=userRSP [rsp+32]=SS
+    ; Four debug pushes shift the frame fields by +32 bytes.
     push rax
     push rcx
     push rdx
     push rsi
-    mov rax, [rsp + 64]
-    cmp al, 0x1B
-    je .irq_skip_dbg
-    lea rsi, [rel .irq_dbg_excl]
+    lea rsi, [rel .irq_dbg_hdr]
+    call serial_puts
+    ; RIP
+    lea rsi, [rel .irq_dbg_rip]
+    call serial_puts
+    mov rax, [rsp + 32]
+    call serial_print_hex64
+    ; CS
+    lea rsi, [rel .irq_dbg_cs]
+    call serial_puts
+    mov rax, [rsp + 40]
+    call serial_print_hex8
+    ; SS
+    lea rsi, [rel .irq_dbg_ss]
     call serial_puts
     mov rax, [rsp + 64]
     call serial_print_hex8
-    lea rsi, [rel .irq_dbg_rsp]
+    ; RFLAGS
+    lea rsi, [rel .irq_dbg_rfl]
     call serial_puts
-    mov rax, rsp
-    add rax, 32
+    mov rax, [rsp + 48]
+    call serial_print_hex64
+    ; Saved user RSP (the iretq frame field)
+    lea rsi, [rel .irq_dbg_user_rsp]
+    call serial_puts
+    mov rax, [rsp + 56]
+    call serial_print_hex64
+    ; Frame pointer (address of RIP after debug pushes)
+    lea rsi, [rel .irq_dbg_frame]
+    call serial_puts
+    lea rax, [rsp + 32]
     call serial_print_hex64
     lea rsi, [rel .irq_dbg_nl]
     call serial_puts
-.irq_skip_dbg:
     pop rsi
     pop rdx
     pop rcx
     pop rax
     jmp .irq_dbg_end
-.irq_dbg_excl:  db "!SS=", 0
-.irq_dbg_rsp:   db " RSP=0x", 0
+.irq_dbg_hdr:  db "IRQ frame: ", 0
+.irq_dbg_rip:  db "RIP=", 0
+.irq_dbg_cs:   db " CS=", 0
+.irq_dbg_ss:   db " SS=", 0
+.irq_dbg_rfl:  db " RFL=", 0
+.irq_dbg_user_rsp: db " USER_RSP=", 0
+.irq_dbg_frame:    db " FRAME=", 0
 .irq_dbg_nl:    db 0x0D, 0x0A, 0
 .irq_dbg_end:
 %endif
