@@ -198,6 +198,16 @@ impl Tty {
     // Public interface (called from VnodeOps)
     //--------------------------------------------------------------------------
 
+    /// Poll keyboard and serial input from the scheduler tick.
+    ///
+    /// A process blocked in read() cannot poll its own input device. The timer
+    /// calls this entry point so serial input can reach push_byte(), which
+    /// wakes the process recorded in waiting_pid.
+    pub fn poll_input() {
+        let tty = unsafe { &mut *core::ptr::addr_of_mut!(TTY) };
+        tty.process_input();
+    }
+
     /// Read from the completed-lines buffer.
     ///
     /// First processes any pending keyboard/serial input through the line

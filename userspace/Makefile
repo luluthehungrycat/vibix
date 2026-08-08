@@ -39,39 +39,43 @@ VISH_RUST_ELF = $(VISH_DIR)/target/x86_64-unknown-none/release/vibix
 GVIBU_DIR     = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/kernel)
 GVIBU_ELF_DIR = $(abspath $(BUILD_DIR)/../../gvibu-ai-lab/vibix-lib)
 
-.PHONY: all clean
+.PHONY: all clean FORCE
+.ONESHELL:
+
+FORCE:
+
+ifeq ($(INIT),vibit)
+$(OUTPUT) $(INITRAMFS): FORCE
+endif
 
 all: $(OUTPUT) $(INITRAMFS)
 
 # Build or copy the init binary
 $(OUTPUT):
 ifeq ($(INIT),vibit)
-	$(MAKE) -C $(VIBIT_DIR) all
-	cp $(VIBIT_BIN) $@
+	@test -d "$(VIBIT_DIR)" || { printf '%s\n' "ERROR: missing ../vibit; run make -C ../vibit all from the VIBIX root." >&2; exit 1; }
+	$(MAKE) -C "$(VIBIT_DIR)" all || { printf '%s\n' "ERROR: VIBIT build failed in ../vibit; run make -C ../vibit all." >&2; exit 1; }
+	@test -s "$(VIBIT_BIN)" || { printf '%s\n' "ERROR: missing or empty ../vibit/vibit.bin after make -C ../vibit all." >&2; exit 1; }
+	cp -f "$(VIBIT_BIN)" "$@"
 else
 	$(NASM) -f bin -I $(INC_DIR)/ $(BLOB_ASM) -o $@
 endif
 
 $(INITRAMFS): $(OUTPUT)
-	mkdir -p /tmp/vibix-initramfs/sbin /tmp/vibix-initramfs/bin
-	cp $(OUTPUT) /tmp/vibix-initramfs/sbin/init
+	tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/vibix-initramfs.XXXXXX") || { printf '%s\n' "ERROR: unable to create temporary initramfs directory." >&2; exit 1; }; \
+	trap 'rm -rf "$$tmp"' EXIT HUP INT TERM; \
+	mkdir -p "$$tmp/sbin" "$$tmp/bin" || { printf '%s\n' "ERROR: unable to prepare temporary initramfs tree." >&2; exit 1; }; \
+	cp -f "$(OUTPUT)" "$$tmp/sbin/init" || { printf '%s\n' "ERROR: unable to stage /sbin/init from $(OUTPUT)." >&2; exit 1; };
 ifeq ($(INIT),vibit)
-	# Build and copy vish shell binary for VIBIT to exec
-	$(MAKE) -C $(VISH_DIR) all
-	cp $(VISH_BIN) /tmp/vibix-initramfs/bin/vish
-	# Build and copy vish Rust ELF binary (experimental)
-	cp $(VISH_RUST_ELF) /tmp/vibix-initramfs/bin/vish_rust
-	# Build and copy GVIBU coreutils (flat NASM binaries)
-	cd $(GVIBU_DIR) && for asm in user_*.asm; do \
-		out=$$(echo $$asm | sed 's/user_\(.*\)\.asm/\1/'); \
-		$(NASM) -f bin -I ./ $$asm -o /tmp/vibix-initramfs/bin/$$out 2>/dev/null; \
-	done
-	# Build and copy GVIBU Rust ELF binary (multicall: echo, true, false, yes, printenv)
-	$(MAKE) -C $(GVIBU_ELF_DIR) all
-	cp $(GVIBU_ELF_DIR)/target/x86_64-unknown-none/release/vibix /tmp/vibix-initramfs/bin/gvibu
+	$(MAKE) -C "$(VISH_DIR)" nasm || { printf '%s\n' "ERROR: NASM vish build failed in ../vish; run make -C ../vish nasm." >&2; exit 1; }
+	test -s "$(VISH_BIN)" || { printf '%s\n' "ERROR: missing or empty ../vish/vish.bin after make -C ../vish nasm." >&2; exit 1; }
+	cp -f "$(VISH_BIN)" "$$tmp/bin/vish" || { printf '%s\n' "ERROR: unable to stage /bin/vish from ../vish/vish.bin." >&2; exit 1; }
 endif
-	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init bin/* 2>/dev/null || tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/$@ sbin/init
-	rm -rf /tmp/vibix-initramfs
+ifeq ($(INIT),vibit)
+	cd "$$tmp" && tar --format=ustar --owner=0 --group=0 -cf "$(CURDIR)/$@" sbin/init bin/vish || { printf '%s\n' "ERROR: unable to create initramfs archive $(CURDIR)/$@." >&2; exit 1; }
+else
+	cd "$$tmp" && tar --format=ustar --owner=0 --group=0 -cf "$(CURDIR)/$@" sbin/init || { printf '%s\n' "ERROR: unable to create initramfs archive $(CURDIR)/$@." >&2; exit 1; }
+endif
 
 clean:
 	rm -f $(OUTPUT) $(INITRAMFS)

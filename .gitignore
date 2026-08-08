@@ -1,8 +1,12 @@
 # Build artifacts
 *.o
 *.elf
-*.bin
-*.tar
+/kernel64.bin
+/userspace/vibix_blob.bin
+/userspace/initramfs.tar
+/userspace/vibit.bin
+
+# VIBIT integration staging outputs (generated, never committed)
 
 # Rust / Cargo
 kernel_rust/target/

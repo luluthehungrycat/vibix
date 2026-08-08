@@ -240,22 +240,21 @@ with `invlpg`, then restores CR3. If target == current CR3, the switch is skippe
 ### ELF Loader (`elf.rs`)
 - Pages are zeroed via virtual address in target PML4 (`write_bytes(vaddr_page, ...)`)
   NOT via physical address (no identity-map dependency)
-- `translate_in_pml4(vaddr, pml4_phys)` detects overlapping segments between .text and .rodata
-- Relaxation (RW→RO) is disabled — all pages stay RW (no NX bit anyway)
+- ELF segment overlap is handled by reusing only the immediately preceding page
+  allocated during the current load; `translate_in_pml4` is not used by the loader
+- Pages remain RW because permission relaxation and NX are not enabled
 
-### Known Issue: GPF #13 with Multi-Segment Rust ELF
-When VIBIT fork-execs a Rust ELF with multiple LOAD segments (.text + .rodata), a GPF #13
-occurs at the kernel's `iretq` in `irq_common` (kernel/interrupts.asm:184) with error code 0x18
-(SS selector mismatch). The target frame has CS=0x08 + SS=0x1B.
-
-Single-segment ELFs (text only) work. NASM flat binaries work. The corruption happens between
-`scheduler_tick` returning `next.kernel_rsp` and the assembly `iretq`, likely caused by
-`map_4k`'s `|= PAGE_USER` on PML4[0]/PDPT[0] during ELF loading. See NEXT_SESSION.md for
-detailed debugging history.
+### Current Status: Multi-Segment Rust ELF Probe
+The historical Candidate/Active/Retired paging rewrite is absent from this tree and must not be
+reconstructed or inferred from these notes. The current baseline uses load-local page provenance
+for overlapping PT_LOAD pages. `test_vibit_rust` reaches Rust ELF entry output, preserves the
+shared entry-page frame, and reports no exception. PID/range-correlated Rust-process scheduling
+round trips remain unproven because the harness only observes global DEBUG IRQ lines.
+NASM flat binaries remain covered by `make test_vibit`.
 
 ### translate_in_pml4(vaddr, pml4_phys) → Option(u64)
-Walks a specific PML4 table (not the active CR3). Used by the ELF loader to check if a
-virtual address is already mapped in the target process's page tables (for overlapping segments).
+Walks a specific PML4 table (not the active CR3). It is retained as a general paging
+helper; the current ELF loader does not call it.
 
 ---
 

@@ -196,33 +196,60 @@ syscall_entry:
     pop r15
 
 %ifdef DEBUG
-    ;--- DEBUG: print iretq frame SS if != 0x1B ---
+    ;--- DEBUG: dump full iretq frame via COM1 before iretq ---
+     ; This path still has int_no + err_code below the restored GPRs.
+    ; Four debug pushes therefore place RIP at +48. irq_common skips those
+    ; two fields before its debug block, so its RIP remains at +32.
     push rax
     push rcx
     push rdx
     push rsi
-    mov rax, [rsp + 80]
-    cmp al, 0x1B
-    je .sys_skip_dbg
-    lea rsi, [rel .sys_dbg_excl]
+    lea rsi, [rel .sys_dbg_hdr]
+    call serial_puts
+    ; RIP
+    lea rsi, [rel .sys_dbg_rip]
+    call serial_puts
+    mov rax, [rsp + 48]
+    call serial_print_hex64
+    ; CS
+    lea rsi, [rel .sys_dbg_cs]
+    call serial_puts
+    mov rax, [rsp + 56]
+    call serial_print_hex8
+    ; SS
+    lea rsi, [rel .sys_dbg_ss]
     call serial_puts
     mov rax, [rsp + 80]
     call serial_print_hex8
-    lea rsi, [rel .sys_dbg_rsp]
+    ; RFLAGS
+    lea rsi, [rel .sys_dbg_rfl]
     call serial_puts
-    mov rax, rsp
-    add rax, 32
+    mov rax, [rsp + 64]
+    call serial_print_hex64
+    ; Saved user RSP (the iretq frame field)
+    lea rsi, [rel .sys_dbg_user_rsp]
+    call serial_puts
+    mov rax, [rsp + 72]
+    call serial_print_hex64
+    ; Frame pointer (address of RIP after debug pushes)
+    lea rsi, [rel .sys_dbg_frame]
+    call serial_puts
+    lea rax, [rsp + 48]
     call serial_print_hex64
     lea rsi, [rel .sys_dbg_nl]
     call serial_puts
-.sys_skip_dbg:
     pop rsi
     pop rdx
     pop rcx
     pop rax
     jmp .sys_dbg_end
-.sys_dbg_excl:  db "!SYS SS=", 0
-.sys_dbg_rsp:   db " RSP=0x", 0
+.sys_dbg_hdr:  db "SYSCALL frame: ", 0
+.sys_dbg_rip:  db "RIP=", 0
+.sys_dbg_cs:   db " CS=", 0
+.sys_dbg_ss:   db " SS=", 0
+.sys_dbg_rfl:  db " RFL=", 0
+.sys_dbg_user_rsp: db " USER_RSP=", 0
+.sys_dbg_frame:    db " FRAME=", 0
 .sys_dbg_nl:    db 0x0D, 0x0A, 0
 .sys_dbg_end:
 %endif
