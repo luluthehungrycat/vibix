@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-08
+
+### VIBIT-to-vish integration implementation (blocked at serial input)
+
+- Updated VIBIX-only `INIT=vibit` staging to build `../vibit` with `all`, build `../vish` with `nasm`, stage only `/sbin/init` and `/bin/vish` through a temporary initramfs tree, and emit actionable prerequisite/output errors.
+- Preserved the default combined userspace blob path and the explicit Rust ELF replacement path; added bounded serial TCP QEMU input/continuation checks and narrow staging ignore rules.
+- Files modified: `userspace/Makefile`, `test_kernel.py`, `.gitignore`, `openspec/changes/boot-vibit-to-vish-integration/tasks.md`, `CHANGELOG.md`.
+- Tests: sibling `make -B -C ../vibit all` and `make -B -C ../vish nasm` passed; default and `INIT=vibit` userspace builds, archive provenance inspection, `make clean && make INIT=vibit`, and existing VIBIT marker checks passed. Bounded deterministic vish input failed: the shell produced `goodbye`/respawn without `VIBIX_VISH_TEST`, then hit a page fault at RIP `0x2000063`; `make test` and `make test_vibit` were not run after this first blocker.
+
+### VIBIT/vish serial-input investigation — blocked at sibling ABI boundary
+
+- Re-read the OpenSpec context and inspected the VIBIX TTY/serial path plus the NASM vish syscall callers.
+- Root cause: `vish.asm` calls `sys_read` with `(buffer, length)` at `read_line` and escape/cat paths, but the VIBIX syscall ABI requires `(fd, buffer, length)`. The first pointer is therefore interpreted as an invalid fd; VIBIX returns the read error sentinel, vish treats it as EOF, prints `goodbye`, and VIBIT respawns. The later RIP `0x2000063` is consistent with the resulting repeated malformed shell lifecycle, not TCP framing.
+- No sibling source was modified. Fixing the caller ABI requires a separate change in `../vish`; no VIBIX-only harness timing change can make command input valid with the current `vish.bin`.
+- Tests: bounded TCP QEMU reproduction reached VIBIT PID 1, fork/exec, vish prompt, goodbye, respawn, and the reported page fault; `make test` and `make test_vibit` remain deferred at the first repository-boundary blocker.
+
+## 2026-08-08
+
+### OpenSpec Proposal: VIBIT to vish Boot Integration
+
+- Created the complete `boot-vibit-to-vish-integration` planning change covering sibling binary generation, binary-only initramfs staging, narrow ignore policy, bounded QEMU validation, and sibling-repository ownership boundaries.
+- Files modified: `openspec/changes/boot-vibit-to-vish-integration/proposal.md`, `openspec/changes/boot-vibit-to-vish-integration/design.md`, `openspec/changes/boot-vibit-to-vish-integration/specs/boot-vibit-to-vish-integration/spec.md`, `openspec/changes/boot-vibit-to-vish-integration/tasks.md`, `CHANGELOG.md`.
+- Tests: OpenSpec strict change validation passed; no implementation or kernel tests run because this session was planning/artifacts only.
+
+
 All notable changes to VIBIX are documented here.
 
 ## 2026-07-01

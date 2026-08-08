@@ -4,6 +4,9 @@ import subprocess
 import sys
 import os
 import tempfile
+import selectors
+import time
+import socket
 
 QEMU = "/usr/bin/qemu-system-x86_64"
 
@@ -186,7 +189,108 @@ def test_vibit():
             all_ok = False
 
     os.unlink(serial_path)
-    return all_ok
+    integration_ok = test_vibit_integration()
+    return all_ok and integration_ok
+
+
+
+def test_vibit_integration():
+    """Exercise vish input and VIBIT shell respawn with bounded serial I/O."""
+    print("🧪 Testing bounded VIBIT/vish shell handoff...")
+    accel = "kvm"
+    try:
+        with open("/dev/kvm", "rb"):
+            pass
+    except (FileNotFoundError, PermissionError, OSError):
+        accel = "tcg"
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    command = [
+        QEMU,
+        "-accel", accel,
+        "-kernel", "vibix.elf",
+        "-serial", f"tcp:127.0.0.1:{port},server=on,wait=on",
+        "-display", "none",
+        "-m", "512M",
+        "-no-reboot",
+        "-no-shutdown",
+    ]
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    connection = None
+    output = bytearray()
+    sent_input = False
+    sent_exit = False
+    deadline = time.monotonic() + 30
+    try:
+        while connection is None and time.monotonic() < deadline:
+            try:
+                connection = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            except OSError:
+                if proc.poll() is not None:
+                    break
+        if connection is None:
+            print("  ❌ serial TCP connection was not established")
+            return False
+        connection.setblocking(False)
+        selector = selectors.DefaultSelector()
+        selector.register(connection, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
+            events = selector.select(max(0, deadline - time.monotonic()))
+            if not events:
+                break
+            for key, _ in events:
+                chunk = key.fileobj.recv(4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                text = output.decode("utf-8", errors="replace")
+                if not sent_input and "vish$ " in text:
+                    connection.sendall(b"help\n")
+                    sent_input = True
+                if sent_input and not sent_exit and "Built-in commands:" in text:
+                    connection.sendall(b"exit\n")
+                    sent_exit = True
+                if sent_exit and text.count("vish$ ") >= 3 and "VIBIT: respawning shell..." in text:
+                    deadline = time.monotonic()
+                    break
+        selector.close()
+        text = output.decode("utf-8", errors="replace")
+        checks = {
+            "Built-in commands:": "deterministic vish command output",
+            "VIBIT: reaped child": "VIBIT child reaping",
+            "VIBIT: respawning shell...": "VIBIT shell continuation",
+        }
+        ok = sent_input and sent_exit and text.count("vish$ ") >= 3
+        for marker, label in checks.items():
+            if marker in text:
+                print(f"  ✅ {label}")
+            else:
+                print(f"  ❌ {label} (missing: {marker!r})")
+                ok = False
+        if text.count("vish$ ") >= 3:
+            print("  ✅ vish prompt returned after shell exit")
+        else:
+            print(f"  ❌ vish prompt repetition (observed {text.count('vish$ ')} prompt(s))")
+        if not sent_input:
+            print("  ❌ deterministic input was not sent (prompt missing)")
+        if not sent_exit:
+            print("  ❌ exit command was not sent (command output missing)")
+        if not ok:
+            print("  Serial transcript:", repr(text))
+        return ok
+    finally:
+        if connection is not None:
+            connection.close()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
 
 
 if __name__ == "__main__":
