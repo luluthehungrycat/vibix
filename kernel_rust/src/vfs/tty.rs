@@ -84,6 +84,14 @@ impl Tty {
         // 2. Drain serial receiver buffer
         let serial = crate::serial::SerialPort::new();
         let n2 = serial.read(&mut scratch);
+        if cfg!(feature = "debug") && n2 != 0 {
+            debug_marker(
+                "serial",
+                crate::process::current_pid(),
+                self.waiting_pid,
+                n2 as u64,
+            );
+        }
         for i in 0..n2 {
             self.process_byte(scratch[i]);
         }
@@ -99,10 +107,10 @@ impl Tty {
 
         match c {
             0x08 | 0x7F => self.handle_backspace(),
-            0x03        => self.handle_ctrlc(),
+            0x03 => self.handle_ctrlc(),
             b'\r' | b'\n' => self.handle_enter(),
-            0x09        => self.handle_tab(),
-            0x1b        => {
+            0x09 => self.handle_tab(),
+            0x1b => {
                 // Escape — ignored for now (future: ANSI escape sequences)
             }
             _ if c >= 0x20 => self.handle_char(c),
@@ -121,17 +129,43 @@ impl Tty {
     }
 
     fn handle_ctrlc(&mut self) {
+        let reader_pid = self.waiting_pid;
+        if cfg!(feature = "debug") {
+            debug_marker(
+                "ctrlc",
+                reader_pid,
+                crate::process::current_pid(),
+                self.line_len as u64,
+            );
+        }
         self.line_len = 0;
         if self.echo {
             serial_write(b"^C\r\n");
         }
-        // Deliver SIGINT to the current process
-        let pid = crate::process::current_pid();
-        if pid != 0 {
-            let proc = crate::process::process_mut(pid);
-            proc.sig_pending |= 1 << crate::signal::SIGINT;
+
+        // The scheduler polls input while the reader is blocked, so
+        // current_pid() is commonly the idle process here.  Only the live,
+        // blocked owner recorded by read() may receive terminal SIGINT.
+        if reader_pid != 0 {
+            let delivered = if let Some(proc) = crate::process::process_mut_if(reader_pid) {
+                if proc.state == crate::process::ProcessState::Blocked {
+                    proc.sig_pending |= 1 << crate::signal::SIGINT;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !delivered {
+                // Do not let a stale or no-longer-blocked owner affect an
+                // unrelated process when push_byte() publishes the newline.
+                self.waiting_pid = 0;
+            }
         }
-        // Push a newline so tty.read() returns instead of blocking the process
+
+        // Push a newline through the normal completed-input path.  This
+        // preserves the existing wakeup and scheduling behavior.
         self.push_byte(b'\n');
     }
 
@@ -184,11 +218,15 @@ impl Tty {
         if self.waiting_pid != 0 {
             let pid = self.waiting_pid;
             self.waiting_pid = 0;
-            let proc = crate::process::process_mut(pid);
-            if proc.state == crate::process::ProcessState::Blocked {
-                proc.state = crate::process::ProcessState::Ready;
-                unsafe {
-                    core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+            if let Some(proc) = crate::process::process_mut_if(pid) {
+                if cfg!(feature = "debug") {
+                    debug_marker("wake", pid, proc.state as u64, self.head as u64);
+                }
+                if proc.state == crate::process::ProcessState::Blocked {
+                    proc.state = crate::process::ProcessState::Ready;
+                    unsafe {
+                        core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
+                    }
                 }
             }
         }
@@ -224,6 +262,14 @@ impl Tty {
                 self.tail = (self.tail + 1) % BUF_SIZE;
                 count += 1;
             }
+            if cfg!(feature = "debug") {
+                debug_marker(
+                    "read",
+                    crate::process::current_pid(),
+                    count as u64,
+                    self.waiting_pid,
+                );
+            }
             return count;
         }
 
@@ -234,9 +280,15 @@ impl Tty {
             let proc = crate::process::process_mut(pid);
             proc.state = crate::process::ProcessState::Blocked;
             self.waiting_pid = pid;
+            if cfg!(feature = "debug") {
+                debug_marker("block", pid, self.tail as u64, self.head as u64);
+            }
             unsafe {
                 core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);
             }
+        }
+        if cfg!(feature = "debug") {
+            debug_marker("read", crate::process::current_pid(), 0, self.waiting_pid);
         }
         0
     }
@@ -252,6 +304,24 @@ impl Tty {
 // I/O helper — write bytes to serial without creating a Tty dependency
 //------------------------------------------------------------------------------
 
+fn debug_marker(event: &str, a: u64, b: u64, c: u64) {
+    if !cfg!(feature = "debug") {
+        return;
+    }
+    use core::fmt::Write;
+    let mut serial = crate::serial::SerialPort::new();
+    serial.init();
+    let _ = write!(
+        serial,
+        "DBG tty: t={} event={} a={} b={} c={}\n",
+        crate::pit::get_ticks(),
+        event,
+        a,
+        b,
+        c
+    );
+}
+
 fn serial_write(buf: &[u8]) {
     let mut serial = crate::serial::SerialPort::new();
     for &b in buf {
@@ -265,21 +335,25 @@ fn serial_write(buf: &[u8]) {
 //==============================================================================
 
 pub static TTY_OPS: VnodeOps = VnodeOps {
-    open:    Some(tty_open as VnOpen),
-    close:   Some(tty_close as VnClose),
-    read:    Some(tty_read as VnRead),
-    write:   Some(tty_write as VnWrite),
-    lseek:   None,
+    open: Some(tty_open as VnOpen),
+    close: Some(tty_close as VnClose),
+    read: Some(tty_read as VnRead),
+    write: Some(tty_write as VnWrite),
+    lseek: None,
     readdir: None,
-    ioctl:   Some(tty_ioctl as VnIoctl),
+    ioctl: Some(tty_ioctl as VnIoctl),
 };
 
 //==============================================================================
 // Vnode operation implementations
 //==============================================================================
 
-unsafe fn tty_open(_vnode: *mut Vnode, _flags: u32, _mode: u32) -> i32 { 0 }
-unsafe fn tty_close(_vnode: *mut Vnode) -> i32 { 0 }
+unsafe fn tty_open(_vnode: *mut Vnode, _flags: u32, _mode: u32) -> i32 {
+    0
+}
+unsafe fn tty_close(_vnode: *mut Vnode) -> i32 {
+    0
+}
 
 unsafe fn tty_read(_vnode: *mut Vnode, buf: *mut u8, len: usize, _offset: &mut u64) -> isize {
     let tty = &mut *core::ptr::addr_of_mut!(TTY);
