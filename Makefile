@@ -103,6 +103,22 @@ clean:
 	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true
 
 test_vibit_rust: clean
+	# Build the sibling Rust ELF before staging it, even when no artifact exists yet.
+	@if [ ! -d "$(CURDIR)/../vish" ]; then \
+		echo "ERROR: Rust vish prerequisite is missing: expected sibling checkout at $(CURDIR)/../vish" >&2; \
+		echo "       Provide ../vish with its documented 'elf' target, then rerun: make test_vibit_rust" >&2; \
+		exit 1; \
+	fi
+	@if ! $(MAKE) -C "$(CURDIR)/../vish" elf; then \
+		echo "ERROR: Rust vish prerequisite failed: '$(MAKE) -C ../vish elf'" >&2; \
+		echo "       Install the sibling vish Rust toolchain/dependencies and rerun: make test_vibit_rust" >&2; \
+		exit 1; \
+	fi
+	@if [ ! -s "$(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix" ]; then \
+		echo "ERROR: Rust vish prerequisite produced no non-empty ELF at $(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix" >&2; \
+		echo "       Ensure the sibling 'elf' target produces that path, then rerun: make test_vibit_rust" >&2; \
+		exit 1; \
+	fi
 	# Build the kernel Rust library with DEBUG=1 so the loader diagnostics are present.
 	$(MAKE) DEBUG=1 INIT=vibit
 	# Replace /bin/vish with Rust ELF to test multi-segment ELF scheduling
@@ -118,3 +134,8 @@ test_vibit_rust: clean
 	$(MAKE) DEBUG=1 kernel64_entry.o interrupts.o syscall_entry.o context_switch.o
 	$(MAKE) DEBUG=1 kernel64.elf kernel64.bin boot.o vibix.elf
 	python3 anti_cheat.py && python3 -c "from test_kernel import test_vibit_rust; import sys; sys.exit(0 if test_vibit_rust() else 1)"
+
+# Run the VIBIX-owned synthetic ELF that requires more than 256 pages.
+test_vibit_rust_large: clean
+	$(MAKE) DEBUG=1 INIT=vibit
+	python3 anti_cheat.py && python3 -c "from test_kernel import test_vibit_rust_large; import sys; sys.exit(0 if test_vibit_rust_large() else 1)"
