@@ -474,6 +474,11 @@ fn sched_next() -> u64 {
 /// Returns kernel_rsp of next process to run.
 #[no_mangle]
 pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
+    // Poll input before selecting the next process. A blocked TTY reader
+    // cannot poll its own serial input; tty::poll_input() delivers bytes to
+    // the line discipline and wakes its waiting PID when a line completes.
+    crate::vfs::tty::Tty::poll_input();
+
     let cur_pid = current_pid();
     if cur_pid == 0 {
         // No process yet — don't try to schedule

@@ -2,6 +2,15 @@
 
 ## 2026-08-08
 
+### VIBIX blocked TTY wakeup for VIBIT/vish integration
+
+- Added scheduler-tick TTY input polling so serial/keyboard bytes continue through the existing line discipline after a process blocks in `read()`. Completed input still wakes `waiting_pid`, marks it `Ready`, and requests scheduling; no sibling source was changed.
+- Hardened the bounded vish integration sequence to send `help`, wait for deterministic help output, then send `exit` and verify reaping, respawn, and a third prompt.
+- Files modified: `kernel_rust/src/vfs/tty.rs`, `kernel_rust/src/process.rs`, `test_kernel.py`, `openspec/changes/boot-vibit-to-vish-integration/tasks.md`, `CHANGELOG.md`.
+- Tests: `make clean && make INIT=vibit` passed; bounded integration passed; `make test_vibit` passed anti-cheat plus all VIBIT/PID1, fork/exec, prompt, help output, exit/respawn checks; `make clean && make test` passed anti-cheat plus all 21 required kernel markers. One pre-refinement `make test_vibit` attempt missed help output due sending `help` and `exit` together; the bounded sequence was changed to wait for help output and the final required run passed.
+
+## 2026-08-08
+
 ### VIBIT-to-vish integration implementation (blocked at serial input)
 
 - Updated VIBIX-only `INIT=vibit` staging to build `../vibit` with `all`, build `../vish` with `nasm`, stage only `/sbin/init` and `/bin/vish` through a temporary initramfs tree, and emit actionable prerequisite/output errors.
