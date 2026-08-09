@@ -8,15 +8,42 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C code-model=kernel"
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+
+    - name: Install kernel build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq binutils nasm python3 qemu-kvm qemu-system-x86
+
+    - name: Install stable Rust and kernel target
+      run: |
+        rustup toolchain install stable --profile minimal --no-self-update
+        rustup target add --toolchain stable x86_64-unknown-none
+        rustup run stable rustc --version --verbose
+        rustup target list --installed --toolchain stable | grep -Fx x86_64-unknown-none
+
+    - name: Verify kernel manifest boundary
+      run: |
+        test ! -e Cargo.toml
+        test -f kernel_rust/Cargo.toml
+
+    - name: Build kernel Rust crate
+      working-directory: kernel_rust
+      run: cargo +stable build --target x86_64-unknown-none --release --verbose
+
+    - name: Check kernel Rust crate
+      working-directory: kernel_rust
+      run: cargo +stable check --target x86_64-unknown-none --release --verbose
+
+    - name: Build VIBIX kernel image
+      run: make
+
+    - name: Run VIBIX kernel tests
+      run: make test
