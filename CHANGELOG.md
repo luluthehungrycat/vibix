@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-09
+
+### PR #9 Rust CI workflow implementation
+
+- Updated `.github/workflows/rust.yml` only for this change: installed non-interactive kernel build dependencies, selected stable Rust, installed `x86_64-unknown-none`, asserted the manifest boundary, ran explicit `kernel_rust` Rust build/check steps, and retained root `make` plus `make test` gates.
+- Updated `openspec/changes/fix-rust-ci-workflow/tasks.md`; no kernel source, generated binary, or sibling-repository source changes were made.
+- Results: `cargo +stable metadata --no-deps --format-version 1`, target-aware release `cargo +stable check`, and `RUSTFLAGS='-C code-model=kernel' cargo +stable build` passed; `make test` passed all required checks; `make test_vibit` passed all VIBIT/vish checks; workflow YAML parsing and `git diff --check` passed; strict OpenSpec validation passed with `openspec validate fix-rust-ci-workflow --type change --strict --no-interactive`. The first pushed CI run also exposed the embedded `userspace/initramfs.tar` prerequisite; the workflow now prepares it before the standalone Rust build.
+- `cargo test --manifest-path kernel_rust/Cargo.toml --target x86_64-unknown-none --release --no-run` was evaluated and is unsupported for this no-std staticlib (`can't find crate for test`); the workflow uses target-aware `cargo check` as the Rust test/check boundary and keeps runtime coverage in `make test`.
+
+## 2026-08-08
+
+### Final follow-up validation
+
+- Finalized the three follow-up changes without modifying sibling repositories: deterministic foreground-reader Ctrl-C coverage, the Rust vish ELF prerequisite/probe, and reclaimed ELF provenance metadata with cleanup.
+- Added readiness-aware KVM/TCG retries to `test_vibit_rust`, a test-time synthetic 257-page ELF, and a DEBUG lower-level arena-capacity/cleanup regression. Generated fixtures and binaries remain temporary/ignored.
+- Tests passed: `make clean && make`, `make test`, `make test_vibit`, `make test_vibit_rust`, `make test_vibit_rust_large`, and `make clean && make DEBUG=1`. Relevant OpenSpec validation passed for all three changes; `git diff --check` passed.
+- Limitations: the synthetic ELF is validated through the lower-level arena/loader regression rather than full VIBIT shell handoff; failure-after-partial-map injection remains deferred because no injection mechanism exists; Rust scheduler evidence is global IRQ counting only, not PID/range-correlated.
+
+
+## 2026-08-08
+
+### VIBIX follow-up integration validation
+
+- Verified the three in-scope implementations without modifying sibling source: TTY uses `waiting_pid` for SIGINT, `test_vibit_rust` builds/checks the sibling ELF prerequisite, and `elf::load` uses chunked provenance metadata with rollback.
+- Files reviewed: `kernel_rust/src/vfs/tty.rs`, `kernel_rust/src/elf.rs`, `Makefile`, and `test_kernel.py`; files modified in this validation session: the three OpenSpec task files, `ROADMAP.md`, and `CHANGELOG.md` (existing implementation worktree changes preserved).
+- Tests: clean release build passed; DEBUG build passed; clean release `make test` passed all required markers; strict OpenSpec validation passed for all three changes. `make test_vibit` remains blocked by nondeterministic TTY/scheduler runtime behavior; `make test_vibit_rust` builds the sibling ELF and preserves entry-page provenance but fails before `OK` with only two IRQ observations. No focused standalone TTY test exists.
+- Remaining blockers: deterministic foreground Ctrl-C integration, Rust ELF post-exec entry/scheduling evidence, and >256-page/failure-injection ELF fixtures.
+
+
+## 2026-08-08
+
+### PR #8 follow-up OpenSpec planning
+
+- Created planning changes for foreground-reader Ctrl-C routing, the Rust vish build prerequisite, and scalable ELF page provenance with rollback semantics; no implementation changes were made.
+- Files modified: `ROADMAP.md`, `openspec/changes/fix-tty-sigint-foreground-reader/`, `openspec/changes/build-rust-vish-test-prerequisite/`, `openspec/changes/remove-elf-page-provenance-ceiling/`, `CHANGELOG.md`.
+- Tests: OpenSpec artifact validation pending; no kernel or sibling-repository tests run because this session is planning-only.
+
+
 ## 2026-08-08
 
 ### VIBIX blocked TTY wakeup for VIBIT/vish integration

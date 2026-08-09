@@ -7,20 +7,20 @@
 
 #![no_std]
 
-mod serial;
-mod pmm;
-mod kmm;
-mod interrupts;
-mod multiboot;
-mod pit;
-mod keyboard;
-mod fb;
 mod elf;
+mod fb;
 mod gdt;
-mod syscall;
+mod interrupts;
+mod keyboard;
+mod kmm;
+mod multiboot;
 mod paging;
+mod pit;
+mod pmm;
 mod process;
+mod serial;
 mod signal;
+mod syscall;
 
 mod vfs;
 use core::panic::PanicInfo;
@@ -71,21 +71,43 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Page Table Manager
     paging::test(&mut pmm, &mut serial);
+    if cfg!(feature = "debug") {
+        elf::test_provenance_arena(&mut serial);
+    }
 
     // Framebuffer (Bochs VBE direct programming)
     match fb::init(&mut pmm, &mut serial) {
         Some(fb) => {
             // Draw boot graphics
-            fb.clear(0x00101A);  // dark navy background
+            fb.clear(0x00101A); // dark navy background
             fb.draw_string(24, 20, "VIBIX", 0x00FFAA, Some(0x00101A));
-            fb.draw_string(24, 40, "UNIXoid Kernel (Rust Port)", 0x888888, Some(0x00101A));
+            fb.draw_string(
+                24,
+                40,
+                "UNIXoid Kernel (Rust Port)",
+                0x888888,
+                Some(0x00101A),
+            );
             fb.draw_string(24, 60, "VBE Framebuffer", 0xAAAAAA, Some(0x00101A));
 
             // Draw a test pattern — coloured rectangles
-            let colours = [0xFF0000u32, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF];
+            let colours = [
+                0xFF0000u32,
+                0x00FF00,
+                0x0000FF,
+                0xFFFF00,
+                0xFF00FF,
+                0x00FFFF,
+            ];
             let bar_w = fb.width / 6;
             for i in 0..6 {
-                fb.fill_rect(i * bar_w, fb.height - 32, (i + 1) * bar_w - 1, fb.height - 1, colours[i as usize]);
+                fb.fill_rect(
+                    i * bar_w,
+                    fb.height - 32,
+                    (i + 1) * bar_w - 1,
+                    fb.height - 1,
+                    colours[i as usize],
+                );
             }
 
             serial.writestrs(&["VIBIX: Framebuffer initialised.\n"]);
@@ -95,9 +117,7 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    serial.writestrs(&[
-        "VIBIX: Initialising interrupts...\n",
-    ]);
+    serial.writestrs(&["VIBIX: Initialising interrupts...\n"]);
 
     interrupts::init_interrupts();
     serial.writestrs(&["VIBIX: IDT loaded, PIC remapped.\n"]);
@@ -125,15 +145,17 @@ pub extern "C" fn kernel_main() -> ! {
     syscall::init();
     // Virtual File System
     serial.writestrs(&["VIBIX: Initialising VFS...\n"]);
-    unsafe { vfs::vfs_init(); }
+    unsafe {
+        vfs::vfs_init();
+    }
     serial.writestrs(&["VIBIX: VFS ready.\n"]);
     // Enable interrupts — timer ticks will begin immediately
     serial.writestrs(&["VIBIX: Enabling interrupts.\n"]);
-    unsafe { interrupts::enable_interrupts(); }
+    unsafe {
+        interrupts::enable_interrupts();
+    }
 
-    serial.writestrs(&[
-        "VIBIX: Boot sequence complete — spawning PID 1.\n",
-    ]);
+    serial.writestrs(&["VIBIX: Boot sequence complete — spawning PID 1.\n"]);
 
     // Create the init process
     let init_pid = process::spawn_init(&mut pmm);
@@ -141,7 +163,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Start the scheduler — never returns
     serial.writestrs(&["VIBIX: Starting scheduler...\n"]);
-    unsafe { process::start_scheduler(init_pid); }
+    unsafe {
+        process::start_scheduler(init_pid);
+    }
 }
 
 //------------------------------------------------------------------------------

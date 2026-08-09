@@ -4,18 +4,17 @@
 //! start_scheduler(), scheduler_tick(), sched_next().
 //! Phase 2: idle process (PID 2), fork (8), exec (9), waitpid (10).
 
+use crate::gdt;
 use crate::paging;
 use crate::pmm::PmmAllocator;
-use crate::gdt;
 
 const MAX_PROCS: usize = 64;
-const KERNEL_STACK_SIZE: usize = 12288;  // 12 KB (3 pages)
+const KERNEL_STACK_SIZE: usize = 12288; // 12 KB (3 pages)
 const USER_CODE_ADDR: u64 = 0x2000000;
 const USER_STACK_ADDR: u64 = 0x2002000;
 
-
 /// BRK start address (shared constant for per-process brk)
-pub const BRK_START: u64 = 0x500_0000;  // Start well above ELF stack (0x2010000) and flat binary stack
+pub const BRK_START: u64 = 0x500_0000; // Start well above ELF stack (0x2010000) and flat binary stack
 pub const BRK_MAX: u64 = 0x1000_0000;
 // SIGINT constant moved to signal.rs (crate::signal::SIGINT)
 pub const WNOHANG: u64 = 1;
@@ -23,17 +22,19 @@ pub const WNOHANG: u64 = 1;
 /// Idle process entry — runs in kernel mode, halts forever.
 extern "C" fn idle_entry() -> ! {
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum ProcessState {
-    Ready   = 0,
+    Ready = 0,
     Running = 1,
     Blocked = 2,
-    Zombie  = 3,
+    Zombie = 3,
 }
 
 #[repr(C)]
@@ -52,7 +53,7 @@ pub struct Process {
     pub wait_for_pid: u64,
     pub brk: u64,
     pub errno: i64,
-    pub sig_pending: u64,    // bitmask: bit N = signal N pending
+    pub sig_pending: u64, // bitmask: bit N = signal N pending
     pub sigactions: [crate::signal::SigAction; 32],
     pub in_signal: bool,
     pub sigframe_rsp: u64,
@@ -104,7 +105,9 @@ pub fn current_pid() -> u64 {
 }
 
 fn set_current_pid(pid: u64) {
-    unsafe { CURRENT_PID = pid; }
+    unsafe {
+        CURRENT_PID = pid;
+    }
 }
 
 pub fn process(pid: u64) -> &'static Process {
@@ -133,8 +136,27 @@ pub fn process_mut(pid: u64) -> &'static mut Process {
     }
 }
 
+/// Return a live process for optional ownership lookups.
+///
+/// Unlike `process_mut`, this is safe for stale PID references held by
+/// subsystems such as the TTY line discipline.
+pub fn process_mut_if(pid: u64) -> Option<&'static mut Process> {
+    unsafe {
+        for slot in &mut PROCESS_TABLE.slots {
+            if let Some(p) = slot {
+                if p.pid == pid {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+}
+
 pub fn set_syscall_kstack(rsp: u64) {
-    unsafe { current_proc_kernel_rsp = rsp; }
+    unsafe {
+        current_proc_kernel_rsp = rsp;
+    }
 }
 
 // --- Frame builder ---
@@ -148,47 +170,42 @@ pub fn set_syscall_kstack(rsp: u64) {
 ///                 RIP, CS=0x23, RFLAGS=0x202, user_RSP, SS=0x1B]
 ///
 /// Returns kernel_rsp (pointer to RAX slot).
-fn build_init_frame(
-    kernel_stack_top: u64,
-    user_entry: u64,
-    user_rsp: u64,
-    command_id: u64,
-) -> u64 {
+fn build_init_frame(kernel_stack_top: u64, user_entry: u64, user_rsp: u64, command_id: u64) -> u64 {
     unsafe {
         let ptr = kernel_stack_top as *mut u64;
 
         // Build frame from HIGH address downward (last pushed = lowest addr).
         // iretq frame (highest addresses — popped last by iretq)
-        ptr.sub(1).write(0x1Bu64);                 // SS
-        ptr.sub(2).write(user_rsp);                // user RSP
-        ptr.sub(3).write(0x202u64);                // RFLAGS (IF enabled)
-        ptr.sub(4).write(0x23u64);                 // CS (user code | 3)
-        ptr.sub(5).write(user_entry);              // RIP
+        ptr.sub(1).write(0x1Bu64); // SS
+        ptr.sub(2).write(user_rsp); // user RSP
+        ptr.sub(3).write(0x202u64); // RFLAGS (IF enabled)
+        ptr.sub(4).write(0x23u64); // CS (user code | 3)
+        ptr.sub(5).write(user_entry); // RIP
 
         // int_no + err_code
-        ptr.sub(6).write(0u64);                    // err_code (dummy)
-        ptr.sub(7).write(0u64);                    // int_no
+        ptr.sub(6).write(0u64); // err_code (dummy)
+        ptr.sub(7).write(0u64); // int_no
 
         // GPRs — written high-to-low: R15 is at top-64 (highest),
         // RAX is at top-176 (lowest = kernel_rsp).
         // This matches the order in context_switch.asm which pops rax first.
-        ptr.sub(8).write(0u64);                    // R15
-        ptr.sub(9).write(0u64);                    // R14
-        ptr.sub(10).write(0u64);                   // R13
-        ptr.sub(11).write(0u64);                   // R12
-        ptr.sub(12).write(0u64);                   // R11
-        ptr.sub(13).write(0u64);                   // R10
-        ptr.sub(14).write(0u64);                   // R9
-        ptr.sub(15).write(0u64);                   // R8
-        ptr.sub(16).write(command_id);             // RDI = command selector
-        ptr.sub(17).write(0u64);                   // RSI
-        ptr.sub(18).write(0u64);                   // RBP
-        ptr.sub(19).write(0u64);                   // RBX
-        ptr.sub(20).write(0u64);                   // RDX
-        ptr.sub(21).write(0u64);                   // RCX
-        ptr.sub(22).write(0u64);                   // RAX
+        ptr.sub(8).write(0u64); // R15
+        ptr.sub(9).write(0u64); // R14
+        ptr.sub(10).write(0u64); // R13
+        ptr.sub(11).write(0u64); // R12
+        ptr.sub(12).write(0u64); // R11
+        ptr.sub(13).write(0u64); // R10
+        ptr.sub(14).write(0u64); // R9
+        ptr.sub(15).write(0u64); // R8
+        ptr.sub(16).write(command_id); // RDI = command selector
+        ptr.sub(17).write(0u64); // RSI
+        ptr.sub(18).write(0u64); // RBP
+        ptr.sub(19).write(0u64); // RBX
+        ptr.sub(20).write(0u64); // RDX
+        ptr.sub(21).write(0u64); // RCX
+        ptr.sub(22).write(0u64); // RAX
 
-        ptr.sub(22) as u64   // = kernel_rsp (points at RAX)
+        ptr.sub(22) as u64 // = kernel_rsp (points at RAX)
     }
 }
 
@@ -200,39 +217,38 @@ fn build_fork_frame(kstack_top: u64) -> u64 {
         let ptr = kstack_top as *mut u64;
 
         // iretq frame (highest addresses)
-        ptr.sub(1).write(0x1Bu64);                        // SS
-        ptr.sub(2).write(syscall_state.rsp);               // user RSP
-        ptr.sub(3).write(0x202u64);                        // RFLAGS (IF=1)
-        ptr.sub(4).write(0x23u64);                         // CS (user code | 3)
-        ptr.sub(5).write(syscall_state.rip);               // RIP (after fork)
+        ptr.sub(1).write(0x1Bu64); // SS
+        ptr.sub(2).write(syscall_state.rsp); // user RSP
+        ptr.sub(3).write(0x202u64); // RFLAGS (IF=1)
+        ptr.sub(4).write(0x23u64); // CS (user code | 3)
+        ptr.sub(5).write(syscall_state.rip); // RIP (after fork)
 
         // int_no + err_code
-        ptr.sub(6).write(0u64);                            // err_code (dummy)
-        ptr.sub(7).write(0u64);                            // int_no
+        ptr.sub(6).write(0u64); // err_code (dummy)
+        ptr.sub(7).write(0u64); // int_no
 
         // GPRs — written high-to-low
-        ptr.sub(8).write(0u64);                            // R15
-        ptr.sub(9).write(0u64);                            // R14
-        ptr.sub(10).write(0u64);                           // R13
-        ptr.sub(11).write(0u64);                           // R12
-        ptr.sub(12).write(0u64);                           // R11
-        ptr.sub(13).write(0u64);                           // R10
-        ptr.sub(14).write(0u64);                           // R9
-        ptr.sub(15).write(0u64);                           // R8
-        ptr.sub(16).write(0u64);                           // RDI
-        ptr.sub(17).write(0u64);                           // RSI
-        ptr.sub(18).write(0u64);                           // RBP
-        ptr.sub(19).write(0u64);                           // RBX
-        ptr.sub(20).write(0u64);                           // RDX
-        ptr.sub(21).write(0u64);                           // RCX
-        ptr.sub(22).write(0u64);                           // RAX = 0 (child gets 0)
+        ptr.sub(8).write(0u64); // R15
+        ptr.sub(9).write(0u64); // R14
+        ptr.sub(10).write(0u64); // R13
+        ptr.sub(11).write(0u64); // R12
+        ptr.sub(12).write(0u64); // R11
+        ptr.sub(13).write(0u64); // R10
+        ptr.sub(14).write(0u64); // R9
+        ptr.sub(15).write(0u64); // R8
+        ptr.sub(16).write(0u64); // RDI
+        ptr.sub(17).write(0u64); // RSI
+        ptr.sub(18).write(0u64); // RBP
+        ptr.sub(19).write(0u64); // RBX
+        ptr.sub(20).write(0u64); // RDX
+        ptr.sub(21).write(0u64); // RCX
+        ptr.sub(22).write(0u64); // RAX = 0 (child gets 0)
 
-        ptr.sub(22) as u64  // kernel_rsp = address of RAX slot
+        ptr.sub(22) as u64 // kernel_rsp = address of RAX slot
     }
 }
 
 // --- Binary loader ---
-
 
 /// Load a flat binary from a raw data pointer to user pages.
 /// Maps pages at USER_CODE_ADDR (code) and USER_STACK_ADDR (stack).
@@ -245,23 +261,25 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator, pm
     // Allocate enough pages for the binary (minimum 2 like before)
     let min_pages = 2;
     let pages_needed = (size + 0xfff) / 0x1000;
-    let pages = if pages_needed < min_pages { min_pages } else { pages_needed };
+    let pages = if pages_needed < min_pages {
+        min_pages
+    } else {
+        pages_needed
+    };
 
     for _ in 0..pages {
         let page = pmm.alloc();
         if page.is_null() {
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
         let copy_len = min(bytes_left, 0x1000);
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.add(src_offset),
-                page,
-                copy_len,
-            );
+            core::ptr::copy_nonoverlapping(data.add(src_offset), page, copy_len);
         }
         paging::map_4k_target(virt_addr, page as u64, paging::PAGE_USER_RW, pmm, pml4_phys);
-        paging::invlpg(virt_addr);  // Flush TLB for this page
+        paging::invlpg(virt_addr); // Flush TLB for this page
         src_offset += 0x1000;
         virt_addr += 0x1000;
         bytes_left = bytes_left.saturating_sub(0x1000);
@@ -270,10 +288,18 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator, pm
     // Allocate and map stack page
     let stack_page = pmm.alloc();
     if stack_page.is_null() {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
-    paging::map_4k_target(USER_STACK_ADDR, stack_page as u64, paging::PAGE_USER_RW, pmm, pml4_phys);
-    paging::invlpg(USER_STACK_ADDR);  // Flush TLB for stack page
+    paging::map_4k_target(
+        USER_STACK_ADDR,
+        stack_page as u64,
+        paging::PAGE_USER_RW,
+        pmm,
+        pml4_phys,
+    );
+    paging::invlpg(USER_STACK_ADDR); // Flush TLB for stack page
 }
 
 // --- Init process + idle process ---
@@ -285,18 +311,42 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     let pid1_pml4 = crate::paging::create_pml4(pmm, false);
 
     // Load PID 1 binary from initramfs via VFS
-    if let Ok(vn) = crate::vfs::vfs_resolve(b"/sbin/init") {
-        let data = vn.data as *const u8;
-        let size = vn.size as usize;
-        if !data.is_null() && size > 0 {
-            load_flat_binary(data, size, pmm, pid1_pml4);
+    match crate::vfs::vfs_resolve(b"/sbin/init") {
+        Ok(vn) => {
+            let data = vn.data as *const u8;
+            let size = vn.size as usize;
+            if !data.is_null() && size > 0 {
+                load_flat_binary(data, size, pmm, pid1_pml4);
+                if cfg!(feature = "debug") {
+                    paging::debug_dump_walk(
+                        "after spawn_init flat load",
+                        USER_CODE_ADDR,
+                        pid1_pml4,
+                    );
+                }
+            } else if cfg!(feature = "debug") {
+                let mut serial = crate::serial::SerialPort::new();
+                serial.init();
+                serial.writestrs(&["DBG INIT: /sbin/init has null data or zero size\n"]);
+            }
         }
+        Err(_) if cfg!(feature = "debug") => {
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            serial.writestrs(&["DBG INIT: vfs_resolve(/sbin/init) failed\n"]);
+        }
+        Err(_) => {}
+    }
+    if cfg!(feature = "debug") {
+        paging::debug_dump_walk("spawn_init final", USER_CODE_ADDR, pid1_pml4);
     }
 
     let kstack_page = pmm.alloc_pages(3);
 
     if kstack_page.is_null() {
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
     let ktop = kstack_page as u64 + KERNEL_STACK_SIZE as u64;
     // Build synthetic frame with command_id=1 (init_demo, not shell)
@@ -326,10 +376,13 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             let mut n = [0u8; 32];
             let bytes = b"init\0";
             let mut i = 0;
-            while i < bytes.len() { n[i] = bytes[i]; i += 1; }
+            while i < bytes.len() {
+                n[i] = bytes[i];
+                i += 1;
+            }
             n
         },
-            fd_table: crate::vfs::FdTable::new(),
+        fd_table: crate::vfs::FdTable::new(),
         cwd: {
             let mut c = [0u8; 256];
             c[0] = b'/';
@@ -342,11 +395,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     // Set up fd 0/1/2 for init — all point to /dev/ttyS0
     unsafe {
         let tty_vnode = crate::vfs::devfs::devfs_get_vnode(crate::vfs::devfs::DevId::TtyS0);
-        let oft_idx = crate::vfs::open_file::oft_alloc(
-            tty_vnode,
-            crate::vfs::O_RDWR,
-            0o666,
-        );
+        let oft_idx = crate::vfs::open_file::oft_alloc(tty_vnode, crate::vfs::O_RDWR, 0o666);
         match oft_idx {
             Ok(idx) => {
                 // All three fds share the same OpenFile entry (same offset)
@@ -368,7 +417,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     let idle_kstack = pmm.alloc_pages(3);
     if idle_kstack.is_null() {
         // No memory for idle stack — halt (should never happen)
-        loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+        loop {
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack));
+            }
+        }
     }
     let idle_ktop = idle_kstack as u64 + KERNEL_STACK_SIZE as u64;
 
@@ -383,8 +436,11 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         use core::fmt::Write;
         let mut serial = crate::serial::SerialPort::new();
         serial.init();
-        let _ = write!(serial, "VIBIX: idle kstack_base={:016X} ktop={:016X} krsp={:016X} entry={:016X}\n",
-            idle_kstack as u64, idle_ktop, idle_krsp, idle_entry as *const () as u64);
+        let _ = write!(
+            serial,
+            "VIBIX: idle kstack_base={:016X} ktop={:016X} krsp={:016X} entry={:016X}\n",
+            idle_kstack as u64, idle_ktop, idle_krsp, idle_entry as *const () as u64
+        );
     }
     // Override CS and SS for kernel-mode return (CPL=0).
     // In 64-bit mode, iretq ALWAYS pops SS:RSP even for same-level returns,
@@ -392,8 +448,8 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     unsafe {
         let ptr = idle_krsp as *mut u64;
         // Offsets: RAX=0, ..., RIP=136, CS=144, RFLAGS=152, RSP=160, SS=168
-        *ptr.add(144/8) = 0x08;  // CS = kernel code segment (CPL=0)
-        *ptr.add(168/8) = 0x10;  // SS = kernel data segment (CPL=0)
+        *ptr.add(144 / 8) = 0x08; // CS = kernel code segment (CPL=0)
+        *ptr.add(168 / 8) = 0x10; // SS = kernel data segment (CPL=0)
     }
 
     // Create idle PML4 — kernel mappings only
@@ -421,10 +477,13 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
             let mut n = [0u8; 32];
             let bytes = b"idle\0";
             let mut i = 0;
-            while i < bytes.len() { n[i] = bytes[i]; i += 1; }
+            while i < bytes.len() {
+                n[i] = bytes[i];
+                i += 1;
+            }
             n
         },
-            fd_table: crate::vfs::FdTable::new(),
+        fd_table: crate::vfs::FdTable::new(),
         cwd: {
             let mut c = [0u8; 256];
             c[0] = b'/';
@@ -443,9 +502,11 @@ fn sched_next() -> u64 {
     let cur = current_pid();
     let table = unsafe { &PROCESS_TABLE };
 
-    let start = table.slots.iter().position(|s| {
-        s.as_ref().map_or(false, |p| p.pid == cur)
-    }).unwrap_or(0);
+    let start = table
+        .slots
+        .iter()
+        .position(|s| s.as_ref().map_or(false, |p| p.pid == cur))
+        .unwrap_or(0);
 
     // First pass: look for any Ready process that isn't idle
     for offset in 1..MAX_PROCS {
@@ -466,7 +527,7 @@ fn sched_next() -> u64 {
         }
     }
 
-    cur  // nothing ready (shouldn't happen with idle alive)
+    cur // nothing ready (shouldn't happen with idle alive)
 }
 
 /// Called from irq_common after EOI. Interrupts disabled.
@@ -490,25 +551,62 @@ pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
 
     loop {
         let next_pid = sched_next();
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(
+                serial,
+                "DBG sched: t={} cur={} next={}\n",
+                crate::pit::get_ticks(),
+                current_pid(),
+                next_pid
+            );
+        }
         set_current_pid(next_pid);
 
         // Check if next process is runnable (immutable borrow)
         {
             let next = process(next_pid);
             if next.state != ProcessState::Ready {
-                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+                loop {
+                    unsafe {
+                        core::arch::asm!("hlt", options(nomem, nostack));
+                    }
+                }
             }
         }
 
         // Set up resources for the selected process
-        unsafe { gdt::set_rsp0(process(next_pid).kernel_stack_top); }
+        unsafe {
+            gdt::set_rsp0(process(next_pid).kernel_stack_top);
+        }
         set_syscall_kstack(process(next_pid).kernel_stack_top);
-        unsafe { crate::paging::write_cr3(process(next_pid).pml4_phys); }
+        unsafe {
+            crate::paging::write_cr3(process(next_pid).pml4_phys);
+        }
+
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let next = process(next_pid);
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(
+                serial,
+                "DBG sched restore: pid={} state={:?} cr3={:016x} pml4={:016x} krsp={:016x}\n",
+                next_pid,
+                next.state,
+                crate::paging::read_cr3(),
+                next.pml4_phys,
+                next.kernel_rsp
+            );
+        }
 
         // Deliver pending signals (modifies iretq frame, may kill process)
         let krsp = process(next_pid).kernel_rsp;
         let mut process_killed = false;
-        let final_krsp = crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
+        let final_krsp =
+            crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
 
         if process_killed {
             // Process was terminated by signal — re-select
@@ -520,10 +618,15 @@ pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
             use core::fmt::Write;
             let mut serial = crate::serial::SerialPort::new();
             serial.init();
-            let _ = write!(serial, "DBG tick: pid={} krsp={:016x}\n", next_pid, final_krsp);
+            let _ = write!(
+                serial,
+                "DBG tick: pid={} krsp={:016x}\n",
+                next_pid, final_krsp
+            );
             for i in 0..22 {
                 let off = i * 8;
-                let val: u64 = unsafe { core::ptr::read_volatile((final_krsp + off) as *const u64) };
+                let val: u64 =
+                    unsafe { core::ptr::read_volatile((final_krsp + off) as *const u64) };
                 let _ = write!(serial, "DBG tick:  [{:3}]: {:016x}\n", off, val);
             }
         }
@@ -546,7 +649,11 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
         use core::fmt::Write;
         let mut serial = crate::serial::SerialPort::new();
         serial.init();
-        let _ = write!(serial, "DBG sw_exit: pid={} saved_krsp={:016x}\n", cur_pid, current_rsp);
+        let _ = write!(
+            serial,
+            "DBG sw_exit: pid={} saved_krsp={:016x}\n",
+            cur_pid, current_rsp
+        );
     }
 
     // state already set by handler (e.g. Zombie for exit, Blocked for blocked I/O)
@@ -558,25 +665,62 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
 
     loop {
         let next_pid = sched_next();
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(
+                serial,
+                "DBG sched: t={} cur={} next={}\n",
+                crate::pit::get_ticks(),
+                current_pid(),
+                next_pid
+            );
+        }
         set_current_pid(next_pid);
 
         // Check if next process is runnable
         {
             let next = process(next_pid);
             if next.state != ProcessState::Ready {
-                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+                loop {
+                    unsafe {
+                        core::arch::asm!("hlt", options(nomem, nostack));
+                    }
+                }
             }
         }
 
         // Set up resources for the selected process
-        unsafe { gdt::set_rsp0(process(next_pid).kernel_stack_top); }
+        unsafe {
+            gdt::set_rsp0(process(next_pid).kernel_stack_top);
+        }
         set_syscall_kstack(process(next_pid).kernel_stack_top);
-        unsafe { crate::paging::write_cr3(process(next_pid).pml4_phys); }
+        unsafe {
+            crate::paging::write_cr3(process(next_pid).pml4_phys);
+        }
+
+        if cfg!(feature = "debug") {
+            use core::fmt::Write;
+            let next = process(next_pid);
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            let _ = write!(
+                serial,
+                "DBG sched restore: pid={} state={:?} cr3={:016x} pml4={:016x} krsp={:016x}\n",
+                next_pid,
+                next.state,
+                crate::paging::read_cr3(),
+                next.pml4_phys,
+                next.kernel_rsp
+            );
+        }
 
         // Deliver pending signals (may kill process or modify iretq frame)
         let krsp = process(next_pid).kernel_rsp;
         let mut process_killed = false;
-        let final_krsp = crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
+        let final_krsp =
+            crate::signal::deliver_pending_signals(next_pid, krsp, &mut process_killed);
 
         if process_killed {
             // Process terminated by signal — re-select
@@ -627,9 +771,7 @@ pub fn sys_fork() -> i64 {
     };
 
     // Find free slot
-    let free_slot = unsafe {
-        PROCESS_TABLE.slots.iter_mut().position(|s| s.is_none())
-    };
+    let free_slot = unsafe { PROCESS_TABLE.slots.iter_mut().position(|s| s.is_none()) };
 
     match free_slot {
         Some(idx) => {
@@ -639,7 +781,7 @@ pub fn sys_fork() -> i64 {
                     pml4_phys: child_pml4,
                     state: ProcessState::Ready,
                     entry: parent.entry,
-                    user_rsp: syscall_state.rsp,  // use saved syscall RSP
+                    user_rsp: syscall_state.rsp, // use saved syscall RSP
                     kernel_stack_top: child_ktop,
                     kernel_rsp: child_krsp,
                     kernel_stack_base: child_base,
@@ -657,7 +799,10 @@ pub fn sys_fork() -> i64 {
                         let mut n = [0u8; 32];
                         let bytes = b"forked\0";
                         let mut i = 0;
-                        while i < bytes.len() { n[i] = bytes[i]; i += 1; }
+                        while i < bytes.len() {
+                            n[i] = bytes[i];
+                            i += 1;
+                        }
                         n
                     },
                     fd_table: parent.fd_table,
@@ -685,6 +830,13 @@ pub fn sys_fork() -> i64 {
 pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     let pid = current_pid();
     let proc = process_mut(pid);
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let (saved_rip, saved_rsp) = unsafe { (syscall_state.rip, syscall_state.rsp) };
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "DBG EXEC BEGIN: pid={} state={:?} cr3={:016x} pml4={:016x} rip={:016x} rsp={:016x} krsp={:016x}\n", pid, proc.state, crate::paging::read_cr3(), proc.pml4_phys, saved_rip, saved_rsp, proc.kernel_rsp);
+    }
 
     // 1. Copy path string from user space
     let path_buf = unsafe {
@@ -693,7 +845,10 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             Err(e) => return -e as i64,
         }
     };
-    let path_len = path_buf.iter().position(|&b| b == 0).unwrap_or(crate::vfs::PATH_MAX);
+    let path_len = path_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(crate::vfs::PATH_MAX);
     let path_slice = &path_buf[..path_len];
 
     // 2. Resolve path through VFS
@@ -709,6 +864,22 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         return -2; // ENOENT
     }
 
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "DBG EXEC: path=");
+        for &byte in path_slice {
+            serial.writestrs(&[core::str::from_utf8(&[byte]).unwrap_or("?")]);
+        }
+        let magic = unsafe { core::slice::from_raw_parts(data, core::cmp::min(size, 4)) };
+        let _ = write!(serial, " size={} magic=", size);
+        for &byte in magic {
+            let _ = write!(serial, "{:02x}", byte);
+        }
+        serial.writestrs(&["\n"]);
+    }
+
     let pmm = crate::pmm::global_pmm();
 
     // 4. Check for ELF magic and dispatch accordingly
@@ -722,25 +893,77 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             let data_slice = core::slice::from_raw_parts(data, size);
             match crate::elf::load(data_slice, pmm, proc.pml4_phys) {
                 Ok(ep) => {
+                    if cfg!(feature = "debug") {
+                        use core::fmt::Write;
+                        let mut serial = crate::serial::SerialPort::new();
+                        serial.init();
+                        let _ = write!(
+                            serial,
+                            "DBG EXEC LOADED: pid={} cr3={:016x} pml4={:016x} entry={:016x}\n",
+                            pid,
+                            crate::paging::read_cr3(),
+                            proc.pml4_phys,
+                            ep
+                        );
+                    }
                     // ELF loader maps segments but NOT the user stack.
                     // Use a larger stack (64 KiB, 16 pages) starting at 0x2020000
                     // (top) growing down to accommodate Rust's format! and allocator calls.
                     const ELF_STACK_PAGES: u64 = 16;
                     const ELF_STACK_TOP_PAGE: u64 = 0x2020000;
                     let mut page_addr = ELF_STACK_TOP_PAGE;
-                    for _ in 0..ELF_STACK_PAGES {
+                    for stack_index in 0..ELF_STACK_PAGES {
+                        if cfg!(feature = "debug") {
+                            use core::fmt::Write;
+                            let mut serial = crate::serial::SerialPort::new();
+                            serial.init();
+                            let _ = write!(
+                                serial,
+                                "DBG EXEC STACK PAGE: pid={} index={} vaddr={:016x} before_alloc\n",
+                                pid, stack_index, page_addr
+                            );
+                        }
                         let sp = pmm.alloc();
-                        if sp.is_null() { return -12; }
+                        if sp.is_null() {
+                            return -12;
+                        }
+                        if cfg!(feature = "debug") {
+                            use core::fmt::Write;
+                            let mut serial = crate::serial::SerialPort::new();
+                            serial.init();
+                            let _ = write!(
+                                serial,
+                                "DBG EXEC STACK PAGE: pid={} index={} paddr={:016x} before_map\n",
+                                pid, stack_index, sp as u64
+                            );
+                        }
                         crate::paging::map_4k(
                             page_addr,
                             sp as u64,
                             crate::paging::PAGE_USER_RW,
                             pmm,
                         );
+                        if cfg!(feature = "debug") {
+                            use core::fmt::Write;
+                            let mut serial = crate::serial::SerialPort::new();
+                            serial.init();
+                            let _ = write!(
+                                serial,
+                                "DBG EXEC STACK PAGE: pid={} index={} vaddr={:016x} after_map\n",
+                                pid, stack_index, page_addr
+                            );
+                        }
                         paging::invlpg(page_addr);
                         page_addr -= 0x1000;
                     }
                     elf_user_rsp = ELF_STACK_TOP_PAGE + 0x1000;
+                    if cfg!(feature = "debug") {
+                        use core::fmt::Write;
+                        let mut serial = crate::serial::SerialPort::new();
+                        serial.init();
+                        let _ = write!(serial, "DBG EXEC STACK: pid={} cr3={:016x} pml4={:016x} entry={:016x} rsp={:016x}\n", pid, crate::paging::read_cr3(), proc.pml4_phys, ep, elf_user_rsp);
+                        paging::debug_dump_walk("after exec ELF stack", 0x2000000, proc.pml4_phys);
+                    }
                     entry = ep;
                     is_elf = true;
                 }
@@ -751,8 +974,8 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
                         | crate::elf::ElfError::BadEndian
                         | crate::elf::ElfError::BadMachine
                         | crate::elf::ElfError::BadType
-                        | crate::elf::ElfError::Truncated => -22,  // EINVAL
-                        crate::elf::ElfError::Oom => -12,           // ENOMEM
+                        | crate::elf::ElfError::Truncated => -22, // EINVAL
+                        crate::elf::ElfError::Oom | crate::elf::ElfError::MetadataOom => -12, // ENOMEM
                     };
                 }
             }
@@ -767,7 +990,11 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     // 5. Update syscall_state with new entry point and stack
     // ELF binaries use computed stack; flat binaries use USER_STACK_ADDR.
     unsafe {
-        let user_rsp = if is_elf { elf_user_rsp } else { USER_STACK_ADDR + 0x1000 };
+        let user_rsp = if is_elf {
+            elf_user_rsp
+        } else {
+            USER_STACK_ADDR + 0x1000
+        };
         core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
         core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
         core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
@@ -775,13 +1002,22 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 
     proc.brk = BRK_START;
     proc.errno = 0;
-    proc.sig_pending = 0;  // fresh signal state for new program
+    proc.sig_pending = 0; // fresh signal state for new program
     proc.in_signal = false;
     proc.sigframe_rsp = 0;
     proc.stack_low = if is_elf { 0x2010000 } else { USER_STACK_ADDR };
     // Reset all sigactions to SIG_DFL for the new program image
     for i in 0..32 {
         proc.sigactions[i] = Default::default();
+    }
+
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let (new_rip, new_rsp, new_rflags) =
+            unsafe { (syscall_state.rip, syscall_state.rsp, syscall_state.rflags) };
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "DBG EXEC STATE: pid={} state={:?} new_rip={:016x} new_rsp={:016x} flags={:016x} cr3={:016x} pml4={:016x} kernel_rsp={:016x}\n", pid, proc.state, new_rip, new_rsp, new_rflags, crate::paging::read_cr3(), proc.pml4_phys, proc.kernel_rsp);
     }
 
     // 6. Close all fds except 0/1/2 on exec
@@ -791,6 +1027,13 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             proc.fd_table.fds[fd] = -1;
             crate::vfs::open_file::oft_decref(oft_idx as usize);
         }
+    }
+    if cfg!(feature = "debug") {
+        use core::fmt::Write;
+        let (end_rip, end_rsp) = unsafe { (syscall_state.rip, syscall_state.rsp) };
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = write!(serial, "DBG EXEC END: pid={} state={:?} rip={:016x} rsp={:016x} cr3={:016x} pml4={:016x} kernel_rsp={:016x}\n", pid, proc.state, end_rip, end_rsp, crate::paging::read_cr3(), proc.pml4_phys, proc.kernel_rsp);
     }
     0
 }
@@ -825,20 +1068,24 @@ pub fn sys_waitpid(requested_pid: i64, wstatus: u64, flags: u64) -> i64 {
         Some((pid, ProcessState::Zombie)) => {
             // Reap child
             if wstatus != 0 {
-                unsafe { *(wstatus as *mut u64) = process(pid).exit_code; }
+                unsafe {
+                    *(wstatus as *mut u64) = process(pid).exit_code;
+                }
             }
             pid as i64
         }
         Some((pid, _)) => {
             // Child still running
             if flags & WNOHANG != 0 {
-                return 0;  // Non-blocking: return 0 immediately
+                return 0; // Non-blocking: return 0 immediately
             }
             // Block parent until child exits
             let cur = process_mut(cur_pid);
             cur.wait_for_pid = pid;
             cur.state = ProcessState::Blocked;
-            unsafe { should_schedule = 1; }
+            unsafe {
+                should_schedule = 1;
+            }
             -1
         }
         None => -1, // No matching child
@@ -859,7 +1106,6 @@ pub unsafe fn start_scheduler(init_pid: u64) -> ! {
         context_switch_to(proc.kernel_rsp)
     }
 }
-
 
 /// Clean up all file descriptors for a process.
 /// Should be called on process exit (e.g. from sys_exit) to release all OFT references.
