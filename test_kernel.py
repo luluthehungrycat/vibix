@@ -365,6 +365,205 @@ def _run_bounded_qemu(serial_path, accelerators, attempts=2):
     return best
 
 
+RUST_SCHED_REQUIRED_ROUND_TRIPS = 3
+RUST_SCHED_PREFIX = "DBG RUSTSCHED "
+
+
+def _parse_scheduler_fields(payload):
+    fields = {}
+    for token in payload.split():
+        if "=" not in token:
+            raise ValueError(f"malformed scheduler token: {token!r}")
+        key, value = token.split("=", 1)
+        if not key or key in fields:
+            raise ValueError(f"duplicate/empty scheduler field: {key!r}")
+        if value.startswith("0x"):
+            fields[key] = int(value, 16)
+        elif value.isdigit():
+            fields[key] = int(value, 10)
+        else:
+            fields[key] = value
+    return fields
+
+
+def _is_canonical_user_address(value):
+    if not isinstance(value, int) or value == 0 or value >= (1 << 64):
+        return False
+    upper = value >> 48
+    sign = (value >> 47) & 1
+    return upper == (0xffff if sign else 0)
+
+
+def _validate_scheduler_frame(fields, target, label, require_kernel_rsp=False):
+    required = {"pid", "cr3", "rip", "cs", "ss", "rflags", "rsp"}
+    missing = sorted(required - fields.keys())
+    if missing:
+        return f"{label} missing fields: {', '.join(missing)}"
+    if fields["pid"] != target["pid"]:
+        return f"{label} PID mismatch: {fields['pid']} != {target['pid']}"
+    if fields["cr3"] != target["cr3"]:
+        return f"{label} CR3 mismatch: 0x{fields['cr3']:x} != 0x{target['cr3']:x}"
+    if not target["rip_lo"] <= fields["rip"] < target["rip_hi"]:
+        return f"{label} RIP outside target range: 0x{fields['rip']:x}"
+    if fields["cs"] != 0x23 or fields["ss"] != 0x1B:
+        return f"{label} user selectors invalid: cs=0x{fields['cs']:x} ss=0x{fields['ss']:x}"
+    if fields["rflags"] & 0x200 == 0:
+        return f"{label} IF flag missing: 0x{fields['rflags']:x}"
+    if not _is_canonical_user_address(fields["rsp"]):
+        return f"{label} user RSP invalid: 0x{fields['rsp']:x}"
+    if require_kernel_rsp:
+        if "krsp" not in fields or not _is_canonical_user_address(fields["krsp"]):
+            return f"{label} kernel frame pointer invalid"
+    return None
+
+
+def _check_rust_elf_scheduler_evidence(serial_output, required_round_trips=RUST_SCHED_REQUIRED_ROUND_TRIPS):
+    """Validate PID/CR3/RIP-correlated Rust ELF scheduler round trips."""
+    target = None
+    events = []
+    parse_errors = []
+    for line in serial_output.splitlines():
+        if line.startswith(f"{RUST_SCHED_PREFIX}TARGET "):
+            try:
+                parsed = _parse_scheduler_fields(line[len(f"{RUST_SCHED_PREFIX}TARGET "):])
+            except ValueError as exc:
+                parse_errors.append(str(exc))
+                continue
+            if target is not None:
+                parse_errors.append("duplicate Rust scheduler target record")
+            target = parsed
+        elif line.startswith(f"{RUST_SCHED_PREFIX}TARGET_") or line.startswith(f"{RUST_SCHED_PREFIX}CONFLICT"):
+            parse_errors.append(f"invalid Rust scheduler target record: {line}")
+        elif line.startswith(f"{RUST_SCHED_PREFIX}IN "):
+            kind = "IN"
+            payload = line[len(f"{RUST_SCHED_PREFIX}IN "):]
+            try:
+                events.append((kind, _parse_scheduler_fields(payload)))
+            except ValueError as exc:
+                parse_errors.append(str(exc))
+        elif line.startswith(f"{RUST_SCHED_PREFIX}OUT "):
+            kind = "OUT"
+            payload = line[len(f"{RUST_SCHED_PREFIX}OUT "):]
+            try:
+                events.append((kind, _parse_scheduler_fields(payload)))
+            except ValueError as exc:
+                parse_errors.append(str(exc))
+        elif line.startswith(f"{RUST_SCHED_PREFIX}USER "):
+            kind = "USER"
+            payload = line[len(f"{RUST_SCHED_PREFIX}USER "):]
+            try:
+                events.append((kind, _parse_scheduler_fields(payload)))
+            except ValueError as exc:
+                parse_errors.append(str(exc))
+
+    if target is None:
+        parse_errors.append("missing Rust scheduler target record")
+    else:
+        required_target = {"pid", "cr3", "rip_lo", "rip_hi", "entry"}
+        missing = sorted(required_target - target.keys())
+        if missing:
+            parse_errors.append(f"target record missing fields: {', '.join(missing)}")
+        elif target["rip_lo"] >= target["rip_hi"] or not target["rip_lo"] <= target["entry"] < target["rip_hi"]:
+            parse_errors.append("target executable RIP interval is invalid")
+
+    if parse_errors:
+        for error in parse_errors:
+            print(f"  ❌ Rust scheduler evidence: {error}")
+        return False
+    if not events:
+        print("  ❌ Rust scheduler evidence: no correlated events")
+        return False
+
+    completed = 0
+    state = "need_in"
+    last_seq = 0
+    errors = []
+    for kind, fields in events:
+        required = {"seq", "round"}
+        missing = sorted(required - fields.keys())
+        if missing:
+            errors.append(f"{kind} missing fields: {', '.join(missing)}")
+            continue
+        if fields["seq"] != last_seq + 1:
+            errors.append(f"event sequence gap: expected {last_seq + 1}, got {fields['seq']}")
+        last_seq = fields["seq"]
+        if fields["round"] < completed:
+            errors.append(f"round counter regressed at seq {fields['seq']}")
+
+        if kind == "IN":
+            error = _validate_scheduler_frame(fields, target, "SCHED_IN", require_kernel_rsp=True)
+            if error:
+                errors.append(error)
+                continue
+            source = fields.get("source")
+            if state == "need_in" and source == "sysret" and completed == 0:
+                if fields.get("prev") != 0 or fields["round"] != 0:
+                    errors.append("initial SYSRET handoff has invalid predecessor or round")
+                state = "need_user"
+            elif state == "need_in" and source == "sched":
+                if fields.get("prev") == target["pid"]:
+                    errors.append("same-process SCHED_IN cannot start a round trip")
+                else:
+                    completed += 1
+                    if fields["round"] != completed:
+                        errors.append(f"SCHED_IN round mismatch: {fields['round']} != {completed}")
+                    state = "need_user"
+            elif state == "same_process_in" and source == "sched":
+                if fields.get("prev") != target["pid"]:
+                    errors.append("same-process continuation has wrong predecessor")
+                state = "need_user"
+            else:
+                errors.append(f"unexpected SCHED_IN source/state: {source}/{state}")
+        elif kind == "USER":
+            error = _validate_scheduler_frame(fields, target, "USER_RETURN")
+            if error:
+                errors.append(error)
+                continue
+            if state != "need_user":
+                errors.append(f"USER_RETURN out of order in state {state}")
+            elif fields["round"] != completed:
+                errors.append(f"USER_RETURN round mismatch: {fields['round']} != {completed}")
+            else:
+                state = "need_out"
+        elif kind == "OUT":
+            error = _validate_scheduler_frame(fields, target, "SCHED_OUT", require_kernel_rsp=True)
+            if error:
+                errors.append(error)
+                continue
+            if state != "need_out":
+                errors.append(f"SCHED_OUT out of order in state {state}")
+            elif fields["round"] != completed:
+                errors.append(f"SCHED_OUT round mismatch: {fields['round']} != {completed}")
+            elif fields.get("next") == target["pid"]:
+                state = "same_process_in"
+            else:
+                state = "need_in"
+        else:
+            errors.append(f"unknown scheduler event: {kind}")
+
+    if completed < required_round_trips:
+        errors.append(
+            f"round-trip threshold not met: observed {completed}, need {required_round_trips}"
+        )
+    if state == "need_out":
+        errors.append("target returned to user but no target schedule-out was observed")
+    if errors:
+        for error in errors:
+            print(f"  ❌ Rust scheduler evidence: {error}")
+        print(f"  · Correlated event records: {len(events)}, completed round trips: {completed}")
+        return False
+
+    print(
+        f"  ✅ Rust scheduler evidence: PID {target['pid']} completed "
+        f"{completed} correlated round trips (threshold {required_round_trips})"
+    )
+    print(
+        f"  ✅ PID/CR3/RIP evidence: cr3=0x{target['cr3']:x}, "
+        f"RIP range=0x{target['rip_lo']:x}-0x{target['rip_hi']:x}, events={len(events)}"
+    )
+    return True
+
+
 def _print_rust_elf_result(serial_output, require_shell_marker=False):
     required = {
         "VIBIT v0.2.0: PID 1 init": "VIBIT banner",
@@ -436,13 +635,9 @@ def _print_rust_elf_result(serial_output, require_shell_marker=False):
         print("  ✅ No exception detected")
 
     global_irq_observations = serial_output.count("IRQ frame:")
-    if global_irq_observations >= 3:
-        print(f"  ◇ Global IRQ observation threshold met (IRQ frames: {global_irq_observations})")
-    else:
-        print(f"  ❌ Global IRQ observation threshold not met (IRQ frames: {global_irq_observations}, need 3)")
-        all_ok = False
-    print("  · Rust-process scheduling round trips are not claimed: IRQ lines have no PID/range correlation")
-    return all_ok and not exception
+    print(f"  ◇ Global IRQ observations (informational only): {global_irq_observations}")
+    scheduler_ok = _check_rust_elf_scheduler_evidence(serial_output)
+    return all_ok and not exception and scheduler_ok
 
 
 def test_vibit_rust():
