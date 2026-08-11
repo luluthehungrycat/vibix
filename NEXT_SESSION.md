@@ -15,11 +15,16 @@ and zeroed once per load; later PT_LOADs reuse only recorded frames. Existing fo
 mappings remain excluded. Exact partial-page copy order is preserved, with later file bytes
 winning and no permission/NX changes.
 
-The focused Rust ELF probe now reaches entry output `OK`, preserves the entry-page frame across
-both PT_LOADs, and reports no exception. `test_vibit_rust` still treats DEBUG IRQ lines as global
-observations, not proof of Rust-process scheduling round trips because they lack PID/range
-correlation. The historical Candidate/Active/Retired rewrite and historical GPF remain out of
-scope.
+The focused Rust ELF probe reaches entry output `OK`, preserves the entry-page frame across both
+PT_LOADs, and reports no exception. `test_vibit_rust` now validates three bounded, ordered
+PID/CR3/RIP-correlated scheduler round trips using `IN`, `USER`, and `OUT` DEBUG records. Final
+evidence was PID 3, CR3 `0x297000`, executable RIP range `0x2000000–0x2000019`, and 10 correlated
+events. The historical Candidate/Active/Retired rewrite and historical GPF remain out of scope.
+
+The full final validation matrix passed: clean release/debug builds, default/VIBIT boot tests,
+TTY SIGINT, Rust ELF, large synthetic ELF, ELF rollback, anti-cheat, and strict OpenSpec validation
+for the scheduler-evidence change plus the three related follow-up changes. Generated build and
+fixture artifacts were cleaned afterward; no sibling source was changed.
 
 ## Diagnostics
 
@@ -30,8 +35,8 @@ saved user RSP `+72`, SS `+80`. `FRAME` is the iretq frame pointer; `USER_RSP` i
 
 ## Remaining actionable work
 
-1. Optionally add PID- and instruction-range-correlated scheduling evidence; global DEBUG IRQ
-   counts alone are not Rust-process round-trip proof.
+1. Correlated DEBUG evidence does not claim scheduler fairness or general multi-process liveness;
+   extend that separately only if needed.
 2. If separately scoped, evaluate non-atomic exec/OOM behavior or additional ELF overlap
    semantics. Do not reopen the fixed shared-page provenance diagnosis.
 3. Consider the absent Candidate/Active/Retired rewrite only if its actual artifact is supplied;

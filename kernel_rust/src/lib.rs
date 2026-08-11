@@ -18,6 +18,7 @@ mod paging;
 mod pit;
 mod pmm;
 mod process;
+mod scheduler_evidence;
 mod serial;
 mod signal;
 mod syscall;

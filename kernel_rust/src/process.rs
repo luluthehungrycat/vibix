@@ -551,6 +551,13 @@ pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
 
     loop {
         let next_pid = sched_next();
+        #[cfg(feature = "debug")]
+        crate::scheduler_evidence::scheduled_out(
+            cur_pid,
+            next_pid,
+            current_rsp,
+            crate::paging::read_cr3(),
+        );
         if cfg!(feature = "debug") {
             use core::fmt::Write;
             let mut serial = crate::serial::SerialPort::new();
@@ -613,6 +620,14 @@ pub extern "C" fn scheduler_tick(current_rsp: u64) -> u64 {
             continue;
         }
 
+        #[cfg(feature = "debug")]
+        crate::scheduler_evidence::scheduled_in(
+            next_pid,
+            cur_pid,
+            final_krsp,
+            crate::paging::read_cr3(),
+        );
+
         // DEBUG: inspect the frame before returning it
         if cfg!(feature = "debug") {
             use core::fmt::Write;
@@ -665,6 +680,13 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
 
     loop {
         let next_pid = sched_next();
+        #[cfg(feature = "debug")]
+        crate::scheduler_evidence::scheduled_out(
+            cur_pid,
+            next_pid,
+            current_rsp,
+            crate::paging::read_cr3(),
+        );
         if cfg!(feature = "debug") {
             use core::fmt::Write;
             let mut serial = crate::serial::SerialPort::new();
@@ -726,6 +748,14 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
             // Process terminated by signal — re-select
             continue;
         }
+
+        #[cfg(feature = "debug")]
+        crate::scheduler_evidence::scheduled_in(
+            next_pid,
+            cur_pid,
+            final_krsp,
+            crate::paging::read_cr3(),
+        );
 
         let next = process_mut(next_pid);
         next.state = ProcessState::Running;
@@ -906,6 +936,15 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
                             ep
                         );
                     }
+                    #[cfg(feature = "debug")]
+                    if path_slice == b"/bin/vish" {
+                        crate::scheduler_evidence::register_target(
+                            pid,
+                            proc.pml4_phys,
+                            data_slice,
+                            ep,
+                        );
+                    }
                     // ELF loader maps segments but NOT the user stack.
                     // Use a larger stack (64 KiB, 16 pages) starting at 0x2020000
                     // (top) growing down to accommodate Rust's format! and allocator calls.
@@ -998,6 +1037,22 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
         core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
         core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
+    }
+
+    #[cfg(feature = "debug")]
+    if is_elf && path_slice == b"/bin/vish" {
+        crate::scheduler_evidence::sysret_handoff(
+            pid,
+            proc.pml4_phys,
+            entry,
+            if is_elf {
+                elf_user_rsp
+            } else {
+                USER_STACK_ADDR + 0x1000
+            },
+            0x202,
+            proc.kernel_rsp,
+        );
     }
 
     proc.brk = BRK_START;

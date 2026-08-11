@@ -16,6 +16,7 @@ A Unixoid kernel for x86-64, written in Rust + NASM assembly.
 - ELF64 executable loading with multi-segment support, including load-local shared-page provenance (Rust ELF probe reaches `OK` without exception)
 - Loads via per-process PML4 (not identity map) — current committed implementation
 - Pages always allocated fresh on exec (no parent-memory corruption)
+- DEBUG-only Rust ELF scheduler evidence correlates target PID, CR3, executable RIP range, ordered `IN`/`USER`/`OUT` events, and three bounded round trips
 
 ### VFS
 - Vnodes with function-pointer dispatch
@@ -59,8 +60,8 @@ alarm, syslog, times, uname, uptime
 - `make test_vibit` — 7 VIBIT init/shell fork/exec/blocking-read checks
 - VIBIT/vish integration — external VIBIT init launches the NASM vish shell; bounded shell handoff and continuation checks pass
 - `make test_vibit_rust` — readiness-aware KVM/TCG retries, Rust ELF `OK`, no exception,
-  shared-page provenance, and bounded global IRQ observations; PID/range-correlated Rust
-  scheduling evidence remains unproven.
+  shared-page provenance, and three bounded PID/CR3/RIP-correlated scheduler round trips
+  (final evidence: PID 3, CR3 `0x297000`, RIP range `0x2000000–0x2000019`, 10 events).
 - `make test_vibit_rust_large` — test-time 257-page synthetic ELF plus lower-level
   provenance-arena capacity and cleanup regression; full VIBIT shell handoff is deferred.
 
@@ -89,6 +90,10 @@ alarm, syslog, times, uname, uptime
 ### 6. Process groups / session management
 - **Why**: setsid, getpgid, setpgid, getpgrp exist but untested
 - **Work**: Verify job-control primitives work end-to-end
+
+### Validation limitations retained
+- Correlated DEBUG evidence proves the target process's bounded scheduler round trips, not
+  scheduler fairness, long-term liveness, or PID/range-correlated behavior for other processes.
 
 ---
 
@@ -137,4 +142,4 @@ alarm, syslog, times, uname, uptime
 
 ---
 
-*Last updated: 2026-08-08*
+*Last updated: 2026-08-11*

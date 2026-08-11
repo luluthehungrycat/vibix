@@ -614,6 +614,12 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
 #[no_mangle]
 pub extern "C" fn irq_handler(frame: &InterruptFrame) {
     let irq = frame.int_no.wrapping_sub(32);  // PIC offset 0x20 → 0..15
+    #[cfg(feature = "debug")]
+    crate::scheduler_evidence::user_return(
+        crate::process::current_pid(),
+        frame,
+        crate::paging::read_cr3(),
+    );
     match irq {
         0 => crate::pit::tick(),
         1 => crate::keyboard::handle_keyboard(),

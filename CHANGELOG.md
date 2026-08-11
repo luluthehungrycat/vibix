@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-11
+
+### Correlated Rust ELF scheduler evidence
+
+- Implemented the VIBIX-only `correlate-rust-elf-scheduler-evidence` change. DEBUG records now identify the Rust ELF target and emit bounded ordered `IN`, `USER`, and `OUT` events with PID, CR3, RIP, frame invariants, sequence, and round-trip counters. Serial volume is capped after the required three target round trips to avoid perturbation/drop-induced false failures.
+- Updated `kernel_rust/src/scheduler_evidence.rs`, `kernel_rust/src/process.rs`, `kernel_rust/src/interrupts.rs`, `kernel_rust/src/lib.rs`, `test_kernel.py`, the change tasks, `ROADMAP.md`, and `NEXT_SESSION.md`. No sibling-repository source was modified.
+- Final correlated evidence: PID 3, CR3 `0x297000`, executable RIP range `0x2000000–0x2000019`, 3 completed round trips, 10 structured events, Rust `OK`, no exception.
+- Full validation passed: `make clean && make`, `make test`, `make test_vibit`, `make test_tty_sigint`, `make test_vibit_rust`, `make test_vibit_rust_large`, `make test_elf_rollback`, and `make clean && make DEBUG=1`. Anti-cheat passed in all applicable harness targets.
+- Strict OpenSpec validation passed for `correlate-rust-elf-scheduler-evidence`, `fix-tty-sigint-foreground-reader`, `build-rust-vish-test-prerequisite`, and `remove-elf-page-provenance-ceiling`; `git diff --check` passed. The first unbounded Rust probe exposed a serial-drop malformed record; bounded emission was added and the final rerun passed.
+
 ## 2026-08-09
 
 ### PR #9 Rust CI workflow implementation
