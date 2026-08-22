@@ -389,14 +389,17 @@ fn sys_dup2(old_fd: u64, new_fd: u64, _: u64, _: u64) -> u64 {
     if old_fd as usize >= MAX_FDS || new_fd as usize >= MAX_FDS {
         return (-EBADF as i64) as u64;
     }
-    if old_fd == new_fd {
-        return new_fd;
-    }
     let pid = current_pid();
     let proc = process_mut(pid);
     let oft_idx = proc.fd_table.fds[old_fd as usize];
     if oft_idx < 0 {
         return (-EBADF as i64) as u64;
+    }
+    if crate::vfs::open_file::oft_get(oft_idx as usize).is_none() {
+        return (-EBADF as i64) as u64;
+    }
+    if old_fd == new_fd {
+        return new_fd;
     }
     // If new_fd is already open, close it first
     let new_oft_idx = proc.fd_table.fds[new_fd as usize];

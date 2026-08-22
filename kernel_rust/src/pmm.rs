@@ -9,7 +9,7 @@
 use crate::serial::SerialPort;
 
 pub const PMM_PAGE_SIZE: usize = 4096;
-pub const PMM_MAX_PAGES: usize = 0x10000;   // 64 K pages → 256 MB
+pub const PMM_MAX_PAGES: usize = 0x10000; // 64 K pages → 256 MB
 
 const BITMAP_SIZE: usize = PMM_MAX_PAGES / 8;
 
@@ -60,7 +60,10 @@ pub struct PmmAllocator {
 
 impl PmmAllocator {
     pub const fn new() -> Self {
-        Self { total_pages: 0, memory_start: 0 }
+        Self {
+            total_pages: 0,
+            memory_start: 0,
+        }
     }
 
     /// Initialise the PMM over a given physical memory region.
@@ -163,6 +166,19 @@ impl PmmAllocator {
         bm[page / 8] &= !(1 << (page % 8));
     }
 
+    /// Count currently available physical pages for DEBUG ownership fixtures.
+    #[cfg(feature = "debug")]
+    pub fn available_pages(&self) -> usize {
+        let bm = unsafe { &*bitmap_mut() };
+        let mut available = 0;
+        for page in 0..self.total_pages {
+            if bm[page / 8] & (1 << (page % 8)) == 0 {
+                available += 1;
+            }
+        }
+        available
+    }
+
     /// Mark a region of physical memory as USED (reserved).
     /// This is the inverse of `init_region` — it sets bits in the bitmap.
     pub fn reserve(&mut self, base: usize, size: usize) {
@@ -174,7 +190,11 @@ impl PmmAllocator {
             start_page
         } else {
             let end = (base - self.memory_start + size - 1) / PMM_PAGE_SIZE;
-            if end >= PMM_MAX_PAGES { PMM_MAX_PAGES - 1 } else { end }
+            if end >= PMM_MAX_PAGES {
+                PMM_MAX_PAGES - 1
+            } else {
+                end
+            }
         };
 
         let bm = unsafe { &mut *bitmap_mut() };
@@ -194,7 +214,11 @@ impl PmmAllocator {
             start_page
         } else {
             let end = (base - self.memory_start + size - 1) / PMM_PAGE_SIZE;
-            if end >= PMM_MAX_PAGES { PMM_MAX_PAGES - 1 } else { end }
+            if end >= PMM_MAX_PAGES {
+                PMM_MAX_PAGES - 1
+            } else {
+                end
+            }
         };
 
         let bm = unsafe { &mut *bitmap_mut() };

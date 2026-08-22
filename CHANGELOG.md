@@ -1,6 +1,239 @@
 # Changelog
 
+## 2026-08-22
+
+### Large-ELF probe admission blocker fixed
+
+- `test_kernel.py`: `test_vibit_rust_large()` now applies
+  `_rust_probe_result_is_acceptable()` to the selected `ProbeResult` before
+  lifecycle or scheduler evidence can make the test pass. The shared fatal
+  marker predicate rejects `VIBIX: EXCEPTION:`, `VIBIX: PANIC:`, generic
+  `kernel panic`, and `triple fault` transcripts even if lifecycle markers are
+  present. Focused probe coverage now exercises PASS, FAIL, BLOCKED, panic,
+  exception, kernel-panic, and triple-fault cases.
+- Exact validation: `timeout 240s make test_vibit_rust_large` exited 0;
+  KVM attempt 1 was readiness-without-completion `FAIL`, TCG attempt 1 was
+  selected `PASS`, Rust probe admission was `PASS`, and the lifecycle reported
+  PID 3 / CR3 `0x297000`, 3 correlated scheduler round trips, 10 events,
+  `LARGE_ELF_OK` → reap/respawn → continuation, no exception/panic, and
+  initramfs restoration. `python3 -c 'from test_kernel import
+  test_probe_selection; raise SystemExit(0 if test_probe_selection() else 1)'`,
+  `python3 -m py_compile test_kernel.py`, `python3 anti_cheat.py`,
+  `openspec validate --all --strict --no-interactive`, and `git diff --check`
+  all passed. OpenSpec adversarial review is complete; delivery gates remain pending;
+  no sibling/global-config, commit, push, or PR changes were made.
+
+### Remaining code blockers: flat-page clearing and Rust probe admission
+
+- `kernel_rust/src/process.rs`: every newly allocated flat code page is now
+  cleared with `write_bytes` before the optional source copy. This includes
+  pages whose `copy_len` is zero, while checked bounds, fresh-root publication,
+  and rollback behavior remain unchanged. The DEBUG small-binary fixture now
+  seeds eight PMM pages with `0xA5`, requires code-page reuse, verifies the
+  one-byte source, the first-page zero tail, and the fully unused second page,
+  then destroys the uncommitted image.
+- `test_kernel.py`: `test_vibit_rust()` now gates Rust ELF checks on the
+  selected `ProbeResult` being `PASS` and on the shared fatal-marker predicate;
+  selected `FAIL`/`BLOCKED` or panic/exception transcripts are rejected before
+  entry/provenance/interval/scheduler validation. Focused probe-selection
+  coverage exercises PASS, FAIL, BLOCKED, and a fatal marker-rich transcript.
+- OpenSpec `proposal.md`, `design.md`, `spec.md`, and `tasks.md` now describe
+  the page-clearing/stale-PMM contract and Rust probe admission guard. The
+  adversarial review is complete; delivery gates remain pending.
+- Validation results: `python3 -m py_compile test_kernel.py`, focused
+  `test_probe_selection`, `timeout 240s make test_elf_rollback`, and
+  `timeout 240s make test_vibit_rust` passed; the latter selected TCG `PASS`
+  after KVM attempts reached readiness without completion, with PID 3, CR3
+  `0x297000`, 3 correlated scheduler round trips, 10 events, Rust `OK`, and no
+  exception. `python3 anti_cheat.py`, strict OpenSpec validation, and
+  `git diff --check` also pass. Existing compiler/assembler/linker warnings
+  remain. No sibling source, global config, commit, push, or PR was changed.
+
+### Review-blocker closure: final acceptance evidence
+
+- Implemented the oracle's minimal safe design. `kernel_rust/src/paging.rs`
+  now eagerly clones every present non-huge user 4 KiB leaf for fork, preserves
+  PTE flags, rejects user huge mappings, publishes child PTEs only after copying,
+  and frees only child-owned frames/tables on partial failure. DEBUG coverage
+  proves distinct parent/child frames, child-write isolation, and injected
+  failure after one cloned leaf.
+- Reworked `kernel_rust/src/process.rs` flat loading into a fallible fresh-root
+  builder with checked page arithmetic, a `BRK_START` user cap, post-code stack,
+  atomic root/entry/RSP publication, allocation-failure/oversize/no-overwrite
+  coverage, and an explicit follow-up note for successful old-root reclamation.
+  `kernel_rust/src/elf.rs` now reports the exact stack-page count in the shared
+  rollback hook and removes the weak pre-destroy-only stack check. The final
+  rollback marker remains after all cases.
+- Repaired the second-failure cleanup in `userspace/vibix_user_test.inc` and
+  added named trace/OK markers to `test_kernel.py` proving the helper returns to
+  its caller instead of treating saved arguments as a return address. Updated
+  `kernel_rust/src/lib.rs` to run the new DEBUG fork/flat fixtures.
+- Moved emission of `ELF TEST: rollback final PASS` from the ELF fixture to the
+  outer DEBUG fixture runner, so it is emitted only after both ELF and flat
+  rollback suites have completed; the helper functions now return their
+  aggregate status to that final marker.
+- OpenSpec scope and acceptance criteria were expanded in
+  `openspec/changes/close-openspec-review-blockers/{proposal.md,design.md,
+  specs/review-blocker-closure/spec.md,tasks.md}`. Complete modified-file
+  inventory for this session: those four artifacts, `CHANGELOG.md`,
+  `NEXT_SESSION.md`,
+  `kernel_rust/src/{paging,process,elf,lib}.rs`, `test_kernel.py`, and
+  `userspace/vibix_user_test.inc`. The accidental global capture-log entry was
+  removed; no sibling-repository source changed and no commit, push, or PR was
+  performed.
+- Actual bounded probe evidence: `timeout 240s make test_vibit_rust` exited 0;
+  KVM attempts 1 and 2 reached readiness but timed out without completion and
+  were classified `FAIL`, then TCG attempt 1 reached readiness and completion
+  and was selected as `PASS` (`completion predicate observed`). Rust scheduler
+  evidence was PID 3, CR3 `0x297000`, interval
+  `[0x2000000,0x2000019)`, 3 correlated round trips, and 10 events. The
+  selected transcript also contained Rust `OK`, preserved entry-page frame
+  `0x2a3000`, and no exception. `timeout 240s make test_vibit_rust_large`
+  exited 0; KVM attempt 1 was a readiness-without-completion `FAIL`, TCG
+  attempt 1 was selected `PASS`, and the 257-page lifecycle proved scheduler
+  evidence, `LARGE_ELF_OK`, reaper/respawn, the second marker, and no
+  exception. `timeout 180s make test_vibit` exited 0 with KVM attempt 1
+  selected `PASS` and all VIBIT/fork/exec/reaper/shell/prompt markers.
+- Canonical and focused validation also passed: `timeout 300s bash -c 'make
+  clean && make && make test'`, `timeout 240s make test_elf_rollback`,
+  `timeout 240s make test_tty_sigint`, `timeout 240s bash -c 'make clean &&
+  make DEBUG=1'`, `python3 -m py_compile test_kernel.py`,
+  `python3 anti_cheat.py`, `openspec status --change
+  close-openspec-review-blockers`, `openspec validate --all --strict
+  --no-interactive`, and `git diff --check`. The default suite passed all 25
+  required checks. Rollback passed all ELF, fork, scratch, flat, and final
+  marker cases. The TTY target exited 0 with all deterministic ownership and
+  no-exception assertions; its bounded shell probe correctly reported
+  readiness without a product completion marker as `FAIL` rather than hiding
+  the timeout.
+- The Rust-vish prerequisite was available at `../vish`; its `elf` target was
+  already up to date. No accelerator was environment-blocked: TCG supplied
+  the successful bounded Rust evidence. Existing compiler/assembler/linker
+  warnings remain. Acceptance tasks 8.3 and 8.4 are now evidenced and
+  complete; adversarial review is complete and delivery tasks remain pending. No commit,
+  push, or PR was performed.
+
+### Review-blocker closure: scratch fork copies and probe ranking
+
+- Updated `kernel_rust/src/paging.rs` so fork leaf copies use the reserved
+  kernel-only scratch mapping with interrupts disabled across map/copy/unmap,
+  transactional scratch page-table provisioning, and rejection of the scratch
+  range from user mappings. Added checked arithmetic for the one-page user-map
+  guard.
+- Updated `kernel_rust/src/process.rs` and `kernel_rust/src/elf.rs` to avoid
+  zero-length flat-loader source-pointer formation and reject ELF ranges that
+  overlap the scratch page. Added focused small-binary zero-tail coverage.
+- Updated `test_kernel.py` to rank semantic probe status before readiness and
+  completion details, reject fatal transcripts as PASS, and retain a valid
+  PASS over marker-rich failures. Added focused selection coverage.
+- Reconciled implementation notes in
+  `openspec/changes/close-openspec-review-blockers/{design.md,tasks.md}` and
+  `specs/review-blocker-closure/spec.md`;
+  adversarial review is complete; delivery-gate tasks remain intentionally unchecked.
+- Validation passed: target-aware debug `cargo check`, Python syntax and probe
+  selection checks, `make test_elf_rollback`, `make clean && make && make test`,
+  `openspec validate --all --strict --no-interactive`, and `git diff --check`.
+  Existing compiler/assembler/linker warnings remain. No commit, push, or PR
+  was performed.
+
+### Remaining merge blockers fixed and final validation evidence
+
+- Made fork scratch provisioning failure-atomic in `kernel_rust/src/paging.rs`:
+  `ScratchProvision` records only newly allocated PD/PT branches, cleanup
+  removes only empty transaction-owned branches, and rollback now discovers
+  partially filled child PTs because the private PT is published before its
+  individual child-owned eager leaves. DEBUG PMM reuse evidence proves both
+  successful and failed fork paths reclaim scratch resources without changing
+  parent mappings.
+- Added dynamic linked-kernel image reservation through `_kernel_end` in
+  `kernel_rust/kernel64_elf.ld` and `kernel_rust/src/lib.rs`. DEBUG flat fixture
+  buffers are static and its large transaction helpers are kept out of the
+  fixed 16 KiB bootstrap stack; this fixes the real large-archive failure,
+  which previously stopped inside the pre-init flat rollback fixture rather
+  than reaching VIBIT/Rust evidence.
+- Routed `test_vibit()` boot and shell handoff diagnostics through structured
+  bounded probe records. Reports now include accelerator, attempt,
+  readiness/completion, classification, transcript, and deterministic reason;
+  missing readiness is `BLOCKED`, while missing product markers after
+  readiness is `FAIL`. Serial reads tolerate a concurrently written partial
+  UTF-8 character without losing transcript evidence.
+- Final validation passed: `git diff --check`, Python syntax/probe selection,
+  anti-cheat, strict validation of all 9 active OpenSpec changes,
+  `make clean && make && make test`, `make test_elf_rollback`,
+  `make test_vibit`, `make test_vibit_rust`, `make test_vibit_rust_large`,
+  `make test_tty_sigint`, and `make clean && make DEBUG=1`. Rust ELF selected
+  TCG after bounded KVM attempts and passed with 3 correlated PID/CR3/RIP
+  scheduler round trips across 10 events; the large lifecycle also passed with
+  the ordered marker → reap/respawn → continuation chain. Compiler,
+  assembler, and linker warnings remain. Tasks 8.3/8.4 are now complete from
+  the fixer validation pass; adversarial review is complete and all delivery
+  tasks remain pending for orchestrator review. No commit, push, or PR was
+  performed.
+
+### Review-blocker closure validation and flat-image stack fix
+
+- Continued `close-openspec-review-blockers` implementation and fixed a newly
+  exposed flat-binary overlap: the 9630-byte default userspace image occupied
+  three code pages while `load_flat_binary()` still placed its stack on the
+  third code page. Flat loaders now place the stack after the complete image,
+  return the computed initial user RSP, and propagate it through init/exec
+  process state. Flat userspace entry points now retain the kernel-provided
+  RSP instead of overriding it with a fixed address.
+- Moved the rollback inherited-page fixture above the runtime low identity map
+  so its precondition is meaningful after identity-map extension.
+- Files modified in this continuation: `kernel_rust/src/process.rs`,
+  `kernel_rust/src/elf.rs`, `userspace/vibix_blob.asm`,
+  `userspace/user_init.asm`, `userspace/vibix_shell.inc`,
+  `userspace/vibix_vfstest.inc`, `userspace/vibix_stat_chdir.inc`,
+  `kernel_rust/src/paging.rs`, and this changelog. No sibling-repository source
+  was changed; no commit, push, or PR was performed.
+- Validation passed: `make clean && make && make test`, `make test_elf_rollback`,
+  `make test_tty_sigint`, `make test_vibit`, stable target-aware Cargo checks,
+  userspace NASM assembly, anti-cheat, and Python syntax checks. Rollback
+  reported truncated-later-segment, PMM-exhaustion, metadata-exhaustion,
+  complete-suite, and stack-allocation PASS. The TTY probe reached its bounded
+  timeout but all deterministic cases and no-exception checks passed.
+- Existing warnings remain in Rust/NASM/linker output. Earlier successful
+  `test_vibit_rust` and `test_vibit_rust_large` evidence remains recorded; the
+  adversarial review is complete; delivery steps are still pending.
+
 ## 2026-08-11
+
+### Final follow-up validation
+
+- Finalized the active follow-up work: synthetic ELF shell lifecycle, fd error
+  semantics, correlated Rust ELF scheduler evidence, TTY SIGINT ownership,
+  Rust-vish prerequisite, scalable ELF provenance, and VIBIT/vish integration.
+- Passed from clean builds: `make clean && make`, `make test`, `make test_vibit`,
+  `make test_tty_sigint`, `make test_vibit_rust`, `make test_vibit_rust_large`,
+  `make test_elf_rollback`, and `make clean && make DEBUG=1`. The dedicated DEBUG
+  TTY and rollback harnesses passed; running the ordinary default marker harness
+  directly on the DEBUG image exceeded its bounded timeout while DEBUG rollback
+  self-tests were emitting, so it is not treated as a DEBUG gate.
+- Python syntax checks, anti-cheat, `git diff --check`, generated-artifact ignore
+  checks, and all seven named strict OpenSpec validations passed. Aggregate strict
+  validation passed all 8 active changes; the archived
+  `fix-multisegment-elf-iretq-gpf` change is excluded and is not a blocker.
+- Exact evidence: Rust ELF PID 3 completed 3 correlated round trips with CR3
+  `0x297000`, RIP range `0x2000000–0x2000019`, and 10 events; the large fixture
+  observed `LARGE_ELF_OK` → `VIBIT: respawning shell...` → a second completion
+  marker; rollback passed truncated-later-segment, PMM-exhaustion, and
+  metadata-exhaustion cases.
+- Reconciled all active `tasks.md` files, updated `ROADMAP.md` and
+  `NEXT_SESSION.md`, and preserved temporary fixture cleanup/ignore behavior.
+  No sibling-repository source was changed; no commit or push was performed.
+
+### Harden fd error semantics
+
+- Implemented `harden-fd-error-semantics`: stale/out-of-range descriptor checks,
+  corrected `dup2` same-fd validation, DEBUG fd-table invariants, focused flat
+  userspace coverage, and documented VIBIX return conventions.
+- Modified `kernel_rust/src/syscall.rs`, `kernel_rust/src/vfs/mod.rs`,
+  `userspace/vibix_user_test.inc`, `userspace/vibix_blob.asm`, `test_kernel.py`,
+  `SYSCALL.md`, and the change tasks. No sibling-repository source was changed.
+- Validation passed: `make test`, `make test_vibit`, `make DEBUG=1` plus the
+  focused userspace harness, strict OpenSpec validation, anti-cheat, and
+  `git diff --check`.
 
 ### Correlated Rust ELF scheduler evidence
 
@@ -12,12 +245,29 @@
 
 ## 2026-08-09
 
+### Final follow-up test-gap validation
+
+- Finalized evidence for the three follow-up OpenSpec changes on `followup/tty-elf-fixtures`: deterministic TTY ownership cases, the Rust vish build/probe prerequisite, and scalable ELF provenance plus rollback coverage. Updated `ROADMAP.md`; no sibling-repository source changes were made.
+- Tests passed from clean builds: `make clean && make`, `make test`, `make test_vibit`, `make test_tty_sigint`, `make test_vibit_rust`, `make test_vibit_rust_large`, `make test_elf_rollback`, and `make clean && make DEBUG=1`.
+- Targeted strict OpenSpec validation passed for all three changes; aggregate validation passed five changes and reported only the known unrelated legacy failure in `fix-multisegment-elf-iretq-gpf`. `git diff --check` passed.
+- Deferred limitations remain: Rust scheduler evidence is global IRQ counting rather than PID/range-correlated round trips, and the 257-page fixture is test-time/temporary with post-marker shell lifecycle coverage intentionally deferred.
+
+## 2026-08-09
+
 ### PR #9 Rust CI workflow implementation
 
 - Updated `.github/workflows/rust.yml` only for this change: installed non-interactive kernel build dependencies, selected stable Rust, installed `x86_64-unknown-none`, asserted the manifest boundary, ran explicit `kernel_rust` Rust build/check steps, and retained root `make` plus `make test` gates.
 - Updated `openspec/changes/fix-rust-ci-workflow/tasks.md`; no kernel source, generated binary, or sibling-repository source changes were made.
 - Results: `cargo +stable metadata --no-deps --format-version 1`, target-aware release `cargo +stable check`, and `RUSTFLAGS='-C code-model=kernel' cargo +stable build` passed; `make test` passed all required checks; `make test_vibit` passed all VIBIT/vish checks; workflow YAML parsing and `git diff --check` passed; strict OpenSpec validation passed with `openspec validate fix-rust-ci-workflow --type change --strict --no-interactive`. The first pushed CI run also exposed the embedded `userspace/initramfs.tar` prerequisite; the workflow now prepares it before the standalone Rust build.
 - `cargo test --manifest-path kernel_rust/Cargo.toml --target x86_64-unknown-none --release --no-run` was evaluated and is unsupported for this no-std staticlib (`can't find crate for test`); the workflow uses target-aware `cargo check` as the Rust test/check boundary and keeps runtime coverage in `make test`.
+
+## 2026-08-09
+
+### PR #9 Rust CI workflow OpenSpec planning
+
+- Created the `fix-rust-ci-workflow` OpenSpec change to target `kernel_rust/Cargo.toml`, provision the `x86_64-unknown-none` no-std target/toolchain, and preserve root Makefile build/test checks.
+- Files modified: `openspec/changes/fix-rust-ci-workflow/proposal.md`, `design.md`, `specs/rust-kernel-ci/spec.md`, `tasks.md`, `CHANGELOG.md`.
+- Tests: strict OpenSpec validation passed; no workflow, kernel, or sibling-repository tests run because this session was planning-only.
 
 ## 2026-08-08
 

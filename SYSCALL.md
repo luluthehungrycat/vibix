@@ -2,7 +2,7 @@
 
 **Version:** 2.0  
 **Status:** Stable  
-**Last updated:** 2026-06-25  
+**Last updated:** 2026-08-11
 
 This document defines the VIBIX system call interface — the contract between
 user-mode programs and the kernel.  Any program targeting VIBIX must follow
@@ -40,6 +40,9 @@ these conventions.
   - [18 — dup](#18--dup)
   - [19 — dup2](#19--dup2)
   - [20 — pipe](#20--pipe)
+   - [24 — isatty](#24--isatty)
+   - [25 — tcgetattr](#25--tcgetattr)
+   - [26 — tcsetattr](#26--tcsetattr)
 - [Change Log](#change-log)
 
 ---
@@ -75,6 +78,11 @@ full register clobber.
 
 > **Note for compilers:** When generating syscall wrappers, save any live
 > registers before `syscall` and restore them after.
+>
+> **Fixture invariant:** VIBIX assembly regression fixtures follow the same
+> rule. A descriptor, pointer, length, loop counter, or comparison value that
+> remains live after a syscall is reloaded from memory or saved on the stack;
+> fixture helpers do not rely on any non-preserved register surviving a call.
 
 ### Example
 
@@ -114,8 +122,11 @@ syscall             ; ⟶ rax = bytes written
 | 18 | `dup`      | `int dup(int oldfd)`                                          | ✅     |
 | 19 | `dup2`     | `int dup2(int oldfd, int newfd)`                              | ✅     |
 | 20 | `pipe`     | `int pipe(int pipefd[2])`                                     | ✅     |
+| 24 | `isatty`   | `int isatty(int fd)`                                         | ✅     |
+| 25 | `tcgetattr`| `int tcgetattr(int fd, void *termios)`                       | ✅     |
+| 26 | `tcsetattr`| `int tcsetattr(int fd, const void *termios)`                 | ✅     |
 
-Slots 21–63 are reserved for future expansion.
+Slots 21–23 and 27–63 are reserved for future expansion.
 
 ---
 
@@ -287,7 +298,8 @@ For `/dev/ttyS0` (fd 0/1/2 by default), writes go to the serial console
 - `rsi` = `buf`: Pointer to buffer in user address space.
 - `rdx` = `count`: Number of bytes to write.
 
-**Return:** Number of bytes written on success, negative errno on error.
+**Return:** Number of bytes written on success. For compatibility, invalid
+descriptors, invalid pointers, and zero-length writes return `0`.
 
 **Example:**
 ```asm
@@ -318,7 +330,8 @@ buffer (non-blocking, may return 0). The keyboard driver decodes scan code set
 - `rsi` = `buf`: Pointer to buffer in user address space.
 - `rdx` = `count`: Maximum number of bytes to read.
 
-**Return:** Number of bytes read, or negative errno on error.
+**Return:** Number of bytes read. For compatibility, invalid descriptors,
+invalid pointers, and zero-length reads return `u64::MAX`.
 
 ---
 
@@ -590,7 +603,8 @@ layer). Reads up to `count` bytes from the file descriptor's vnode read op.
 - `rsi` = `buf`: User-space buffer.
 - `rdx` = `count`: Maximum bytes to read.
 
-**Return:** Number of bytes read, or negative errno on error.
+**Return:** Number of bytes read, or negative errno on error. Invalid, closed,
+or stale descriptors return `-EBADF` before buffer validation.
 
 ---
 
@@ -608,7 +622,8 @@ Writes up to `count` bytes through the vnode write op.
 - `rsi` = `buf`: User-space buffer.
 - `rdx` = `count`: Number of bytes to write.
 
-**Return:** Number of bytes written, or negative errno on error.
+**Return:** Number of bytes written, or negative errno on error. Invalid,
+closed, or stale descriptors return `-EBADF` before buffer validation.
 
 ---
 
@@ -672,9 +687,11 @@ int dup2(int oldfd, int newfd);
 ```
 
 **Description:** Duplicates a file descriptor to a specific fd number.
-Follows Linux conventions:
+VIBIX semantics:
 - If `oldfd == newfd`, returns `newfd` (no-op).
 - If `newfd` is already open, closes it first.
+- Source validation happens before the same-fd no-op, so closed or stale
+  descriptors return `-EBADF` without mutation.
 
 **Arguments:**
 - `rdi` = `oldfd`: Existing file descriptor.
@@ -702,6 +719,39 @@ freed when both ends are closed.
 - `rdi` = `pipefd`: Pointer to a user-space array of two `i32`s.
 
 **Return:** 0 on success, or negative errno on error.
+
+---
+
+### 24 — isatty
+
+```c
+int isatty(int fd);
+```
+
+Returns `1` for a TTY descriptor and `0` for another valid descriptor. Invalid,
+closed, or stale descriptors return `-EBADF`.
+
+---
+
+### 25 — tcgetattr
+
+```c
+int tcgetattr(int fd, void *termios);
+```
+
+Reads terminal attributes. Invalid, closed, or stale descriptors return
+`-EBADF`; non-TTY descriptors return `-ENOTTY`.
+
+---
+
+### 26 — tcsetattr
+
+```c
+int tcsetattr(int fd, const void *termios);
+```
+
+Writes terminal attributes. Invalid, closed, or stale descriptors return
+`-EBADF`; non-TTY descriptors return `-ENOTTY`.
 
 ---
 

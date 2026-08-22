@@ -40,22 +40,14 @@ _start:
 ; Produces "Hello, world!\n" and "From PID 1 (init)\n" for test compatibility,
 ; then demonstrates echo -e with octal escapes.
 init_demo:
-    mov rsp, 0x2003000
-
-    ; echo "Hello, world!"
-    mov rdi, 2
-    lea rsi, [rel args_hello]
-    call echo
-
-    ; echo -e "\0101there"  (octal 0101 = 'A')
-    mov rdi, 3
-    lea rsi, [rel args_e_octal]
-    call echo
-
-    ; echo "From PID 1 (init)"
-    mov rdi, 2
-    lea rsi, [rel args_from]
-    call echo
+    ; Print the fixed init markers directly; the kernel-provided RSP is used
+    ; for the complete flat image's stack.
+    lea rsi, [rel str_hello_nl]
+    call ut_print_str
+    lea rsi, [rel str_athere_nl]
+    call ut_print_str
+    lea rsi, [rel str_from_nl]
+    call ut_print_str
 
     ; getpid()
     mov rax, 3
@@ -72,7 +64,6 @@ init_demo:
 
 ; ── Echo demo ─────────────────────────────────────────────────────────────────
 echo_demo:
-    mov rsp, 0x2003000
     mov rdi, 2
     lea rsi, [rel args_hello]
     call echo
@@ -82,7 +73,6 @@ echo_demo:
 
 ; ── Cat demo ──────────────────────────────────────────────────────────────────
 cat_demo:
-    mov rsp, 0x2003000
     call cat
     xor edi, edi
     mov eax, 0
@@ -90,7 +80,6 @@ cat_demo:
 
 ; ── Printenv demo ─────────────────────────────────────────────────────────────
 printenv_demo:
-    mov rsp, 0x2003000
     mov rdi, 1                      ; argc=1 → print all
     xor rsi, rsi                    ; argv = NULL
     xor rdx, rdx                    ; envp = NULL → no output
@@ -101,7 +90,6 @@ printenv_demo:
 
 ; ── Clear demo ────────────────────────────────────────────────────────────────
 clear_demo:
-    mov rsp, 0x2003000
     xor edi, edi
     xor esi, esi
     call clear_cmd
@@ -130,6 +118,9 @@ dispatch_table:
 str_echo:       db "echo", 0
 str_hello:      db "Hello, world!", 0
 str_from:       db "From PID 1 (init)", 0
+str_hello_nl:   db "Hello, world!", 0x0A, 0
+str_athere_nl:   db "Athere", 0x0A, 0
+str_from_nl:     db "From PID 1 (init)", 0x0A, 0
 str_e_flag:     db "-e", 0
 str_octal_test: db "\0101there", 0       ; literal backslash-0-1-0-1
 
@@ -139,6 +130,10 @@ args_from:      dq str_echo, str_from
 args_e_octal:   dq str_echo, str_e_flag, str_octal_test
 
 ; ── Include shared implementations ──────────────────────────────────────────
+; Place the fd fixture before the larger shell helpers so its entry and test
+; code remain below the fixed stack-page boundary.
+%include "vibix_user_test.inc"
+section .rodata
 %include "vibix_core.inc"
 %include "vibix_tiny.inc"
 %include "vibix_echo.inc"
@@ -152,6 +147,6 @@ section .text
 %include "vibix_vfstest.inc"
 %include "vibix_stat_chdir.inc"
 section .text
-%include "vibix_user_test.inc"
-section .text
 %include "vibix_signal_test.inc"
+
+flat_binary_end:

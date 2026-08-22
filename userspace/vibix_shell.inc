@@ -26,7 +26,6 @@ MAX_ARGS        equ 16          ; max args per command
 ; Input: rdi = argc, rsi = argv, rdx = envp
 shell:
     ; Reset stack to top of user stack page
-    mov rsp, 0x2003000
 
     push rbx
     push r12

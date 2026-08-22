@@ -26,6 +26,14 @@ mod syscall;
 mod vfs;
 use core::panic::PanicInfo;
 
+extern "C" {
+    static _kernel_end: u8;
+}
+
+fn kernel_image_end() -> usize {
+    unsafe { &_kernel_end as *const u8 as usize }
+}
+
 //------------------------------------------------------------------------------
 // Kernel entry — called from assembly (kernel64_entry.asm)
 //------------------------------------------------------------------------------
@@ -58,8 +66,16 @@ pub extern "C" fn kernel_main() -> ! {
         pmm.init(0x100000, 0x10000000);
     }
 
-    // Reserve the kernel's own memory (0x200000 + 512 KiB for code + BSS + page tables + stack).
-    pmm.reserve(0x200000, 0x80000);
+    // Reserve the complete linked kernel image, including the embedded
+    // initramfs and entry-stack BSS. A fixed 512 KiB reservation is too small
+    // for the synthetic large-ELF archive and lets PMM allocations overwrite
+    // kernel data before the Rust scheduler probe starts.
+    let kernel_start = 0x200000usize;
+    let kernel_end = kernel_image_end().saturating_add(0xfff) & !0xfff;
+    pmm.reserve(
+        kernel_start,
+        kernel_end.saturating_sub(kernel_start).max(0x80000),
+    );
 
     pmm.test(&mut serial);
 
@@ -72,7 +88,13 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Page Table Manager
     paging::test(&mut pmm, &mut serial);
-    if cfg!(feature = "debug") {
+    // The boot stub identity-maps only the first 4 MiB.  Runtime PMM pages
+    // used for page tables can exceed that after the large-ELF probe, so
+    // extend the kernel-only identity map through (but not into) USER_CODE_ADDR.
+    paging::extend_kernel_identity(0x0200_0000, &mut pmm);
+    #[cfg(feature = "debug")]
+    {
+        paging::test_fork_leaf_isolation(&mut pmm, &mut serial);
         elf::test_provenance_arena(&mut serial);
     }
 
@@ -150,6 +172,24 @@ pub extern "C" fn kernel_main() -> ! {
         vfs::vfs_init();
     }
     serial.writestrs(&["VIBIX: VFS ready.\n"]);
+    #[cfg(feature = "debug")]
+    {
+        // Run after the IDT is live so any test fault is reported normally,
+        // but before STI can schedule a process during the CR3 checks.
+        let elf_rollback_ok = elf::test_provenance_failures(&mut pmm, &mut serial);
+        let flat_rollback_ok = process::test_flat_image_failures(&mut pmm, &mut serial);
+        serial.writestrs(
+            [
+                "ELF TEST: rollback final ",
+                if elf_rollback_ok && flat_rollback_ok {
+                    "PASS\n"
+                } else {
+                    "FAIL\n"
+                },
+            ]
+            .as_slice(),
+        );
+    }
     // Enable interrupts — timer ticks will begin immediately
     serial.writestrs(&["VIBIX: Enabling interrupts.\n"]);
     unsafe {

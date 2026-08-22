@@ -35,9 +35,6 @@ section .text
 global _start
 
 _start:
-    ; Stack starts at top of stack page (0x2002000)
-    mov rsp, 0x2002000
-
     ; echo "Hello, world!"
     mov rdi, 2
     lea rsi, [rel args_hello]
@@ -97,6 +94,8 @@ str_e_flag:         db "-e", 0
 str_n_flag:         db "-n", 0
 str_escapes_demo:   db "Escapes:\tOCTAL:\0101there", 0  ; literal escape sequences
 str_pid:            db "PID 1", 0
+
+flat_binary_end:
 
 ; ── Shared echo implementation ────────────────────────────────────────────────
 %include "vibix_echo.inc"

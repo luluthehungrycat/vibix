@@ -2,7 +2,7 @@
 ; vibix_user_test.inc — User-mode syscall test suite for VIBIX
 ;
 ; Tests: sys_pipe(20), sys_dup(18), sys_dup2(19), sys_getcwd(27),
-;        sys_chdir(23)
+;        sys_chdir(23), fd error/safety semantics
 ;
 ; Entry: user_test() — sets up stack, runs tests, exits when done.
 ;
@@ -12,6 +12,8 @@
 
 %ifndef VIBIX_USER_TEST_INC
 %define VIBIX_USER_TEST_INC
+
+%define UT_EBADF 0xfffffffffffffff7
 
 ; ── Test entry point ──────────────────────────────────────────────────────────
 user_test:
@@ -69,7 +71,7 @@ user_test:
     mov edi, 1
     mov rax, 18                 ; sys_dup
     syscall
-    mov r12d, eax               ; save new fd
+    mov [rel ut_dup_fd], eax    ; save new fd across later syscalls
     test eax, eax
     js .ut_test2_fail
     cmp eax, 1
@@ -78,7 +80,7 @@ user_test:
     ; Print "[OK] dup test: newfd=X"
     lea rsi, [rel ut_str_dup_prefix]
     call ut_print_str
-    mov edi, r12d
+    mov edi, [rel ut_dup_fd]
     call ut_print_uint64
     lea rsi, [rel ut_str_newline]
     call ut_print_str
@@ -141,12 +143,239 @@ user_test:
     call ut_print_str
 
 .ut_test5:
-    ; Skip test 5 for now — chdir+getcwd needs VFS debugging
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; Test 5: descriptor validity and dup2 same-fd semantics
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; fd=5 is the fd created by the existing dup2 test. Close it first so the
+    ; following checks cover both a successful close and a closed descriptor.
+    mov edi, 5
+    mov eax, 13                ; sys_close
+    syscall
+    test rax, rax
+    jnz .ut_fd_errors_fail
+
+    xor esi, esi
+    xor edx, edx
+    mov eax, 13                ; sys_close
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jnz .ut_fd_errors_fail
+
+    mov eax, 18                ; sys_dup
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jnz .ut_fd_errors_fail
+
+    mov edi, 1                 ; open same-fd dup2 is a no-op success
+    mov esi, 1
+    mov eax, 19
+    syscall
+    cmp rax, 1
+    jne .ut_dup2_self_fail
+
+    mov edi, 5                 ; closed same-fd dup2 must fail
+    mov eax, 19
+    call ut_expect_ebadf_same_fd
+    test eax, eax
+    jne .ut_dup2_self_fail
+
+    mov edi, 16                ; out-of-range same-fd dup2 must fail
+    mov eax, 19
+    call ut_expect_ebadf_same_fd
+    test eax, eax
+    jne .ut_dup2_self_fail
+
+    ; Exercise the helper's second-failure cleanup path: make fd 5 valid,
+    ; then expect close(fd=5) to fail even though the helper's first fd=16
+    ; check still returns EBADF.  The helper must unwind to this call site.
+    mov edi, 1
+    mov esi, 5
+    mov eax, 19
+    syscall
+    cmp rax, 5
+    jne .ut_fd_errors_fail
+    xor esi, esi
+    xor edx, edx
+    mov eax, 13
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jz .ut_fd_errors_fail
+    lea rsi, [rel ut_str_fd_helper_failure_path]
+    call ut_print_str
+    lea rsi, [rel ut_str_fd_helper_cleanup_ok]
+    call ut_print_str
+
+    lea rsi, [rel ut_str_fd_errors_ok]
+    call ut_print_str
+    jmp .ut_test6
+
+.ut_fd_errors_fail:
+    lea rsi, [rel ut_str_fd_errors_fail]
+    call ut_print_str
+    jmp .ut_test6
+
+.ut_dup2_self_fail:
+    lea rsi, [rel ut_str_fd_fail]
+    call ut_print_str
+
+.ut_test6:
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; Test 6: VFS and legacy read/write error conventions
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; VFS IDs 14/15 use -EBADF for invalid/closed descriptors.
+    mov esi, 1                 ; non-null pointer: fd validation comes first
+    mov edx, 1
+    mov eax, 14                ; VFS read
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jnz .ut_vfs_fd_fail
+
+    mov eax, 15                ; VFS write
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jnz .ut_vfs_fd_fail
+
+    ; Legacy IDs 1/2 retain their VIBIX sentinels: write=0 and
+    ; read=u64::MAX for invalid descriptors.
+    mov edi, 16
+    mov esi, 1
+    mov edx, 1
+    mov eax, 1
+    syscall
+    test rax, rax
+    jnz .ut_vfs_fd_fail
+    mov edi, 16
+    mov eax, 2
+    syscall
+    cmp rax, -1
+    jne .ut_vfs_fd_fail
+
+    lea rsi, [rel ut_str_vfs_fd_ok]
+    call ut_print_str
+    jmp .ut_test7
+
+.ut_vfs_fd_fail:
+    lea rsi, [rel ut_str_fd_fail]
+    call ut_print_str
+
+.ut_test7:
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; Test 7: lseek/getdents/isatty/TTY invalid and closed descriptors
+    ; ══════════════════════════════════════════════════════════════════════════
+    xor esi, esi
+    xor edx, edx
+    mov eax, 16                ; lseek, out of range
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jne .ut_tty_fd_fail
+
+    mov esi, 1
+    mov edx, 1
+    mov eax, 17                ; getdents
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jne .ut_tty_fd_fail
+
+    xor esi, esi
+    xor edx, edx
+    mov eax, 24                ; isatty
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jne .ut_tty_fd_fail
+
+    mov esi, 1
+    xor edx, edx
+    mov eax, 25                ; tcgetattr
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jne .ut_tty_fd_fail
+
+    mov eax, 26                ; tcsetattr
+    call ut_expect_ebadf_fd
+    test eax, eax
+    jne .ut_tty_fd_fail
+
+    lea rsi, [rel ut_str_tty_fd_ok]
+    call ut_print_str
+    jmp .ut_test8
+
+.ut_tty_fd_fail:
+    lea rsi, [rel ut_str_fd_fail]
+    call ut_print_str
+
+.ut_test8:
+    ; ══════════════════════════════════════════════════════════════════════════
+    ; Test 8: dup2 replacement and observable OFT/refcount behavior
+    ; ══════════════════════════════════════════════════════════════════════════
+    lea rdi, [rel ut_pipefd2]
+    mov eax, 20                ; second pipe takes the freed fd slots
+    syscall
+    test rax, rax
+    jnz .ut_refcount_fail
+
+    mov edi, [rel ut_pipefd + 4]  ; source: first pipe write end
+    mov esi, [rel ut_pipefd2 + 4] ; target: second pipe write end
+    mov eax, 19
+    syscall
+    cmp eax, [rel ut_pipefd2 + 4]
+    jne .ut_refcount_fail
+
+    ; Repeat while both descriptors share the same OFT entry; this must not
+    ; drift its refcount.
+    mov edi, [rel ut_pipefd + 4]
+    mov esi, [rel ut_pipefd2 + 4]
+    mov eax, 19
+    syscall
+    cmp eax, [rel ut_pipefd2 + 4]
+    jne .ut_refcount_fail
+
+    ; Closing the original source must leave the replacement alias usable.
+    mov edi, [rel ut_pipefd + 4]
+    mov eax, 13
+    syscall
+    test rax, rax
+    jnz .ut_refcount_fail
+
+    mov edi, [rel ut_pipefd2 + 4]
+    lea rsi, [rel ut_pipe_data]
+    mov edx, 10
+    mov eax, 15                ; write through replacement alias
+    syscall
+    cmp eax, 10
+    jne .ut_refcount_fail
+
+    mov edi, [rel ut_pipefd]
+    lea rsi, [rel ut_readbuf]
+    mov edx, 10
+    mov eax, 14                ; read from original pipe read end
+    syscall
+    cmp eax, 10
+    jne .ut_refcount_fail
+
+    lea rsi, [rel ut_pipe_data]
+    lea rdi, [rel ut_readbuf]
+    mov rcx, 10
+    repe cmpsb
+    jne .ut_refcount_fail
+
+    ; Close the remaining aliases and both pipe read ends.
+    mov edi, [rel ut_pipefd2 + 4]
+    mov eax, 13
+    syscall
+    mov edi, [rel ut_pipefd2]
+    mov eax, 13
+    syscall
+    mov edi, [rel ut_pipefd]
+    mov eax, 13
+    syscall
+    lea rsi, [rel ut_str_refcount_ok]
+    call ut_print_str
     jmp .ut_done
 
-    ; ══════════════════════════════════════════════════════════════════════════
-    ; Done — print end marker and exit
-    ; ══════════════════════════════════════════════════════════════════════════
+.ut_refcount_fail:
+    lea rsi, [rel ut_str_fd_fail]
+    call ut_print_str
+
 .ut_done:
     lea rsi, [rel ut_str_end]
     call ut_print_str
@@ -227,6 +456,75 @@ ut_print_uint64:
     pop rbx
     ret
 
+; ── Helper: ut_expect_ebadf_fd(rax=syscall, rsi/rdx=args) ──────────────────────
+; Runs the same descriptor-only call for fd=16 and closed fd=5.
+; Returns eax=0 when both return -EBADF, eax=1 otherwise.
+ut_expect_ebadf_fd:
+    push rbx
+    push rsi
+    push rdx
+    push rax                ; syscall number survives the first syscall
+    mov eax, [rsp]
+    mov edi, 16
+    syscall
+    mov r8, UT_EBADF
+    cmp rax, r8
+    jne .expect_ebadf_fail
+    mov eax, [rsp]
+    mov edi, 5
+    mov rdx, [rsp + 8]
+    mov rsi, [rsp + 16]
+    syscall
+    mov r8, UT_EBADF
+    cmp rax, r8
+    jne .expect_ebadf_fail_after_args
+    ; Discard saved syscall number, then restore the saved argument registers.
+    add rsp, 8
+    pop rdx
+    pop rsi
+    pop rbx
+    xor eax, eax
+    ret
+
+.expect_ebadf_fail:
+    add rsp, 24             ; saved rax, rdx, rsi
+    jmp .expect_ebadf_cleanup
+.expect_ebadf_fail_after_args:
+    add rsp, 24             ; saved rax, rdx, rsi
+.expect_ebadf_cleanup:
+    pop rbx
+    mov eax, 1
+    ret
+
+ut_expect_ebadf_same_fd:
+    push rbx
+    push rdi
+    push rax                ; syscall number survives both syscalls
+    mov eax, [rsp]
+    mov edi, [rsp + 8]
+    mov esi, edi
+    syscall
+    mov r8, UT_EBADF
+    cmp rax, r8
+    jne .expect_same_fail
+    mov eax, [rsp]
+    mov edi, 5
+    mov esi, edi
+    syscall
+    mov r8, UT_EBADF
+    cmp rax, r8
+    jne .expect_same_fail
+    add rsp, 16
+    pop rbx
+    xor eax, eax
+    ret
+
+.expect_same_fail:
+    add rsp, 16
+    pop rbx
+    mov eax, 1
+    ret
+
 ; ── Strings ──────────────────────────────────────────────────────────────────
 section .text
 
@@ -249,6 +547,15 @@ ut_str_chdir_fail:   db "  [FAIL] chdir+getcwd test", 0x0A, 0
 ut_debug_cd:         db "CD=", 0
 ut_debug_gc:         db "GC=", 0
 
+ut_str_fd_errors_ok:   db "  [OK] fd bounds/closed semantics", 0x0A, 0
+ut_str_fd_errors_fail: db "  [FAIL] fd bounds/closed semantics", 0x0A, 0
+ut_str_fd_helper_failure_path: db "  [TRACE] fd helper second-failure path", 0x0A, 0
+ut_str_fd_helper_cleanup_ok: db "  [OK] fd helper second-failure cleanup", 0x0A, 0
+ut_str_fd_fail:        db "  [FAIL] fd semantics", 0x0A, 0
+ut_str_vfs_fd_ok:      db "  [OK] VFS/legacy fd errors", 0x0A, 0
+ut_str_tty_fd_ok:      db "  [OK] lseek/getdents/TTY fd errors", 0x0A, 0
+ut_str_refcount_ok:    db "  [OK] dup2 replacement/refcount", 0x0A, 0
+
 ut_str_end:         db "User Test End", 0x0A, 0
 ut_str_newline:     db 0x0A, 0
 
@@ -259,6 +566,8 @@ ut_path_dev:        db "/dev", 0
 ; ── Buffers (for pipe, cwd, number conversion) ──────────────────────────────
 align 8
 ut_pipefd:      dd 0, 0         ; [0]=read_fd, [4]=write_fd (2 i32s)
+ut_pipefd2:     dd 0, 0
+ut_dup_fd:      dd 0
 ut_readbuf:     resb 64
 ut_cwdbuf:      resb 256
 ut_num_buf:     resb 24

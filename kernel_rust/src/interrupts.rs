@@ -8,8 +8,8 @@
 //   - Default handler that prints exception info and halts
 //==============================================================================
 
-use core::fmt::Write;
 use crate::serial::SerialPort;
+use core::fmt::Write;
 
 //------------------------------------------------------------------------------
 // IDT entry — 16 bytes per entry
@@ -19,12 +19,12 @@ use crate::serial::SerialPort;
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct IdtEntry {
-    offset_low: u16,   // Bits 0-15 of handler address
-    selector: u16,     // Code segment selector (0x08 for kernel)
-    ist: u8,           // Interrupt Stack Table offset (0 = disabled)
-    flags: u8,         // Type, DPL, Present
-    offset_mid: u16,   // Bits 16-31 of handler address
-    offset_high: u32,  // Bits 32-63 of handler address
+    offset_low: u16,  // Bits 0-15 of handler address
+    selector: u16,    // Code segment selector (0x08 for kernel)
+    ist: u8,          // Interrupt Stack Table offset (0 = disabled)
+    flags: u8,        // Type, DPL, Present
+    offset_mid: u16,  // Bits 16-31 of handler address
+    offset_high: u32, // Bits 32-63 of handler address
     reserved: u32,
 }
 
@@ -50,7 +50,7 @@ impl IdtEntry {
         self.offset_low = handler as u16;
         self.selector = selector;
         self.ist = 0;
-        self.flags = 0x8E | ((dpl & 3) << 5);  // present, ring dpl, interrupt gate (0xE)
+        self.flags = 0x8E | ((dpl & 3) << 5); // present, ring dpl, interrupt gate (0xE)
         self.offset_mid = (handler >> 16) as u16;
         self.offset_high = (handler >> 32) as u32;
         self.reserved = 0;
@@ -69,7 +69,9 @@ pub struct Idt {
 
 impl Idt {
     pub const fn new() -> Self {
-        Self { entries: [IdtEntry::missing(); 256] }
+        Self {
+            entries: [IdtEntry::missing(); 256],
+        }
     }
 
     pub fn set(&mut self, index: usize, handler: u64, selector: u16, dpl: u8) {
@@ -131,10 +133,9 @@ extern "C" {
 
 /// Array of ISR entry points, indexed by interrupt number.
 static ISR_STUBS: [unsafe extern "C" fn(); 32] = [
-    isr0,  isr1,  isr2,  isr3,  isr4,  isr5,  isr6,  isr7,
-    isr8,  isr9,  isr10, isr11, isr12, isr13, isr14, isr15,
-    isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23,
-    isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31,
+    isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7, isr8, isr9, isr10, isr11, isr12, isr13, isr14,
+    isr15, isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23, isr24, isr25, isr26, isr27,
+    isr28, isr29, isr30, isr31,
 ];
 
 //------------------------------------------------------------------------------
@@ -162,8 +163,8 @@ extern "C" {
 
 /// Array of IRQ entry points, indexed by IRQ number.
 static IRQ_STUBS: [unsafe extern "C" fn(); 16] = [
-    irq0,  irq1,  irq2,  irq3,  irq4,  irq5,  irq6,  irq7,
-    irq8,  irq9,  irq10, irq11, irq12, irq13, irq14, irq15,
+    irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14,
+    irq15,
 ];
 
 //------------------------------------------------------------------------------
@@ -181,10 +182,21 @@ static IRQ_STUBS: [unsafe extern "C" fn(); 16] = [
 #[repr(C)]
 #[derive(Debug)]
 pub struct SavedRegisters {
-    pub rax: u64, pub rcx: u64, pub rdx: u64, pub rbx: u64,
-    pub rbp: u64, pub rsi: u64, pub rdi: u64, pub r8: u64,
-    pub r9: u64,  pub r10: u64, pub r11: u64, pub r12: u64,
-    pub r13: u64, pub r14: u64, pub r15: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 }
 
 /// Complete interrupt frame, including CPU-pushed state.
@@ -209,11 +221,11 @@ pub struct InterruptFrame {
 //------------------------------------------------------------------------------
 
 const PIC1_COMMAND: u16 = 0x20;
-const PIC1_DATA:    u16 = 0x21;
+const PIC1_DATA: u16 = 0x21;
 const PIC2_COMMAND: u16 = 0xA0;
-const PIC2_DATA:    u16 = 0xA1;
+const PIC2_DATA: u16 = 0xA1;
 
-const PIC_ICW1: u8 = 0x11;     // ICW4 needed, cascade mode
+const PIC_ICW1: u8 = 0x11; // ICW4 needed, cascade mode
 const PIC_ICW4_8086: u8 = 0x01;
 
 /// Remap the PIC to move IRQ vectors away from CPU exception vectors (0–31).
@@ -237,8 +249,8 @@ pub fn remap_pic(master_offset: u8, slave_offset: u8) {
         outb(PIC2_DATA, slave_offset);
 
         // ICW3: cascade configuration
-        outb(PIC1_DATA, 0x04);   // slave on IRQ2 (bit mask 0x04)
-        outb(PIC2_DATA, 0x02);   // cascade identity = 2
+        outb(PIC1_DATA, 0x04); // slave on IRQ2 (bit mask 0x04)
+        outb(PIC2_DATA, 0x02); // cascade identity = 2
 
         // ICW4: 8086 mode
         outb(PIC1_DATA, PIC_ICW4_8086);
@@ -344,7 +356,7 @@ pub unsafe fn disable_interrupts() {
 /// Note: Interrupts are NOT enabled by default.  Call `enable_interrupts()`
 /// when ready.
 pub fn init_interrupts() {
-    let selector = 0x08;  // kernel code segment from GDT
+    let selector = 0x08; // kernel code segment from GDT
 
     unsafe {
         let idt: *mut Idt = &raw mut IDT;
@@ -352,13 +364,13 @@ pub fn init_interrupts() {
         // Set up handlers for CPU exceptions 0–31
         for i in 0..32 {
             let handler = ISR_STUBS[i] as u64;
-            (*idt).set(i, handler, selector, 0);  // dpl = 0 (kernel)
+            (*idt).set(i, handler, selector, 0); // dpl = 0 (kernel)
         }
 
         // Set up handlers for PIC IRQs 0–15 at vectors 32–47
         for i in 0..16 {
             let handler = IRQ_STUBS[i] as u64;
-            (*idt).set(32 + i, handler, selector, 0);  // dpl = 0 (kernel)
+            (*idt).set(32 + i, handler, selector, 0); // dpl = 0 (kernel)
         }
 
         // Remap PIC to put IRQs at vectors 0x20–0x2F (32–47)
@@ -545,7 +557,12 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
             if addr < 0x288000 {
                 let val: u64 = unsafe { core::ptr::read_volatile(addr as *const u64) };
                 let v_buf = hex_str(val);
-                let _ = write!(serial, "VIBIX:   [{:+3}]: {}\n", i * 8, core::str::from_utf8(&v_buf).unwrap_or("???"));
+                let _ = write!(
+                    serial,
+                    "VIBIX:   [{:+3}]: {}\n",
+                    i * 8,
+                    core::str::from_utf8(&v_buf).unwrap_or("???")
+                );
             }
         }
         // Also dump the raw stack from ktop-40 down
@@ -555,7 +572,12 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
             let addr = KTOP - 40 + i * 8;
             let val: u64 = unsafe { core::ptr::read_volatile(addr as *const u64) };
             let v_buf = hex_str(val);
-            let _ = write!(serial, "VIBIX:   [{:+3}]: {}\n", KTOP as i64 - 40 + i as i64 * 8, core::str::from_utf8(&v_buf).unwrap_or("???"));
+            let _ = write!(
+                serial,
+                "VIBIX:   [{:+3}]: {}\n",
+                KTOP as i64 - 40 + i as i64 * 8,
+                core::str::from_utf8(&v_buf).unwrap_or("???")
+            );
         }
 
         serial.writestrs(&["VIBIX: frame_ptr="]);
@@ -566,35 +588,95 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
     // Print saved registers
     serial.writestrs(&["VIBIX: Registers:\n"]);
     let rax_buf = hex_str(frame.regs.rax);
-    serial.writestrs(&["VIBIX:   RAX: ", core::str::from_utf8(&rax_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RAX: ",
+        core::str::from_utf8(&rax_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rbx_buf = hex_str(frame.regs.rbx);
-    serial.writestrs(&["VIBIX:   RBX: ", core::str::from_utf8(&rbx_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RBX: ",
+        core::str::from_utf8(&rbx_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rcx_buf = hex_str(frame.regs.rcx);
-    serial.writestrs(&["VIBIX:   RCX: ", core::str::from_utf8(&rcx_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RCX: ",
+        core::str::from_utf8(&rcx_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rdx_buf = hex_str(frame.regs.rdx);
-    serial.writestrs(&["VIBIX:   RDX: ", core::str::from_utf8(&rdx_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RDX: ",
+        core::str::from_utf8(&rdx_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rsi_buf = hex_str(frame.regs.rsi);
-    serial.writestrs(&["VIBIX:   RSI: ", core::str::from_utf8(&rsi_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RSI: ",
+        core::str::from_utf8(&rsi_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rdi_buf = hex_str(frame.regs.rdi);
-    serial.writestrs(&["VIBIX:   RDI: ", core::str::from_utf8(&rdi_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RDI: ",
+        core::str::from_utf8(&rdi_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let rbp_buf = hex_str(frame.regs.rbp);
-    serial.writestrs(&["VIBIX:   RBP: ", core::str::from_utf8(&rbp_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   RBP: ",
+        core::str::from_utf8(&rbp_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r8_buf = hex_str(frame.regs.r8);
-    serial.writestrs(&["VIBIX:    R8: ", core::str::from_utf8(&r8_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:    R8: ",
+        core::str::from_utf8(&r8_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r9_buf = hex_str(frame.regs.r9);
-    serial.writestrs(&["VIBIX:    R9: ", core::str::from_utf8(&r9_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:    R9: ",
+        core::str::from_utf8(&r9_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r10_buf = hex_str(frame.regs.r10);
-    serial.writestrs(&["VIBIX:   R10: ", core::str::from_utf8(&r10_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R10: ",
+        core::str::from_utf8(&r10_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r11_buf = hex_str(frame.regs.r11);
-    serial.writestrs(&["VIBIX:   R11: ", core::str::from_utf8(&r11_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R11: ",
+        core::str::from_utf8(&r11_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r12_buf = hex_str(frame.regs.r12);
-    serial.writestrs(&["VIBIX:   R12: ", core::str::from_utf8(&r12_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R12: ",
+        core::str::from_utf8(&r12_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r13_buf = hex_str(frame.regs.r13);
-    serial.writestrs(&["VIBIX:   R13: ", core::str::from_utf8(&r13_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R13: ",
+        core::str::from_utf8(&r13_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r14_buf = hex_str(frame.regs.r14);
-    serial.writestrs(&["VIBIX:   R14: ", core::str::from_utf8(&r14_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R14: ",
+        core::str::from_utf8(&r14_buf).unwrap_or("???"),
+        "\n",
+    ]);
     let r15_buf = hex_str(frame.regs.r15);
-    serial.writestrs(&["VIBIX:   R15: ", core::str::from_utf8(&r15_buf).unwrap_or("???"), "\n"]);
+    serial.writestrs(&[
+        "VIBIX:   R15: ",
+        core::str::from_utf8(&r15_buf).unwrap_or("???"),
+        "\n",
+    ]);
 
     serial.writestrs(&["========================================\n"]);
 
@@ -613,7 +695,7 @@ pub extern "C" fn interrupt_handler(frame: &InterruptFrame) {
 /// Dispatches to the appropriate device driver based on IRQ number.
 #[no_mangle]
 pub extern "C" fn irq_handler(frame: &InterruptFrame) {
-    let irq = frame.int_no.wrapping_sub(32);  // PIC offset 0x20 → 0..15
+    let irq = frame.int_no.wrapping_sub(32); // PIC offset 0x20 → 0..15
     #[cfg(feature = "debug")]
     crate::scheduler_evidence::user_return(
         crate::process::current_pid(),
@@ -623,6 +705,6 @@ pub extern "C" fn irq_handler(frame: &InterruptFrame) {
     match irq {
         0 => crate::pit::tick(),
         1 => crate::keyboard::handle_keyboard(),
-        _ => {}  // unknown/spurious IRQ — ignore
+        _ => {} // unknown/spurious IRQ — ignore
     }
 }
