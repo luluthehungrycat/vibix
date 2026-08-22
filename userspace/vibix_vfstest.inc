@@ -16,7 +16,6 @@
 ; ── Test entry point ──────────────────────────────────────────────────────────
 vfs_test:
     ; Set up stack
-    mov rsp, 0x2003000
 
     push rbx
     push r12

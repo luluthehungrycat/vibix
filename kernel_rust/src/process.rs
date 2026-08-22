@@ -10,11 +10,11 @@ use crate::pmm::PmmAllocator;
 
 const MAX_PROCS: usize = 64;
 const KERNEL_STACK_SIZE: usize = 12288; // 12 KB (3 pages)
-const USER_CODE_ADDR: u64 = 0x2000000;
-const USER_STACK_ADDR: u64 = 0x2002000;
+pub const USER_CODE_ADDR: u64 = 0x2000000;
+const FLAT_USER_LIMIT: u64 = BRK_START;
 
 /// BRK start address (shared constant for per-process brk)
-pub const BRK_START: u64 = 0x500_0000; // Start well above ELF stack (0x2010000) and flat binary stack
+pub const BRK_START: u64 = 0x500_0000; // Start well above the ELF and flat-binary stacks
 pub const BRK_MAX: u64 = 0x1000_0000;
 // SIGINT constant moved to signal.rs (crate::signal::SIGINT)
 pub const WNOHANG: u64 = 1;
@@ -250,56 +250,320 @@ fn build_fork_frame(kstack_top: u64) -> u64 {
 
 // --- Binary loader ---
 
-/// Load a flat binary from a raw data pointer to user pages.
-/// Maps pages at USER_CODE_ADDR (code) and USER_STACK_ADDR (stack).
-pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator, pml4_phys: u64) {
-    use core::cmp::min;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatLoadError {
+    InvalidSize,
+    AddressOverflow,
+    Oversize,
+    Oom,
+    MappingCollision,
+}
+
+pub struct FlatImage {
+    pub root: paging::Pml4Handle,
+    pub user_rsp: u64,
+    pub stack_low: u64,
+}
+
+/// Build a flat image and its post-code stack under a fresh, uncommitted root.
+/// The old address space is never touched by this builder.
+// Keep this transaction's stack frame bounded; DEBUG kernel_main runs on a
+// fixed 16 KiB bootstrap stack.
+#[inline(never)]
+fn build_flat_image_inner(
+    data: *const u8,
+    size: usize,
+    pmm: &mut PmmAllocator,
+    fail_after_allocations: Option<usize>,
+) -> Result<FlatImage, FlatLoadError> {
+    if data.is_null() || size == 0 {
+        return Err(FlatLoadError::InvalidSize);
+    }
+    let size_u64 = u64::try_from(size).map_err(|_| FlatLoadError::AddressOverflow)?;
+    let rounded = size_u64
+        .checked_add(0xfff)
+        .ok_or(FlatLoadError::AddressOverflow)?;
+    let pages_needed = rounded / 0x1000;
+    let pages = core::cmp::max(pages_needed, 2);
+    let code_bytes = pages
+        .checked_mul(0x1000)
+        .ok_or(FlatLoadError::AddressOverflow)?;
+    let stack_addr = USER_CODE_ADDR
+        .checked_add(code_bytes)
+        .ok_or(FlatLoadError::AddressOverflow)?;
+    let stack_end = stack_addr
+        .checked_add(0x1000)
+        .ok_or(FlatLoadError::AddressOverflow)?;
+    if stack_end > FLAT_USER_LIMIT {
+        return Err(FlatLoadError::Oversize);
+    }
+    if paging::overlaps_kernel_scratch(USER_CODE_ADDR, stack_end) {
+        return Err(FlatLoadError::Oversize);
+    }
+
+    let root = paging::create_pml4(pmm, false).ok_or(FlatLoadError::Oom)?;
     let mut bytes_left = size;
     let mut src_offset = 0usize;
     let mut virt_addr = USER_CODE_ADDR;
-
-    // Allocate enough pages for the binary (minimum 2 like before)
-    let min_pages = 2;
-    let pages_needed = (size + 0xfff) / 0x1000;
-    let pages = if pages_needed < min_pages {
-        min_pages
-    } else {
-        pages_needed
-    };
+    let mut allocations = 0usize;
 
     for _ in 0..pages {
+        if fail_after_allocations == Some(allocations) {
+            paging::destroy_uncommitted_pml4(root, pmm);
+            return Err(FlatLoadError::Oom);
+        }
         let page = pmm.alloc();
+        allocations += 1;
         if page.is_null() {
-            loop {
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            paging::destroy_uncommitted_pml4(root, pmm);
+            return Err(FlatLoadError::Oom);
+        }
+        let copy_len = core::cmp::min(bytes_left, 0x1000);
+        unsafe {
+            // PMM pages may retain bytes from an earlier owner.  Clear every
+            // newly allocated code page before copying, including pages with
+            // no source bytes, so flat BSS/tails cannot expose stale data.
+            core::ptr::write_bytes(page, 0, 0x1000);
+            if copy_len != 0 {
+                core::ptr::copy_nonoverlapping(data.add(src_offset), page, copy_len);
             }
         }
-        let copy_len = min(bytes_left, 0x1000);
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.add(src_offset), page, copy_len);
+        if !paging::try_map_4k_target(
+            virt_addr,
+            page as u64,
+            paging::PAGE_USER_RW,
+            pmm,
+            root.phys,
+        ) {
+            pmm.free(page);
+            paging::destroy_uncommitted_pml4(root, pmm);
+            return Err(FlatLoadError::MappingCollision);
         }
-        paging::map_4k_target(virt_addr, page as u64, paging::PAGE_USER_RW, pmm, pml4_phys);
-        paging::invlpg(virt_addr); // Flush TLB for this page
-        src_offset += 0x1000;
-        virt_addr += 0x1000;
+        paging::invlpg(virt_addr);
+        src_offset = src_offset
+            .checked_add(0x1000)
+            .ok_or_else(|| {
+                paging::destroy_uncommitted_pml4(root, pmm);
+                FlatLoadError::AddressOverflow
+            })?;
+        virt_addr = virt_addr
+            .checked_add(0x1000)
+            .ok_or_else(|| {
+                paging::destroy_uncommitted_pml4(root, pmm);
+                FlatLoadError::AddressOverflow
+            })?;
         bytes_left = bytes_left.saturating_sub(0x1000);
     }
 
-    // Allocate and map stack page
+    if fail_after_allocations == Some(allocations) {
+        paging::destroy_uncommitted_pml4(root, pmm);
+        return Err(FlatLoadError::Oom);
+    }
     let stack_page = pmm.alloc();
     if stack_page.is_null() {
-        loop {
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
-        }
+        paging::destroy_uncommitted_pml4(root, pmm);
+        return Err(FlatLoadError::Oom);
     }
-    paging::map_4k_target(
-        USER_STACK_ADDR,
+    if !paging::try_map_4k_target(
+        stack_addr,
         stack_page as u64,
         paging::PAGE_USER_RW,
         pmm,
-        pml4_phys,
+        root.phys,
+    ) {
+        pmm.free(stack_page);
+        paging::destroy_uncommitted_pml4(root, pmm);
+        return Err(FlatLoadError::MappingCollision);
+    }
+    paging::invlpg(stack_addr);
+    Ok(FlatImage {
+        root,
+        user_rsp: stack_end,
+        stack_low: stack_addr,
+    })
+}
+
+pub fn build_flat_image(
+    data: *const u8,
+    size: usize,
+    pmm: &mut PmmAllocator,
+) -> Result<FlatImage, FlatLoadError> {
+    build_flat_image_inner(data, size, pmm, None)
+}
+
+#[cfg(feature = "debug")]
+fn build_flat_image_with_failure(
+    data: *const u8,
+    size: usize,
+    pmm: &mut PmmAllocator,
+    fail_after_allocations: usize,
+) -> Result<FlatImage, FlatLoadError> {
+    build_flat_image_inner(data, size, pmm, Some(fail_after_allocations))
+}
+
+#[cfg(feature = "debug")]
+static FLAT_ROLLBACK_DATA: [u8; 0x1001] = [0x90; 0x1001];
+
+#[cfg(feature = "debug")]
+static FLAT_SMALL_DATA: [u8; 1] = [0xCC];
+
+/// DEBUG-only proof that flat construction is fresh-root and failure-atomic.
+#[cfg(feature = "debug")]
+// Keep the fixture's large PMM-reuse arrays out of kernel_main's bootstrap
+// frame while exercising the real builder.
+#[inline(never)]
+pub fn test_flat_image_failures(
+    pmm: &mut PmmAllocator,
+    serial: &mut crate::serial::SerialPort,
+) -> bool {
+    // Use an existing kernel-only identity mapping as the old-root sentinel.
+    // The fresh builder must not alter it, and using a pre-existing branch
+    // avoids allocating fixture page tables in the active root.
+    const OLD_ADDR: u64 = 0x1000;
+    let saved_cr3 = paging::read_cr3();
+    let old_cr3 = saved_cr3;
+    let old_mapping = paging::translate_in_pml4(OLD_ADDR, old_cr3);
+    let old_mapped = old_mapping.is_some();
+    let flat_data = FLAT_ROLLBACK_DATA.as_ptr();
+    let small_data = FLAT_SMALL_DATA.as_ptr();
+    // Seed several soon-to-be-reused PMM pages with non-zero data.  The fresh
+    // root consumes a few table pages before its code pages, so keeping a
+    // short run makes the fixture exercise reuse rather than merely observing
+    // a never-before-used frame.
+    let mut stale_frames = [0u64; 8];
+    let mut stale_seed_ok = true;
+    for frame in &mut stale_frames {
+        let page = pmm.alloc();
+        if page.is_null() {
+            stale_seed_ok = false;
+            break;
+        }
+        unsafe { core::ptr::write_bytes(page, 0xA5, 0x1000) };
+        *frame = page as u64;
+    }
+    for frame in &stale_frames {
+        if *frame != 0 {
+            pmm.free(*frame as *mut u8);
+        }
+    }
+
+    let small_binary_ok = match build_flat_image(small_data, 1, pmm) {
+        Ok(image) => {
+            let code_first = paging::translate_in_pml4(USER_CODE_ADDR, image.root.phys);
+            let code_second = paging::translate_in_pml4(USER_CODE_ADDR + 0x1000, image.root.phys);
+            let stack = paging::translate_in_pml4(image.stack_low, image.root.phys);
+            let mut first_tail_zero = false;
+            let mut second_page_zero = false;
+            let mut stale_frame_reused = false;
+            unsafe {
+                if let Some(first_phys) = code_first {
+                    stale_frame_reused |= stale_frames.iter().any(|frame| *frame == first_phys);
+                    let first = first_phys as *const u8;
+                    first_tail_zero = *first == FLAT_SMALL_DATA[0];
+                    for offset in 1..0x1000 {
+                        if *first.add(offset) != 0 {
+                            first_tail_zero = false;
+                            break;
+                        }
+                    }
+                }
+                if let Some(second_phys) = code_second {
+                    stale_frame_reused |= stale_frames.iter().any(|frame| *frame == second_phys);
+                    let second = second_phys as *const u8;
+                    second_page_zero = true;
+                    for offset in 0..0x1000 {
+                        if *second.add(offset) != 0 {
+                            second_page_zero = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            let layout_ok = code_first.is_some()
+                && code_second.is_some()
+                && stack.is_some()
+                && image.user_rsp == image.stack_low + 0x1000;
+            paging::destroy_uncommitted_pml4(image.root, pmm);
+            stale_seed_ok
+                && stale_frame_reused
+                && layout_ok
+                && first_tail_zero
+                && second_page_zero
+        }
+        Err(_) => false,
+    };
+
+    let oversize = (FLAT_USER_LIMIT - USER_CODE_ADDR) as usize;
+    let oversize_ok = matches!(
+        build_flat_image(flat_data, oversize, pmm),
+        Err(FlatLoadError::Oversize)
     );
-    paging::invlpg(USER_STACK_ADDR); // Flush TLB for stack page
+
+    let mut expected = [0u64; 32];
+    let mut reuse_ok = true;
+    for frame in &mut expected {
+        *frame = pmm.alloc() as u64;
+        if *frame == 0 {
+            reuse_ok = false;
+            break;
+        }
+    }
+    for frame in &expected {
+        if *frame != 0 {
+            pmm.free(*frame as *mut u8);
+        }
+    }
+    let failed = build_flat_image_with_failure(flat_data, 0x1001, pmm, 1);
+    let old_state_ok = paging::read_cr3() == saved_cr3
+        && paging::translate_in_pml4(OLD_ADDR, old_cr3) == old_mapping
+        && old_mapped;
+    let mut recycled = [0u64; 32];
+    for frame in &mut recycled {
+        *frame = pmm.alloc() as u64;
+        if *frame == 0 {
+            reuse_ok = false;
+            break;
+        }
+    }
+    for frame in &recycled {
+        if *frame != 0 {
+            pmm.free(*frame as *mut u8);
+        }
+    }
+    expected.sort_unstable();
+    recycled.sort_unstable();
+    reuse_ok &= expected == recycled;
+    let failure_ok = matches!(failed, Err(FlatLoadError::Oom)) && old_state_ok && reuse_ok;
+    serial.writestrs(
+        [
+            "FLAT TEST: allocation rollback ",
+            if failure_ok { "PASS\n" } else { "FAIL\n" },
+        ]
+        .as_ref(),
+    );
+    serial.writestrs(
+        [
+            "FLAT TEST: oversize rejection ",
+            if oversize_ok { "PASS\n" } else { "FAIL\n" },
+        ]
+        .as_ref(),
+    );
+    serial.writestrs(
+        [
+            "FLAT TEST: old-root no-overwrite ",
+            if old_state_ok { "PASS\n" } else { "FAIL\n" },
+        ]
+        .as_ref(),
+    );
+    serial.writestrs(
+        [
+            "FLAT TEST: small-binary zero-tail/no-stale copy ",
+            if small_binary_ok { "PASS\n" } else { "FAIL\n" },
+        ]
+        .as_ref(),
+    );
+
+    failure_ok && oversize_ok && small_binary_ok
 }
 
 // --- Init process + idle process ---
@@ -307,35 +571,27 @@ pub fn load_flat_binary(data: *const u8, size: usize, pmm: &mut PmmAllocator, pm
 /// Create and register the init process (PID 1) and idle process (PID 2).
 /// Returns PID of init.
 pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
-    // Create PID 1 PML4 — kernel mappings only
-    let pid1_pml4 = crate::paging::create_pml4(pmm, false);
-
     // Load PID 1 binary from initramfs via VFS
-    match crate::vfs::vfs_resolve(b"/sbin/init") {
-        Ok(vn) => {
-            let data = vn.data as *const u8;
-            let size = vn.size as usize;
-            if !data.is_null() && size > 0 {
-                load_flat_binary(data, size, pmm, pid1_pml4);
-                if cfg!(feature = "debug") {
-                    paging::debug_dump_walk(
-                        "after spawn_init flat load",
-                        USER_CODE_ADDR,
-                        pid1_pml4,
-                    );
-                }
-            } else if cfg!(feature = "debug") {
-                let mut serial = crate::serial::SerialPort::new();
-                serial.init();
-                serial.writestrs(&["DBG INIT: /sbin/init has null data or zero size\n"]);
-            }
-        }
-        Err(_) if cfg!(feature = "debug") => {
-            let mut serial = crate::serial::SerialPort::new();
-            serial.init();
-            serial.writestrs(&["DBG INIT: vfs_resolve(/sbin/init) failed\n"]);
-        }
-        Err(_) => {}
+    let pid1_image = match crate::vfs::vfs_resolve(b"/sbin/init") {
+        Ok(vn) if !vn.data.is_null() && vn.size > 0 =>
+            match build_flat_image(vn.data as *const u8, vn.size as usize, pmm) {
+                Ok(image) => image,
+                Err(_) => loop {
+                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+                },
+            },
+        _ => loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        },
+    };
+    let pid1_pml4 = pid1_image.root.phys;
+    let user_rsp = pid1_image.user_rsp;
+    if cfg!(feature = "debug") {
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        use core::fmt::Write;
+        let _ = writeln!(serial, "DBG INIT FLAT STACK: rsp={:016x}", user_rsp);
+        paging::debug_dump_walk("after spawn_init flat load", USER_CODE_ADDR, pid1_pml4);
     }
     if cfg!(feature = "debug") {
         paging::debug_dump_walk("spawn_init final", USER_CODE_ADDR, pid1_pml4);
@@ -349,8 +605,9 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         }
     }
     let ktop = kstack_page as u64 + KERNEL_STACK_SIZE as u64;
-    // Build synthetic frame with command_id=1 (init_demo, not shell)
-    let krsp = build_init_frame(ktop, USER_CODE_ADDR, USER_STACK_ADDR + 0x1000, 1);
+    // Build synthetic frame with command_id=1 (init_demo, not shell).
+    // The flat loader's stack is placed after the complete binary.
+    let krsp = build_init_frame(ktop, USER_CODE_ADDR, user_rsp, 1);
 
     let table = unsafe { &mut PROCESS_TABLE };
     table.slots[0] = Some(Process {
@@ -358,7 +615,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         pml4_phys: pid1_pml4,
         state: ProcessState::Ready,
         entry: USER_CODE_ADDR,
-        user_rsp: USER_STACK_ADDR + 0x1000,
+        user_rsp,
         kernel_stack_top: ktop,
         kernel_rsp: krsp,
         kernel_stack_base: kstack_page as u64,
@@ -371,7 +628,7 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
         sigactions: [Default::default(); 32],
         in_signal: false,
         sigframe_rsp: 0,
-        stack_low: USER_STACK_ADDR,
+        stack_low: user_rsp - 0x1000,
         name: {
             let mut n = [0u8; 32];
             let bytes = b"init\0";
@@ -453,10 +710,15 @@ pub fn spawn_init(pmm: &mut PmmAllocator) -> u64 {
     }
 
     // Create idle PML4 — kernel mappings only
-    let idle_pml4 = crate::paging::create_pml4(pmm, false);
+    let idle_root = match crate::paging::create_pml4(pmm, false) {
+        Some(root) => root,
+        None => loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        },
+    };
     table.slots[1] = Some(Process {
         pid: 2,
-        pml4_phys: idle_pml4,
+        pml4_phys: idle_root.phys,
         state: ProcessState::Ready,
         entry: idle_entry as *const () as u64,
         user_rsp: 0,
@@ -786,10 +1048,18 @@ pub fn sys_fork() -> i64 {
     // Child returns to the instruction after fork syscall with RAX=0.
 
     // Create child PML4 — copy kernel + user mappings from parent
-    let child_pml4 = {
+    let child_root = {
         let pmm = crate::pmm::global_pmm();
         crate::paging::create_pml4(pmm, true)
     };
+    let child_root = match child_root {
+        Some(root) => root,
+        None => {
+            crate::pmm::global_pmm().free(child_kstack);
+            return -12; // ENOMEM
+        }
+    };
+    let child_pml4 = child_root.phys;
     let child_krsp = build_fork_frame(child_ktop);
 
     // Assign child PID
@@ -851,7 +1121,11 @@ pub fn sys_fork() -> i64 {
             }
             child_pid as i64
         }
-        None => -1, // EAGAIN — no free slot
+        None => {
+            crate::paging::destroy_uncommitted_pml4(child_root, crate::pmm::global_pmm());
+            crate::pmm::global_pmm().free(child_kstack);
+            -1 // EAGAIN — no free slot
+        }
     }
 }
 
@@ -859,13 +1133,13 @@ pub fn sys_fork() -> i64 {
 /// Supports both ELF64 executables and flat binaries.
 pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     let pid = current_pid();
-    let proc = process_mut(pid);
+    let old_proc = process(pid);
     if cfg!(feature = "debug") {
         use core::fmt::Write;
         let (saved_rip, saved_rsp) = unsafe { (syscall_state.rip, syscall_state.rsp) };
         let mut serial = crate::serial::SerialPort::new();
         serial.init();
-        let _ = write!(serial, "DBG EXEC BEGIN: pid={} state={:?} cr3={:016x} pml4={:016x} rip={:016x} rsp={:016x} krsp={:016x}\n", pid, proc.state, crate::paging::read_cr3(), proc.pml4_phys, saved_rip, saved_rsp, proc.kernel_rsp);
+        let _ = write!(serial, "DBG EXEC BEGIN: pid={} state={:?} cr3={:016x} pml4={:016x} rip={:016x} rsp={:016x} krsp={:016x}\n", pid, old_proc.state, crate::paging::read_cr3(), old_proc.pml4_phys, saved_rip, saved_rsp, old_proc.kernel_rsp);
     }
 
     // 1. Copy path string from user space
@@ -914,129 +1188,85 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
 
     // 4. Check for ELF magic and dispatch accordingly
     let entry: u64;
+    let user_rsp: u64;
+    let stack_low: u64;
+    let root: crate::paging::Pml4Handle;
+    #[cfg(feature = "debug")]
     let mut is_elf = false;
-    let mut elf_user_rsp: u64 = USER_STACK_ADDR + 0x1000;
     unsafe {
         let magic = core::slice::from_raw_parts(data, 4);
         if magic == b"ELF" {
-            // ELF64 binary — use the ELF loader
+            // ELF64 binary — build into a fresh private address space. The
+            // current image is committed only after loading and stack setup.
             let data_slice = core::slice::from_raw_parts(data, size);
-            match crate::elf::load(data_slice, pmm, proc.pml4_phys) {
-                Ok(ep) => {
-                    if cfg!(feature = "debug") {
-                        use core::fmt::Write;
-                        let mut serial = crate::serial::SerialPort::new();
-                        serial.init();
-                        let _ = write!(
-                            serial,
-                            "DBG EXEC LOADED: pid={} cr3={:016x} pml4={:016x} entry={:016x}\n",
-                            pid,
-                            crate::paging::read_cr3(),
-                            proc.pml4_phys,
-                            ep
-                        );
-                    }
+            match crate::elf::build_exec_image(data_slice, pmm) {
+                Ok(image) => {
+                    entry = image.entry;
+                    user_rsp = image.user_rsp;
+                    stack_low = image.stack_low;
+                    root = image.root;
                     #[cfg(feature = "debug")]
-                    if path_slice == b"/bin/vish" {
-                        crate::scheduler_evidence::register_target(
-                            pid,
-                            proc.pml4_phys,
-                            data_slice,
-                            ep,
-                        );
+                    {
+                        is_elf = true;
                     }
-                    // ELF loader maps segments but NOT the user stack.
-                    // Use a larger stack (64 KiB, 16 pages) starting at 0x2020000
-                    // (top) growing down to accommodate Rust's format! and allocator calls.
-                    const ELF_STACK_PAGES: u64 = 16;
-                    const ELF_STACK_TOP_PAGE: u64 = 0x2020000;
-                    let mut page_addr = ELF_STACK_TOP_PAGE;
-                    for stack_index in 0..ELF_STACK_PAGES {
-                        if cfg!(feature = "debug") {
-                            use core::fmt::Write;
-                            let mut serial = crate::serial::SerialPort::new();
-                            serial.init();
-                            let _ = write!(
-                                serial,
-                                "DBG EXEC STACK PAGE: pid={} index={} vaddr={:016x} before_alloc\n",
-                                pid, stack_index, page_addr
-                            );
-                        }
-                        let sp = pmm.alloc();
-                        if sp.is_null() {
-                            return -12;
-                        }
-                        if cfg!(feature = "debug") {
-                            use core::fmt::Write;
-                            let mut serial = crate::serial::SerialPort::new();
-                            serial.init();
-                            let _ = write!(
-                                serial,
-                                "DBG EXEC STACK PAGE: pid={} index={} paddr={:016x} before_map\n",
-                                pid, stack_index, sp as u64
-                            );
-                        }
-                        crate::paging::map_4k(
-                            page_addr,
-                            sp as u64,
-                            crate::paging::PAGE_USER_RW,
-                            pmm,
-                        );
-                        if cfg!(feature = "debug") {
-                            use core::fmt::Write;
-                            let mut serial = crate::serial::SerialPort::new();
-                            serial.init();
-                            let _ = write!(
-                                serial,
-                                "DBG EXEC STACK PAGE: pid={} index={} vaddr={:016x} after_map\n",
-                                pid, stack_index, page_addr
-                            );
-                        }
-                        paging::invlpg(page_addr);
-                        page_addr -= 0x1000;
-                    }
-                    elf_user_rsp = ELF_STACK_TOP_PAGE + 0x1000;
-                    if cfg!(feature = "debug") {
-                        use core::fmt::Write;
-                        let mut serial = crate::serial::SerialPort::new();
-                        serial.init();
-                        let _ = write!(serial, "DBG EXEC STACK: pid={} cr3={:016x} pml4={:016x} entry={:016x} rsp={:016x}\n", pid, crate::paging::read_cr3(), proc.pml4_phys, ep, elf_user_rsp);
-                        paging::debug_dump_walk("after exec ELF stack", 0x2000000, proc.pml4_phys);
-                    }
-                    entry = ep;
-                    is_elf = true;
                 }
-                Err(e) => {
-                    return match e {
-                        crate::elf::ElfError::BadMagic
-                        | crate::elf::ElfError::BadClass
-                        | crate::elf::ElfError::BadEndian
-                        | crate::elf::ElfError::BadMachine
-                        | crate::elf::ElfError::BadType
-                        | crate::elf::ElfError::Truncated => -22, // EINVAL
-                        crate::elf::ElfError::Oom | crate::elf::ElfError::MetadataOom => -12, // ENOMEM
+                Err(error) => {
+                    return match error {
+                        crate::elf::ElfError::Oom | crate::elf::ElfError::MetadataOom => -12,
+                        _ => -22,
                     };
                 }
             }
         } else {
-            // Flat binary — use load_flat_binary (handles stack page internally)
-            load_flat_binary(data, size, pmm, proc.pml4_phys);
-            entry = USER_CODE_ADDR;
-            is_elf = false;
+            match build_flat_image(data, size, pmm) {
+                Ok(image) => {
+                    entry = USER_CODE_ADDR;
+                    user_rsp = image.user_rsp;
+                    stack_low = image.stack_low;
+                    root = image.root;
+                }
+                Err(error) => {
+                    return match error {
+                        FlatLoadError::Oom => -12,
+                        FlatLoadError::InvalidSize
+                        | FlatLoadError::AddressOverflow
+                        | FlatLoadError::Oversize
+                        | FlatLoadError::MappingCollision => -22,
+                    };
+                }
+            }
         }
     }
 
-    // 5. Update syscall_state with new entry point and stack
-    // ELF binaries use computed stack; flat binaries use USER_STACK_ADDR.
+    // 5. Publish the fully built image only after all mappings succeeded.
+    let proc = process_mut(pid);
+    let saved_if: u64;
     unsafe {
-        let user_rsp = if is_elf {
-            elf_user_rsp
-        } else {
-            USER_STACK_ADDR + 0x1000
-        };
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_if, options(nostack));
+        let root_phys = root.phys;
+        // The old root is intentionally retained: successful replacement
+        // reclamation requires a future root/leaf ownership reference-counting
+        // change while forked descendants may still exist.
+        proc.pml4_phys = root_phys;
+        crate::paging::write_cr3(root_phys);
+        proc.entry = entry;
+        proc.user_rsp = user_rsp;
         core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
         core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
         core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
+        if saved_if & 0x200 != 0 {
+            core::arch::asm!("sti", options(nostack));
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    if path_slice == b"/bin/vish" {
+        crate::scheduler_evidence::register_target(
+            pid,
+            root.phys,
+            unsafe { core::slice::from_raw_parts(data, size) },
+            entry,
+        );
     }
 
     #[cfg(feature = "debug")]
@@ -1045,11 +1275,7 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
             pid,
             proc.pml4_phys,
             entry,
-            if is_elf {
-                elf_user_rsp
-            } else {
-                USER_STACK_ADDR + 0x1000
-            },
+            user_rsp,
             0x202,
             proc.kernel_rsp,
         );
@@ -1060,7 +1286,7 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     proc.sig_pending = 0; // fresh signal state for new program
     proc.in_signal = false;
     proc.sigframe_rsp = 0;
-    proc.stack_low = if is_elf { 0x2010000 } else { USER_STACK_ADDR };
+    proc.stack_low = stack_low;
     // Reset all sigactions to SIG_DFL for the new program image
     for i in 0..32 {
         proc.sigactions[i] = Default::default();

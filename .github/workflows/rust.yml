@@ -30,6 +30,7 @@ jobs:
         rustup toolchain install stable --profile minimal --no-self-update
         rustup target add --toolchain stable x86_64-unknown-none
         rustup run stable rustc --version --verbose
+        rustup run stable cargo --version --verbose
         rustup target list --installed --toolchain stable | grep -Fx x86_64-unknown-none
 
     - name: Verify kernel manifest boundary
@@ -46,7 +47,7 @@ jobs:
       run: cargo +stable check --target x86_64-unknown-none --release --verbose
 
     - name: Build VIBIX kernel image
-      run: make
+      run: make RUST_TOOLCHAIN=stable
 
     - name: Run VIBIX kernel tests
-      run: make test
+      run: make RUST_TOOLCHAIN=stable test

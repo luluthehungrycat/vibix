@@ -22,7 +22,6 @@ SIZEOF_STAT      equ 144
 ; ── Test entry point ──────────────────────────────────────────────────────────
 stat_chdir_test:
     ; Set up stack
-    mov rsp, 0x2003000
 
     push rbx
     push r12

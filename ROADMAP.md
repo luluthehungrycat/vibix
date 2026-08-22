@@ -47,23 +47,31 @@ alarm, syslog, times, uname, uptime
 - **WNOHANG**: `sys_waitpid` now respects the WNOHANG flag — returns 0
   immediately when a child is still running instead of blocking.
 - **Userspace test suite**: NASM test program covering pipe, dup, dup2, getcwd,
-  chdir+getcwd. Added 7 CHECKLIST markers to test framework.
+  chdir+getcwd, fd error conventions, VFS/TTY validation, and dup2 refcount survival.
 - **GPF #13 (SYSRETQ SS selector)**: STAR[63:48] changed from KERNEL_DS(0x10)
   to 0x13 so `SS = 0x13 + 8 = 0x1B` with correct RPL=3.
 - **ELF after fork**: Removed `translate_in_pml4()` reuse — exec always
   allocates fresh pages, never writes onto parent's physical pages.
 - **Current ELF overlap-loader fix**: `elf::load` records pages allocated during one load call,
   reuses shared PT_LOAD pages, and preserves later partial-page file bytes.
+- **Descriptor error semantics**: covered close/dup/dup2 and VFS descriptor handlers reject
+  out-of-range, closed, and stale descriptors with documented VIBIX results; `dup2` validates
+  its source before same-fd no-op handling and DEBUG builds assert fd/OFT invariants.
 
 ### Tests
-- `make test` — 21 required integration markers (as defined by `test_kernel.py`)
+- `make test` — 25 required integration markers (as defined by `test_kernel.py`)
 - `make test_vibit` — 7 VIBIT init/shell fork/exec/blocking-read checks
 - VIBIT/vish integration — external VIBIT init launches the NASM vish shell; bounded shell handoff and continuation checks pass
+- `make test_tty_sigint` — deterministic no-reader, stale-reader, non-blocked-owner, and
+  blocked-owner Ctrl-C cases pass without panic or exception
 - `make test_vibit_rust` — readiness-aware KVM/TCG retries, Rust ELF `OK`, no exception,
   shared-page provenance, and three bounded PID/CR3/RIP-correlated scheduler round trips
   (final evidence: PID 3, CR3 `0x297000`, RIP range `0x2000000–0x2000019`, 10 events).
-- `make test_vibit_rust_large` — test-time 257-page synthetic ELF plus lower-level
-  provenance-arena capacity and cleanup regression; full VIBIT shell handoff is deferred.
+- `make test_vibit_rust_large` — test-time 257-page synthetic ELF, lower-level provenance-arena
+  capacity/cleanup regression, VIBIT `/bin/vish` fork/exec handoff, clean child exit/reap,
+  shell respawn, and a subsequent completion marker.
+- `make test_elf_rollback` — DEBUG truncation, PMM exhaustion, metadata exhaustion, rollback,
+  reuse, and no-panic/no-exception cases pass.
 
 ---
 
@@ -71,11 +79,11 @@ alarm, syslog, times, uname, uptime
 
 ### Follow-up OpenSpec changes from PR #8 review
 - **TTY foreground SIGINT** (`fix-tty-sigint-foreground-reader`): completed foreground-reader routing,
-  wakeup, and bounded integration coverage; dedicated stale/no-reader fixtures remain open.
+  wakeup, bounded integration coverage, and deterministic no-reader/stale/non-blocked/blocked-owner cases.
 - **Rust vish probe prerequisite** (`build-rust-vish-test-prerequisite`): completed sibling ELF build,
   staging, and runtime Rust probe validation without sibling source changes.
 - **Scalable ELF provenance** (`remove-elf-page-provenance-ceiling`): completed reclaimed metadata arena,
-  cleanup, and >256-page lower-level regression; failure-injection coverage remains deferred.
+  cleanup, >256-page regression, and DEBUG failure-injection rollback coverage.
 
 ### 3. Signal handling — userspace test
 - **File**: `userspace/vibix_signal_test.inc`
@@ -94,6 +102,14 @@ alarm, syslog, times, uname, uptime
 ### Validation limitations retained
 - Correlated DEBUG evidence proves the target process's bounded scheduler round trips, not
   scheduler fairness, long-term liveness, or PID/range-correlated behavior for other processes.
+- The large-ELF fixture is generated at test time and remains temporary/ignored; its lifecycle
+  assertion now covers completion marker → VIBIT reap/respawn → subsequent marker.
+- Running the ordinary `test_kernel.py` marker suite directly against a DEBUG image is not a
+  required gate: DEBUG rollback self-tests can delay normal userspace markers beyond its bounded
+  timeout. The dedicated DEBUG TTY and ELF rollback harnesses pass.
+- Aggregate strict OpenSpec validation passes all 9 active changes. The archived
+  `fix-multisegment-elf-iretq-gpf` change is intentionally outside the active aggregate and is
+  not a current blocker.
 
 ---
 
