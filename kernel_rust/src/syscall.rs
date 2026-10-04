@@ -13,7 +13,6 @@
 // Phase 3: dup (18), dup2 (19).
 //==============================================================================
 
-use core::fmt::Write;
 use crate::serial::SerialPort;
 use crate::pmm;
 use crate::process::{current_pid, process_mut, BRK_START, BRK_MAX};
@@ -87,7 +86,10 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
             unsafe {
                 let parent_rsp = parent.kernel_rsp;
                 if parent_rsp != 0 {
-                    *(parent_rsp as *mut u64) = pid;
+                    // The blocked syscall frame resumes with a retry value;
+                    // waitpid must run again to collect the zombie and free
+                    // its resources exactly once.
+                    *(parent_rsp as *mut u64) = 0;
                 }
             }
             parent.state = process::ProcessState::Ready;

@@ -35,7 +35,7 @@ INIT ?= default
 ASMFLAGS32  = -f elf32
 LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
 
-.PHONY: all clean run debug test_tty_sigint test_elf_rollback
+.PHONY: all clean run debug test_tty_sigint test_elf_rollback test_vibit test_vibit_rust test_vibit_rust_shell test_vibit_rust_large
 
 all: vibix.elf
 
@@ -124,38 +124,12 @@ clean:
 	$(MAKE) -C userspace clean
 	cd $(RUST_DIR) && $(CARGO) clean 2>/dev/null || true
 
-test_vibit_rust: clean
-	# Build the sibling Rust ELF before staging it, even when no artifact exists yet.
-	@if [ ! -d "$(CURDIR)/../vish" ]; then \
-		echo "ERROR: Rust vish prerequisite is missing: expected sibling checkout at $(CURDIR)/../vish" >&2; \
-		echo "       Provide ../vish with its documented 'elf' target, then rerun: make test_vibit_rust" >&2; \
-		exit 1; \
-	fi
-	@if ! $(MAKE) -C "$(CURDIR)/../vish" elf; then \
-		echo "ERROR: Rust vish prerequisite failed: '$(MAKE) -C ../vish elf'" >&2; \
-		echo "       Install the sibling vish Rust toolchain/dependencies and rerun: make test_vibit_rust" >&2; \
-		exit 1; \
-	fi
-	@if [ ! -s "$(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix" ]; then \
-		echo "ERROR: Rust vish prerequisite produced no non-empty ELF at $(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix" >&2; \
-		echo "       Ensure the sibling 'elf' target produces that path, then rerun: make test_vibit_rust" >&2; \
-		exit 1; \
-	fi
-	# Build the kernel Rust library with DEBUG=1 so the loader diagnostics are present.
-	$(MAKE) DEBUG=1 INIT=vibit
-	# Replace /bin/vish with Rust ELF to test multi-segment ELF scheduling
-	rm -rf /tmp/vibix-initramfs
-	mkdir -p /tmp/vibix-initramfs/sbin /tmp/vibix-initramfs/bin
-	tar xf $(CURDIR)/userspace/initramfs.tar -C /tmp/vibix-initramfs
-	cp $(CURDIR)/../vish/target/x86_64-unknown-none/release/vibix /tmp/vibix-initramfs/bin/vish
-	cd /tmp/vibix-initramfs && tar --format=ustar --owner=0 --group=0 -cf $(CURDIR)/userspace/initramfs.tar sbin/init bin/*
-	rm -rf /tmp/vibix-initramfs
-	# Force only the DEBUG assembly objects; do not rebuild userspace after
-	# replacing /bin/vish with the Rust ELF above.
-	rm -f kernel64_entry.o interrupts.o syscall_entry.o context_switch.o
-	$(MAKE) DEBUG=1 kernel64_entry.o interrupts.o syscall_entry.o context_switch.o
-	$(MAKE) DEBUG=1 kernel64.elf kernel64.bin boot.o vibix.elf
-	python3 anti_cheat.py && python3 -c "from test_kernel import test_vibit_rust; import sys; sys.exit(0 if test_vibit_rust() else 1)"
+test_vibit_rust:
+	QEMU="$(QEMU)" python3 test_rust_vish.py probe
+
+# Run the Rust shell ELF through VIBIT's interactive reaper/respawn path.
+test_vibit_rust_shell:
+	QEMU="$(QEMU)" python3 test_rust_vish.py shell
 
 # Run the VIBIX-owned synthetic ELF that requires more than 256 pages through
 # VIBIT's real fork/exec("/bin/vish") path.  The Python harness temporarily

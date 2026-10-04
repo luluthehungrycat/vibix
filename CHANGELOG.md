@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-04
+
+### VIBIT reaper and shell lifecycle
+
+- `../vibit/vibit.asm`: fixed the decimal PID formatter to pass its digit buffer
+  to `strlen`, allowing VIBIT to print reaped child IDs without faulting.
+- `kernel_rust/src/syscall.rs` and `kernel_rust/src/process.rs`: wake blocked
+  `waitpid` callers to retry, then remove each zombie once and release its file
+  references, address space, and full three-page kernel stack.
+- `kernel_rust/src/serial.rs`: make COM1 initialization one-time so debug
+  logging does not clear pending serial input from the receive FIFO.
+- `test_kernel.py`: assert decimal reaped PIDs, avoid stalling debug QEMU on
+  undrained output pipes, and check Rust ELF entry-page reuse only when load
+  segments overlap that page.
+- Validation passed: VIBIT boot plus NASM-shell command/exit/respawn/Ctrl-C
+  integration; Rust-shell VIBIT lifecycle integration; the separate Rust ELF
+  scheduler probe; `anti_cheat.py`; Rust shell tests (56); VISH build-target
+  test; GVIBU Python tests (392), Rust tests (601), and implementation parity
+  (266). Optional `wasm32-wasip1` build was attempted and is blocked by existing
+  Unix-only APIs in GVIBU; `wasm-pack` and `wasmtime` are unavailable.
+
 ## 2026-08-22
 
 ### Large-ELF probe admission blocker fixed
