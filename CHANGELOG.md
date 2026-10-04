@@ -636,3 +636,10 @@ GPF #13 previously seen in VIBIT tests is now eliminated.
 - **Files modified:** `.ignore`, `.slim/deepwork/flat-exec-atomic-lifecycle.md`, `CHANGELOG.md`.
 - **Test results:** No tests were run (metadata/orchestration-only plan update).
 - Final independent-review reconciliation by `random-salmon-alligator` updated `.slim/deepwork/flat-exec-atomic-lifecycle.md` and `CHANGELOG.md`; no source/test files changed and no tests were run.
+
+## 2026-10-04
+
+### Cross-repository follow-up designs
+- Documented focused designs for the VIBIT reaper fault, GVIBU primary-group output, and VISH NASM/Rust ELF build integration. Clarified that Rust shell smoke needs its own test because the existing Rust ELF target validates scheduler markers; the plan now calls for a dedicated Rust scheduler-probe artifact to preserve that check.
+- Files modified: `../vibit/docs/superpowers/specs/2026-10-04-vibit-reaper-fault-design.md`, `../gvibu/docs/superpowers/specs/2026-10-04-id-primary-group-design.md`, `../vish/docs/superpowers/specs/2026-10-04-vish-bare-metal-build-design.md`, `CHANGELOG.md`.
+- Tests: documentation-only; no code tests run.
