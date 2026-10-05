@@ -6,6 +6,9 @@
 //==============================================================================
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static SERIAL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 //--- Register offsets from COM1 base (0x3F8) --------------------------------
 const SERIAL_COM1_BASE: u16 = 0x3F8;
@@ -48,6 +51,12 @@ impl SerialPort {
 
     /// Initialise COM1: 115200 baud, 8N1.
     pub fn init(&mut self) {
+        // Several debug paths call init before printing. Reprogramming the
+        // FIFO on every call clears pending receive bytes, which can discard
+        // serial input while the scheduler is polling the TTY.
+        if SERIAL_INITIALIZED.swap(true, Ordering::Relaxed) {
+            return;
+        }
         outb(self.base + SERIAL_INTR, 0x00);   // disable interrupts
         outb(self.base + SERIAL_LCR,  0x80);   // DLAB on
         outb(self.base + SERIAL_DATA, 0x01);   // divisor low  (115200)

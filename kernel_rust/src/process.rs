@@ -1348,10 +1348,42 @@ pub fn sys_waitpid(requested_pid: i64, wstatus: u64, flags: u64) -> i64 {
     match child_info {
         Some((pid, ProcessState::Zombie)) => {
             // Reap child
+            let exit_code = process(pid).exit_code;
             if wstatus != 0 {
                 unsafe {
-                    *(wstatus as *mut u64) = process(pid).exit_code;
+                    *(wstatus as *mut u64) = exit_code;
                 }
+            }
+
+            // Remove the zombie before returning so a later waitpid cannot
+            // report it again, and release the per-process resources needed
+            // for repeated fork/exec/exit cycles.
+            let mut reaped = unsafe {
+                let table = &mut PROCESS_TABLE;
+                let slot = table.slots.iter_mut().find(|slot| {
+                    slot.as_ref().is_some_and(|child| child.pid == pid)
+                });
+                let Some(slot) = slot else {
+                    return -1;
+                };
+                let child = slot.take().unwrap();
+                table.count = table.count.saturating_sub(1);
+                child
+            };
+            cleanup_fds(&mut reaped);
+            let pmm = crate::pmm::global_pmm();
+            crate::paging::destroy_uncommitted_pml4(
+                crate::paging::Pml4Handle {
+                    phys: reaped.pml4_phys,
+                    owns_user_leaves: true,
+                },
+                pmm,
+            );
+            for page in 0..(KERNEL_STACK_SIZE / crate::pmm::PMM_PAGE_SIZE) {
+                pmm.free(
+                    (reaped.kernel_stack_base as usize
+                        + page * crate::pmm::PMM_PAGE_SIZE) as *mut u8,
+                );
             }
             pid as i64
         }

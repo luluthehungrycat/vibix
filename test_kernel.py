@@ -354,7 +354,10 @@ def test_vibit_integration():
         "-no-reboot",
         "-no-shutdown",
     ]
-    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # DEBUG=1 emits verbose scheduler traces. Capturing these streams without
+    # draining them can fill the OS pipe and stall QEMU before serial input is
+    # serviced; this probe only consumes the serial socket.
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     connection = None
     output = bytearray()
     sent_sigint = False
@@ -392,6 +395,10 @@ def test_vibit_integration():
                     break
                 output.extend(chunk)
                 text = output.decode("utf-8", errors="replace")
+                if "VIBIT: respawn failed" in text:
+                    terminal_reason = "VIBIT could not load the shell ELF"
+                    deadline = time.monotonic()
+                    break
                 new_prompt_count = text.count("vish$ ")
                 if new_prompt_count:
                     readiness_observed = True
@@ -420,9 +427,10 @@ def test_vibit_integration():
         text = output.decode("utf-8", errors="replace")
         checks = {
             "Built-in commands:": "deterministic vish command output",
-            "VIBIT: reaped child": "VIBIT child reaping",
             "VIBIT: respawning shell...": "VIBIT shell continuation",
         }
+        reaped_pid_observed = re.search(r"VIBIT: reaped child [0-9]+", text) is not None
+        print(f"  {'✅' if reaped_pid_observed else '❌'} VIBIT child reaping")
         ok = (sent_input and sent_exit and sent_sigint
               and observed_sigint_respawn and prompt_count >= 2
               and text.count("vish$ ") >= 3
@@ -437,6 +445,9 @@ def test_vibit_integration():
             else:
                 print(f"  ❌ {label} (missing: {marker!r})")
                 ok = False
+        if not reaped_pid_observed:
+            print("  ❌ reaped child PID was not printed as a decimal number")
+            ok = False
         if text.count("vish$ ") >= 3:
             print("  ✅ vish prompt returned after shell exit")
         else:
@@ -455,9 +466,15 @@ def test_vibit_integration():
         probe = ProbeResult(
             text, accel, 1, readiness_observed, ok, classification, reason
         )
-        _print_selected_probe("VIBIT/vish integration", probe, include_transcript=True)
+        _print_selected_probe("VIBIT/vish integration", probe, include_transcript=False)
         if not ok:
-            print("  Serial transcript:", repr(text))
+            excerpts = [text[:2500]]
+            for marker in ("VIBIT: starting shell", "DBG EXEC: path=/bin/vish", "vish --", "vish$ ", "DBG tty:", "vish:"):
+                index = text.find(marker)
+                if index >= 0:
+                    excerpts.append(text[max(0, index - 100):index + 1200])
+            excerpts.append(text[-2500:])
+            print("  Serial transcript excerpts:", repr("\n…\n".join(excerpts)))
         return classification == "PASS"
     finally:
         if connection is not None:
@@ -964,8 +981,13 @@ def _print_rust_elf_result(serial_output, require_shell_marker=False):
         serial_output,
     )}
     entry_page = 0x2000000
-    if new_pages.get(entry_page) and reused_pages.get(entry_page) == new_pages[entry_page]:
-        print(f"  ✅ Entry page provenance preserved (frame 0x{new_pages[entry_page]:x})")
+    if (new_pages.get(entry_page)
+            and (entry_page not in reused_pages
+                 or reused_pages[entry_page] == new_pages[entry_page])):
+        detail = ("overlapping PT_LOAD reuse validated"
+                  if entry_page in reused_pages
+                  else "mapped once; no overlapping PT_LOAD")
+        print(f"  ✅ Entry page provenance preserved ({detail})")
     else:
         print("  ❌ Entry page provenance evidence missing or frame changed")
         all_ok = False

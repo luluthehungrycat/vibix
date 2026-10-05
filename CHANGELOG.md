@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-10-05
+- Hardened the Rust VISH fixture harness to restore all touched generated artifacts (contents, mode, or prior absence), including on exceptions; no lifecycle code change because syscall entry masks IF and scheduler IRQs run with interrupts disabled on this single-CPU path, preventing the hypothesized concurrent process-table reaping race.
+- Files: `test_rust_vish.py`, `CHANGELOG.md`.
+- Tests: synthetic sentinel restoration (including exception path), Python compilation, `git diff --check` passed. `make test` blocked because `nasm` is not installed.
+
+
+## 2026-10-04
+
+### VIBIT reaper and shell lifecycle
+
+- `../vibit/vibit.asm`: fixed the decimal PID formatter to pass its digit buffer
+  to `strlen`, allowing VIBIT to print reaped child IDs without faulting.
+- `kernel_rust/src/syscall.rs` and `kernel_rust/src/process.rs`: wake blocked
+  `waitpid` callers to retry, then remove each zombie once and release its file
+  references, address space, and full three-page kernel stack.
+- `kernel_rust/src/serial.rs`: make COM1 initialization one-time so debug
+  logging does not clear pending serial input from the receive FIFO.
+- `test_kernel.py`: assert decimal reaped PIDs, avoid stalling debug QEMU on
+  undrained output pipes, and check Rust ELF entry-page reuse only when load
+  segments overlap that page.
+- Validation passed: VIBIT boot plus NASM-shell command/exit/respawn/Ctrl-C
+  integration; Rust-shell VIBIT lifecycle integration; the separate Rust ELF
+  scheduler probe; `anti_cheat.py`; Rust shell tests (56); VISH build-target
+  test; GVIBU Python tests (392), Rust tests (601), and implementation parity
+  (266). Optional `wasm32-wasip1` build was attempted and is blocked by existing
+  Unix-only APIs in GVIBU; `wasm-pack` and `wasmtime` are unavailable.
+
 ## 2026-08-22
 
 ### Large-ELF probe admission blocker fixed
@@ -636,3 +663,10 @@ GPF #13 previously seen in VIBIT tests is now eliminated.
 - **Files modified:** `.ignore`, `.slim/deepwork/flat-exec-atomic-lifecycle.md`, `CHANGELOG.md`.
 - **Test results:** No tests were run (metadata/orchestration-only plan update).
 - Final independent-review reconciliation by `random-salmon-alligator` updated `.slim/deepwork/flat-exec-atomic-lifecycle.md` and `CHANGELOG.md`; no source/test files changed and no tests were run.
+
+## 2026-10-04
+
+### Cross-repository follow-up designs
+- Documented focused designs for the VIBIT reaper fault, GVIBU primary-group output, and VISH NASM/Rust ELF build integration. Clarified that Rust shell smoke needs its own test because the existing Rust ELF target validates scheduler markers; the plan now calls for a dedicated Rust scheduler-probe artifact to preserve that check.
+- Files modified: `../vibit/docs/superpowers/specs/2026-10-04-vibit-reaper-fault-design.md`, `../gvibu/docs/superpowers/specs/2026-10-04-id-primary-group-design.md`, `../vish/docs/superpowers/specs/2026-10-04-vish-bare-metal-build-design.md`, `CHANGELOG.md`.
+- Tests: documentation-only; no code tests run.
