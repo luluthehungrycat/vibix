@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Iterable
 
 ROOT = Path(__file__).resolve().parent
 VISH = ROOT.parent / "vish"
@@ -20,15 +21,40 @@ def run(command, *, cwd, env=None):
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+class ArtifactSnapshot:
+    """Restore file contents, permissions, and absence after fixture builds."""
+
+    def __init__(self, paths: Iterable[Path]):
+        self.files = {
+            path: (path.read_bytes(), path.stat().st_mode) if path.exists() else None
+            for path in paths
+        }
+
+    def restore(self):
+        for path, saved in self.files.items():
+            if saved is None:
+                path.unlink(missing_ok=True)
+            else:
+                data, mode = saved
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(mode)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.restore()
+
+
 def main(kind: str) -> int:
     if kind not in ("shell", "probe"):
         raise SystemExit("usage: test_rust_vish.py shell|probe")
     if not VISH.is_dir():
         raise SystemExit(f"missing sibling VISH checkout: {VISH}")
 
-    original_archive = ARCHIVE.read_bytes()
-    original_blob = BLOB.read_bytes() if BLOB.exists() else None
-    try:
+    generated_paths = [ROOT / name for name in GENERATED]
+    with ArtifactSnapshot([ARCHIVE, BLOB, *generated_paths]):
         run(["make", "elf" if kind == "shell" else "elf-probe"], cwd=VISH)
         executable = VISH / "target" / "x86_64-unknown-none" / "release" / (
             "vibix" if kind == "shell" else "vibix_probe"
@@ -37,7 +63,7 @@ def main(kind: str) -> int:
             raise RuntimeError(f"missing Rust ELF artifact: {executable}")
 
         # Regenerate the normal VIBIT + NASM initramfs before applying the
-        # isolated ELF fixture. Restore both generated files in the finally.
+        # isolated ELF fixture. All touched generated files are restored on exit.
         run(["make", "-B", "INIT=vibit", "all"], cwd=ROOT / "userspace")
         import io
         import tarfile
@@ -48,8 +74,7 @@ def main(kind: str) -> int:
                 for member in source.getmembers()
                 if member.isfile()
             }
-        path = "bin/vish" if kind == "shell" else "bin/vish"
-        entries[path] = (executable.read_bytes(), 0o755)
+        entries["bin/vish"] = (executable.read_bytes(), 0o755)
         with tarfile.open(ARCHIVE, "w", format=tarfile.USTAR_FORMAT) as target:
             for name, (data, mode) in entries.items():
                 info = tarfile.TarInfo(name)
@@ -58,8 +83,6 @@ def main(kind: str) -> int:
                 info.uid = info.gid = 0
                 target.addfile(info, io.BytesIO(data))
 
-        for name in GENERATED:
-            (ROOT / name).unlink(missing_ok=True)
         env = os.environ.copy()
         env["VIBIX_STAGED_INITRAMFS"] = "1"
         run(["make", "-j1", "DEBUG=1", "INIT=vibit", "vibix.elf"], cwd=ROOT, env=env)
@@ -73,12 +96,6 @@ def main(kind: str) -> int:
         )
         run(["python3", "-c", code], cwd=ROOT, env=env)
         return 0
-    finally:
-        ARCHIVE.write_bytes(original_archive)
-        if original_blob is not None:
-            BLOB.write_bytes(original_blob)
-        for name in GENERATED:
-            (ROOT / name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

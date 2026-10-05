@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-05
+- Hardened the Rust VISH fixture harness to restore all touched generated artifacts (contents, mode, or prior absence), including on exceptions; no lifecycle code change because syscall entry masks IF and scheduler IRQs run with interrupts disabled on this single-CPU path, preventing the hypothesized concurrent process-table reaping race.
+- Files: `test_rust_vish.py`, `CHANGELOG.md`.
+- Tests: synthetic sentinel restoration (including exception path), Python compilation, `git diff --check` passed. `make test` blocked because `nasm` is not installed.
+
+
 ## 2026-10-04
 
 ### VIBIT reaper and shell lifecycle
