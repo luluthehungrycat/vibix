@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-19
+
+### Preserve syscall results across scheduler diversion
+- **`kernel/syscall_entry.asm`**: Store the syscall handler's RAX result in the synthetic scheduler frame's RAX slot. Blocked reads can now return the bytes read after wakeup.
+- **`kernel_rust/src/process.rs` and `kernel_rust/src/signal.rs`**: Route all signal-driven termination and normal exit through a shared zombie transition that wakes a parent blocked in `waitpid`.
+- **`kernel_rust/src/process.rs`**: Return zero when `waitpid` blocks so a woken caller retries and collects the zombie.
+- **`test_kernel.py`**: Strengthen the VIBIT/vish interactive integration to idle before initial input, reject reaping before explicit `exit`, verify help after respawn, and require exactly two numeric reaps across explicit exit and Ctrl-C.
+- **`test_rust_vish.py`**: Force DEBUG=1 assembly objects to rebuild inside the existing artifact snapshot, preventing stale default-mode objects from breaking debug links.
+- **Test results**: Strengthened Rust VISH/VIBIT interactive integration passed, as did the Rust ELF probe and forced-default INIT boot regression. The NASM VISH variant passes its boot probe but fails the stricter integration before input: its shell exits after the delayed blocking read; that fixture is sibling-owned and was not changed here. Python syntax and diff checks passed.
+
 ## 2026-10-05
 - Hardened the Rust VISH fixture harness to restore all touched generated artifacts (contents, mode, or prior absence), including on exceptions; no lifecycle code change because syscall entry masks IF and scheduler IRQs run with interrupts disabled on this single-CPU path, preventing the hypothesized concurrent process-table reaping race.
 - Files: `test_rust_vish.py`, `CHANGELOG.md`.

@@ -153,6 +153,34 @@ pub fn process_mut_if(pid: u64) -> Option<&'static mut Process> {
     }
 }
 
+/// Mark a process as a zombie and wake its parent when that parent is blocked
+/// in waitpid for this child. The saved syscall frame resumes with a zero
+/// result so waitpid can retry and reap the child exactly once.
+pub fn mark_zombie(pid: u64, exit_code: u64) {
+    let parent_pid = {
+        let proc = process_mut(pid);
+        proc.state = ProcessState::Zombie;
+        proc.exit_code = exit_code;
+        proc.parent_pid
+    };
+
+    if parent_pid == 0 {
+        return;
+    }
+    let Some(parent) = process_mut_if(parent_pid) else {
+        return;
+    };
+    if parent.state == ProcessState::Blocked && parent.wait_for_pid == pid {
+        if parent.kernel_rsp != 0 {
+            unsafe {
+                core::ptr::write_volatile(parent.kernel_rsp as *mut u64, 0);
+            }
+        }
+        parent.state = ProcessState::Ready;
+        parent.wait_for_pid = 0;
+    }
+}
+
 pub fn set_syscall_kstack(rsp: u64) {
     unsafe {
         current_proc_kernel_rsp = rsp;
@@ -1319,9 +1347,8 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     0
 }
 
-/// Wait for a child process. Returns PID on success, -1 on error.
-/// For MVP: non-blocking — if child is Zombie, reap and return.
-/// If child is still running, block the parent.
+/// Wait for a child process. Returns PID on success, 0 while blocked, or -1
+/// on error. A wakeup retries the syscall so a zombie is reaped exactly once.
 pub fn sys_waitpid(requested_pid: i64, wstatus: u64, flags: u64) -> i64 {
     let cur_pid = current_pid();
 
@@ -1399,7 +1426,7 @@ pub fn sys_waitpid(requested_pid: i64, wstatus: u64, flags: u64) -> i64 {
             unsafe {
                 should_schedule = 1;
             }
-            -1
+            0
         }
         None => -1, // No matching child
     }

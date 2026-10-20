@@ -74,28 +74,7 @@ fn sys_exit(code: u64, _: u64, _: u64, _: u64) -> u64 {
     serial.putchar((b'0' + (c % 10) as u8) as char);
     serial.putchar('\n');
 
-    let cur = process_mut(pid);
-    cur.state = process::ProcessState::Zombie;
-    cur.exit_code = code;
-
-    // Wake parent if it's blocked waiting for us
-    let parent_pid = cur.parent_pid;
-    if parent_pid != 0 {
-        let parent = process_mut(parent_pid);
-        if parent.state == process::ProcessState::Blocked && parent.wait_for_pid == pid {
-            unsafe {
-                let parent_rsp = parent.kernel_rsp;
-                if parent_rsp != 0 {
-                    // The blocked syscall frame resumes with a retry value;
-                    // waitpid must run again to collect the zombie and free
-                    // its resources exactly once.
-                    *(parent_rsp as *mut u64) = 0;
-                }
-            }
-            parent.state = process::ProcessState::Ready;
-            parent.wait_for_pid = 0;
-        }
-    }
+    process::mark_zombie(pid, code);
 
     unsafe {
         core::ptr::write_volatile(&raw mut crate::process::should_schedule, 1);

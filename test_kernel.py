@@ -364,7 +364,10 @@ def test_vibit_integration():
     observed_sigint_respawn = False
     sent_input = False
     sent_exit = False
+    sent_respawn_help = False
     prompt_count = 0
+    initial_idle_checked = False
+    pre_exit_alive_checked = False
     readiness_observed = False
     terminal_reason = "deadline expired before completion"
     deadline = time.monotonic() + 30
@@ -385,55 +388,90 @@ def test_vibit_integration():
         connection.setblocking(False)
         selector = selectors.DefaultSelector()
         selector.register(connection, selectors.EVENT_READ)
+        initial_prompt_at = None
+        input_complete_at = None
+        respawn_help_complete_at = None
+        reaped_pids = []
+        reaped_count = 0
         while time.monotonic() < deadline:
-            events = selector.select(max(0, deadline - time.monotonic()))
-            if not events:
-                break
+            events = selector.select(min(0.05, max(0, deadline - time.monotonic())))
             for key, _ in events:
                 chunk = key.fileobj.recv(4096)
                 if not chunk:
+                    terminal_reason = "serial connection closed"
+                    deadline = time.monotonic()
                     break
                 output.extend(chunk)
-                text = output.decode("utf-8", errors="replace")
-                if "VIBIT: respawn failed" in text:
-                    terminal_reason = "VIBIT could not load the shell ELF"
-                    deadline = time.monotonic()
+            text = output.decode("utf-8", errors="replace")
+            now = time.monotonic()
+            prompt_count = text.count("vish$ ")
+            readiness_observed = readiness_observed or prompt_count > 0
+            if prompt_count and initial_prompt_at is None:
+                initial_prompt_at = now
+            reaped_pids = re.findall(r"VIBIT: reaped child ([0-9]+)", text)
+            reaped_count = len(re.findall(r"VIBIT: reaped child", text))
+
+            if "VIBIT: respawn failed" in text:
+                terminal_reason = "VIBIT could not load the shell ELF"
+                break
+            if not sent_exit and reaped_count != 0:
+                terminal_reason = "shell was reaped before explicit exit"
+                break
+            if sent_exit and not sent_sigint and reaped_count > 1:
+                terminal_reason = "shell was reaped more than once before Ctrl-C"
+                break
+            if sent_sigint and reaped_count > 2:
+                terminal_reason = "more than two shells were reaped"
+                break
+
+            # Run phase transitions on every poll, including quiet periods
+            # where QEMU emits no serial bytes while the shell blocks in read.
+            if (not initial_idle_checked and initial_prompt_at is not None
+                    and now - initial_prompt_at >= 0.5):
+                initial_idle_checked = True
+                connection.sendall(b"help\n")
+                sent_input = True
+            if (sent_input and not pre_exit_alive_checked
+                    and "Built-in commands:" in text and prompt_count >= 2):
+                pre_exit_alive_checked = True
+                input_complete_at = now
+            if (pre_exit_alive_checked and not sent_exit
+                    and now - input_complete_at >= 0.25):
+                connection.sendall(b"exit\n")
+                sent_exit = True
+            if sent_exit and reaped_count == 1:
+                observed_sigint_respawn = "VIBIT: respawning shell..." in text
+            if (observed_sigint_respawn and not sent_respawn_help
+                    and prompt_count >= 3):
+                connection.sendall(b"help\n")
+                sent_respawn_help = True
+            if (sent_respawn_help and respawn_help_complete_at is None
+                    and text.count("Built-in commands:") >= 2 and prompt_count >= 4):
+                respawn_help_complete_at = now
+            if (respawn_help_complete_at is not None and not sent_sigint
+                    and now - respawn_help_complete_at >= 0.25):
+                if reaped_count != 1:
+                    terminal_reason = "respawned shell exited before Ctrl-C"
                     break
-                new_prompt_count = text.count("vish$ ")
-                if new_prompt_count:
-                    readiness_observed = True
-                if not sent_input and new_prompt_count >= 1:
-                    # Complete one deterministic command before exercising the
-                    # exit and blocked-reader Ctrl-C paths.
-                    connection.sendall(b"help\n")
-                    sent_input = True
-                    prompt_count = new_prompt_count
-                if sent_input and not sent_exit and "Built-in commands:" in text:
-                    connection.sendall(b"exit\n")
-                    sent_exit = True
-                if sent_exit and "VIBIT: respawning shell..." in text:
-                    observed_sigint_respawn = True
-                if observed_sigint_respawn and not sent_sigint and new_prompt_count >= 2:
-                    # The respawned shell is now blocked in read(); Ctrl-C must
-                    # target that reader, not idle PID 2.
-                    connection.sendall(b"\x03")
-                    sent_sigint = True
-                    prompt_count = new_prompt_count
-                if sent_sigint and new_prompt_count >= 3 and text.count("VIBIT: respawning shell...") >= 2:
-                    deadline = time.monotonic()
-                    terminal_reason = "required prompt/respawn sequence observed"
-                    break
+                # The respawned shell is blocked in read; Ctrl-C must target it.
+                connection.sendall(b"\x03")
+                sent_sigint = True
+            if (sent_sigint and reaped_count == 2 and prompt_count >= 5
+                    and text.count("VIBIT: respawning shell...") >= 2):
+                terminal_reason = "required prompt/respawn sequence observed"
+                break
         selector.close()
         text = output.decode("utf-8", errors="replace")
         checks = {
             "Built-in commands:": "deterministic vish command output",
             "VIBIT: respawning shell...": "VIBIT shell continuation",
         }
-        reaped_pid_observed = re.search(r"VIBIT: reaped child [0-9]+", text) is not None
+        reaped_pid_observed = bool(reaped_pids)
         print(f"  {'✅' if reaped_pid_observed else '❌'} VIBIT child reaping")
-        ok = (sent_input and sent_exit and sent_sigint
-              and observed_sigint_respawn and prompt_count >= 2
-              and text.count("vish$ ") >= 3
+        ok = (initial_idle_checked and pre_exit_alive_checked and sent_input
+              and sent_exit and sent_respawn_help and sent_sigint
+              and observed_sigint_respawn and reaped_count == 2
+              and len(reaped_pids) == 2 and prompt_count >= 5
               and text.count("VIBIT: respawning shell...") >= 2)
         if not readiness_observed:
             print(f"  BLOCKED: required vish prompt never appeared (accelerator={accel}, attempt=1)")
@@ -445,13 +483,13 @@ def test_vibit_integration():
             else:
                 print(f"  ❌ {label} (missing: {marker!r})")
                 ok = False
-        if not reaped_pid_observed:
-            print("  ❌ reaped child PID was not printed as a decimal number")
+        if len(reaped_pids) != 2:
+            print(f"  ❌ expected two numeric child PIDs, observed {len(reaped_pids)}")
             ok = False
-        if text.count("vish$ ") >= 3:
+        if prompt_count >= 5:
             print("  ✅ vish prompt returned after shell exit")
         else:
-            print(f"  ❌ vish prompt repetition (observed {text.count('vish$ ')} prompt(s))")
+            print(f"  ❌ vish prompt repetition (observed {prompt_count} prompt(s))")
         if not sent_sigint:
             print("  ❌ Ctrl-C was not sent (prompt missing)")
         if not observed_sigint_respawn:
