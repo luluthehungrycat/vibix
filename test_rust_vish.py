@@ -15,6 +15,9 @@ GENERATED = (
     "kernel64_entry.o", "interrupts.o", "syscall_entry.o", "context_switch.o",
     "kernel64.elf", "kernel64.bin", "boot.o", "vibix.elf",
 )
+DEBUG_ASM_OBJECTS = (
+    "kernel64_entry.o", "interrupts.o", "syscall_entry.o", "context_switch.o",
+)
 
 
 def run(command, *, cwd, env=None):
@@ -85,6 +88,9 @@ def main(kind: str) -> int:
 
         env = os.environ.copy()
         env["VIBIX_STAGED_INITRAMFS"] = "1"
+        # NASM does not track DEBUG=1 in object prerequisites. Force fresh
+        # debug objects so linking cannot reuse default-build assembly.
+        run(["make", "-B", "DEBUG=1", *DEBUG_ASM_OBJECTS], cwd=ROOT, env=env)
         run(["make", "-j1", "DEBUG=1", "INIT=vibit", "vibix.elf"], cwd=ROOT, env=env)
         run(["python3", "anti_cheat.py"], cwd=ROOT)
         test_name = "test_vibit_integration" if kind == "shell" else "test_vibit_rust"

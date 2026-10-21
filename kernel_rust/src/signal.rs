@@ -132,8 +132,7 @@ pub fn check_signals_syscall(pid: u64) -> SignalResult {
         // While a handler is running, SIGKILL is still fatal.
         if proc.sig_pending & (1 << SIGKILL) != 0 {
             proc.sig_pending &= !(1 << SIGKILL);
-            proc.state = crate::process::ProcessState::Zombie;
-            proc.exit_code = 128 + SIGKILL;
+            crate::process::mark_zombie(pid, 128 + SIGKILL);
             return SignalResult::Terminated;
         }
         return SignalResult::None;
@@ -157,8 +156,7 @@ pub fn check_signals_syscall(pid: u64) -> SignalResult {
             match sig {
                 SIGKILL | SIGINT | SIGUSR1 | SIGUSR2 => {
                     proc.sig_pending &= !(1 << sig);
-                    proc.state = crate::process::ProcessState::Zombie;
-                    proc.exit_code = 128 + sig;
+                    crate::process::mark_zombie(pid, 128 + sig);
                     return SignalResult::Terminated;
                 }
                 _ => {
@@ -203,8 +201,7 @@ pub fn deliver_pending_signals(pid: u64, krsp: u64, killed: &mut bool) -> u64 {
     if proc.in_signal {
         if proc.sig_pending & (1 << SIGKILL) != 0 {
             proc.sig_pending &= !(1 << SIGKILL);
-            proc.state = crate::process::ProcessState::Zombie;
-            proc.exit_code = 128 + SIGKILL;
+            crate::process::mark_zombie(pid, 128 + SIGKILL);
             *killed = true;
         }
         return krsp;
@@ -234,8 +231,7 @@ pub fn deliver_pending_signals(pid: u64, krsp: u64, killed: &mut bool) -> u64 {
             match sig {
                 SIGKILL | SIGINT | SIGUSR1 | SIGUSR2 => {
                     proc.sig_pending &= !(1 << sig);
-                    proc.state = crate::process::ProcessState::Zombie;
-                    proc.exit_code = 128 + sig;
+                    crate::process::mark_zombie(pid, 128 + sig);
                     *killed = true;
                     return krsp;
                 }
@@ -250,8 +246,7 @@ pub fn deliver_pending_signals(pid: u64, krsp: u64, killed: &mut bool) -> u64 {
             // Guard: user stack must be large enough for a signal frame.
             // Uses the per-process stack_low (set by spawn_init / sys_exec).
             if user_rsp < proc.stack_low.wrapping_add(SIGFRAME_SIZE) {
-                proc.state = crate::process::ProcessState::Zombie;
-                proc.exit_code = 128 + SIGKILL;  // kill instead of corrupting stack
+                crate::process::mark_zombie(pid, 128 + SIGKILL);
                 *killed = true;
                 return krsp;
             }

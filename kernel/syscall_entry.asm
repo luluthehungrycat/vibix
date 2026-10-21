@@ -172,7 +172,7 @@ syscall_entry:
     push 0                          ; RBX
     push 0                          ; RDX
     push 0                          ; RCX
-    push 0                          ; RAX  ← RSP now points here
+    push rax                        ; RAX (syscall result) ← RSP now points here
 .after_push:
     mov rdi, rsp
     call scheduler_switch_exit
