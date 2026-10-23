@@ -1044,6 +1044,31 @@ pub fn translate(vaddr: u64) -> Option<u64> {
     Some(base | (vaddr & 0xFFF))
 }
 
+/// Check that a virtual address is present and user-accessible at every level
+/// of its page-table walk. Translation alone is insufficient for syscall
+/// pointers because a supervisor-only mapping can still be present.
+pub fn is_user_accessible_in_pml4(vaddr: u64, pml4_phys: u64) -> bool {
+    let (l4i, l3i, l2i, l1i) = indices(vaddr);
+    let l4 = unsafe { &*(pml4_phys as *const PageTable) };
+    let pml4e = l4[l4i];
+    if pml4e & (PAGE_PRESENT | PAGE_USER) != (PAGE_PRESENT | PAGE_USER) { return false; }
+    let l3 = unsafe { &*((pml4e & ADDR_MASK) as *const PageTable) };
+    let pdpte = l3[l3i];
+    if pdpte & (PAGE_PRESENT | PAGE_USER) != (PAGE_PRESENT | PAGE_USER) { return false; }
+    let l2 = unsafe { &*((pdpte & ADDR_MASK) as *const PageTable) };
+    let pde = l2[l2i];
+    if pde & (PAGE_PRESENT | PAGE_USER) != (PAGE_PRESENT | PAGE_USER) { return false; }
+    if pde & PAGE_HUGE != 0 { return true; }
+    let l1 = unsafe { &*((pde & ADDR_MASK) as *const PageTable) };
+    let pte = l1[l1i];
+    pte & (PAGE_PRESENT | PAGE_USER) == (PAGE_PRESENT | PAGE_USER)
+}
+
+/// Check the active address space for a user-readable mapped byte.
+pub fn is_user_accessible(vaddr: u64) -> bool {
+    is_user_accessible_in_pml4(vaddr, read_cr3())
+}
+
 /// Translate a virtual address in a SPECIFIC PML4 table.
 /// This does NOT use `read_cr3()` — it walks the given PML4 directly.
 /// Useful for checking if a page is already mapped in a target process's

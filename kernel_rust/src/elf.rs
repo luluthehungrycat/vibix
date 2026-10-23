@@ -427,7 +427,7 @@ fn put_u64(image: &mut [u8], offset: usize, value: u64) {
 }
 
 #[cfg(feature = "debug")]
-fn build_rollback_elf(truncated_later_segment: bool) -> Option<*mut u8> {
+pub(crate) fn build_rollback_elf(truncated_later_segment: bool) -> Option<*mut u8> {
     let image_ptr = crate::kmm::kmalloc(0x1008);
     if image_ptr.is_null() {
         return None;
@@ -886,8 +886,15 @@ pub fn build_exec_image(data: &[u8], pmm: &mut PmmAllocator) -> Result<ExecImage
     build_exec_image_inner(data, pmm, None, &mut stack_pages_mapped, false)
 }
 
+/// Build an ELF image for DEBUG fixtures without the verbose page-walk trace.
 #[cfg(feature = "debug")]
-fn build_exec_image_with_stack_failure(
+pub(crate) fn build_exec_image_quiet(data: &[u8], pmm: &mut PmmAllocator) -> Result<ExecImage, ElfError> {
+    let mut stack_pages_mapped = 0;
+    build_exec_image_inner(data, pmm, None, &mut stack_pages_mapped, true)
+}
+
+#[cfg(feature = "debug")]
+pub(crate) fn build_exec_image_with_stack_failure(
     data: &[u8],
     pmm: &mut PmmAllocator,
     fail_after: u64,

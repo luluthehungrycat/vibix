@@ -10,6 +10,7 @@
 
 # Rust / Cargo
 kernel_rust/target/
+**/target/
 
 # QEMU debug log
 qemu.log

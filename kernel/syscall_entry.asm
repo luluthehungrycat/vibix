@@ -37,6 +37,9 @@ syscall_state:
     .rsp:    dq 0       ; +0: user RSP
     .rflags: dq 0       ; +8: user RFLAGS
     .rip:    dq 0       ; +16: user RIP (RCX on SYSCALL)
+    .entry_rdi: dq 0    ; +24: one-shot exec argc
+    .entry_rsi: dq 0    ; +32: one-shot exec argv
+    .entry_rdx: dq 0    ; +40: one-shot exec envp
 
 global should_schedule
 should_schedule: db 0
@@ -65,6 +68,11 @@ syscall_entry:
     ; Save user RIP (RCX) and RFLAGS (R11)
     mov [rel syscall_state.rip], rcx
     mov [rel syscall_state.rflags], r11
+    ; Ordinary syscall returns clear these registers. sys_exec fills them only
+    ; after its new image and startup vectors have been built successfully.
+    mov qword [rel syscall_state.entry_rdi], 0
+    mov qword [rel syscall_state.entry_rsi], 0
+    mov qword [rel syscall_state.entry_rdx], 0
 
     ; ── Set up C ABI call: syscall_handler(num, arg1, arg2, arg3, arg4) ──
     ; After SYSCALL: rdi=arg1, rsi=arg2, rdx=arg3, r8=arg4, rax=num
@@ -86,11 +94,12 @@ syscall_entry:
     ; ── Normal return via sysretq ──
     mov rcx, [rel syscall_state.rip]
     mov r11, [rel syscall_state.rflags]
-    ; Zero user-space argument registers to avoid leaking kernel/old-process
-    ; pointers to the restored process (critical after exec()).
-    xor edi, edi
-    xor esi, esi
-    xor edx, edx
+    ; Restore one-shot entry arguments (zero for ordinary syscalls). On exec
+    ; these are argc/argv/envp; the old process's syscall pointers are never
+    ; returned to the replacement image.
+    mov rdi, [rel syscall_state.entry_rdi]
+    mov rsi, [rel syscall_state.entry_rsi]
+    mov rdx, [rel syscall_state.entry_rdx]
     mov rsp, [rel syscall_state.rsp]
     db 0x48, 0x0f, 0x07    ; sysretq
 
@@ -166,11 +175,11 @@ syscall_entry:
     push 0                          ; R10
     push 0                          ; R9
     push 0                          ; R8
-    push 0                          ; RDI
-    push 0                          ; RSI
+    push qword [rel syscall_state.entry_rdi] ; RDI (argc for successful exec)
+    push qword [rel syscall_state.entry_rsi] ; RSI (argv for successful exec)
     push 0                          ; RBP
     push 0                          ; RBX
-    push 0                          ; RDX
+    push qword [rel syscall_state.entry_rdx] ; RDX (envp for successful exec)
     push 0                          ; RCX
     push rax                        ; RAX (syscall result) ← RSP now points here
 .after_push:

@@ -178,10 +178,14 @@ pub extern "C" fn kernel_main() -> ! {
         // but before STI can schedule a process during the CR3 checks.
         let elf_rollback_ok = elf::test_provenance_failures(&mut pmm, &mut serial);
         let flat_rollback_ok = process::test_flat_image_failures(&mut pmm, &mut serial);
+        let exec_vectors_ok = process::test_exec_vector_inputs(&mut serial) && flat_rollback_ok;
+        if !exec_vectors_ok {
+            serial.writestrs(&["VIBIX: exec argv/env regression failed.\n"]);
+        }
         serial.writestrs(
             [
                 "ELF TEST: rollback final ",
-                if elf_rollback_ok && flat_rollback_ok {
+                if elf_rollback_ok && flat_rollback_ok && exec_vectors_ok {
                     "PASS\n"
                 } else {
                     "FAIL\n"

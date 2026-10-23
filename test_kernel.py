@@ -12,10 +12,208 @@ import struct
 import shutil
 import contextlib
 import io
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
 QEMU = "/usr/bin/qemu-system-x86_64"
+
+
+def test_exec_argv_vector_boundary_fixture_address():
+    """Keep the vector-boundary fixture's first string pointer mapped."""
+    source = Path(__file__).read_text()
+    match = re.search(
+        r"lea rsi, \[rsp-8\]\s+lea rcx, \[rel argv0\](.*?)mov \[rsi\], rcx",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None, "argv vector-boundary fixture setup was not found"
+    assert not re.search(r"\badd\s+rcx\b", match.group(1), re.IGNORECASE), (
+        "RIP-relative argv0 already contains the flat-image address; do not add the image base"
+    )
+
+
+def _exec_argv_env_debug_evidence(output):
+    """Require ordered, PID-correlated evidence for DEBUG-only ABI probes."""
+    armed = re.search(r"DBG EXEC TEST: scheduled return armed pid=(\d+)\n", output)
+    observed = re.search(r"DBG EXEC TEST: scheduled frame observed pid=(\d+)\n", output)
+    progress = output.find("DBG EXEC TEST: failed image construction mapped_stack_pages=1\n")
+    preserved = output.find("EXEC ABI IMAGE FAILURE PRESERVED\n")
+    flat = output.find("EXEC ABI FLAT PASS\n")
+    elf = output.find("EXEC ABI ELF PASS\n")
+    schedule_ok = bool(
+        armed and observed and armed.group(1) == observed.group(1)
+        and armed.start() < observed.start() < flat < elf
+    )
+    failure_ok = progress >= 0 and preserved > progress
+    return schedule_ok, failure_ok
+
+
+def _exec_argv_env_debug_completion(output):
+    """Stop the DEBUG probe on a terminal failure or a complete ELF PASS line."""
+    terminal_failures = (
+        "EXEC ABI IMAGE FAILURE FAIL",
+        "EXEC ABI ELF FAIL",
+        "EXEC ABI FLAT FAIL",
+        "EXEC ABI RUNTIME FAIL",
+        "VIBIX: EXCEPTION:",
+        "VIBIX: PANIC:",
+    )
+    return any(marker in output for marker in terminal_failures) or "EXEC ABI ELF PASS\n" in output
+
+
+def test_exec_argv_env_debug_evidence():
+    """Reject late, mismatched, and progress-free DEBUG runtime evidence."""
+    valid = (
+        "DBG EXEC TEST: failed image construction mapped_stack_pages=1\n"
+        "EXEC ABI IMAGE FAILURE PRESERVED\n"
+        "DBG EXEC TEST: scheduled return armed pid=4\n"
+        "DBG EXEC TEST: scheduled frame observed pid=4\n"
+        "EXEC ABI FLAT PASS\nEXEC ABI ELF PASS\n"
+    )
+    assert not _exec_argv_env_debug_completion("EXEC ABI ELF PASS"), (
+        "QEMU completion must wait until the ELF PASS line terminator arrives"
+    )
+    assert _exec_argv_env_debug_completion("EXEC ABI ELF PASS\n")
+    assert _exec_argv_env_debug_evidence(valid) == (True, True)
+    assert _exec_argv_env_debug_completion("EXEC ABI FLAT FAIL"), (
+        "terminal runtime failures should still stop QEMU immediately"
+    )
+    assert not _exec_argv_env_debug_evidence(
+        valid.replace("DBG EXEC TEST: scheduled frame observed pid=4\n", "")
+        .replace("EXEC ABI FLAT PASS\n", "EXEC ABI FLAT PASS\n")
+        .replace("EXEC ABI ELF PASS\n", "EXEC ABI ELF PASS\nDBG EXEC TEST: scheduled frame observed pid=4\n")
+    )[0], "late scheduling observation must not pass"
+    assert not _exec_argv_env_debug_evidence(valid.replace("observed pid=4", "observed pid=5"))[0], (
+        "scheduled observation must match the armed exec PID"
+    )
+    assert not _exec_argv_env_debug_evidence(
+        valid.replace("mapped_stack_pages=1\n", "mapped_stack_pages=0\n")
+    )[1], "zero-page construction must not pass"
+    assert not _exec_argv_env_debug_evidence(
+        valid.replace("DBG EXEC TEST: failed image construction mapped_stack_pages=1\n", "")
+    )[1], "missing construction progress must not pass"
+def _test_process_group_probe_handles_zombie_leader_and_non_utf8_threads():
+    """A dead thread-group leader must not hide a live worker thread."""
+    with tempfile.TemporaryDirectory(prefix="vibix-proc-stat-fixture-") as temp_dir:
+        proc_root = Path(temp_dir)
+        process = proc_root / "700"
+        task_dir = process / "task"
+        task_dir.mkdir(parents=True)
+
+        def write_stat(path, pid, comm, state):
+            path.write_bytes(
+                str(pid).encode() + b" (" + comm + b") " + state + b" 1 700 0\n"
+            )
+
+        write_stat(process / "stat", 700, b"lead\xff", b"Z")
+        (task_dir / "700").mkdir()
+        write_stat(task_dir / "700" / "stat", 700, b"lead\xff", b"Z")
+        (task_dir / "701").mkdir()
+        write_stat(task_dir / "701" / "stat", 701, b"worker\xfe", b"R")
+        assert _process_group_has_live_members(700, proc_root=proc_root)
+
+        write_stat(task_dir / "701" / "stat", 701, b"worker\xfe", b"Z")
+        assert not _process_group_has_live_members(700, proc_root=proc_root)
+
+
+def _process_group_has_live_members(process_group, proc_root=Path("/proc")):
+    """Return whether procfs shows a live process or thread in this group."""
+    for entry in proc_root.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            task_entries = list((entry / "task").iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            task_entries = []
+        stat_paths = [task / "stat" for task in task_entries]
+        if not stat_paths:
+            stat_paths = [entry / "stat"]
+        for stat_path in stat_paths:
+            try:
+                stat = stat_path.read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            fields = stat.rsplit(b")", 1)[-1].split()
+            if len(fields) > 2 and fields[2].isdigit() and int(fields[2]) == process_group:
+                if fields[0] not in {b"Z", b"X"}:
+                    return True
+    return False
+
+
+def _run_owned_process_group(command, *, cwd, timeout):
+    """Run a build and stop every process in its private group before returning."""
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(
+            command, cwd=cwd, stdout=stdout_file, stderr=stderr_file,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                returncode = proc.returncode
+        finally:
+            # Always reap descendants before callers restore or remove build inputs.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if proc.poll() is None:
+                proc.wait()
+            while _process_group_has_live_members(proc.pid):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                time.sleep(0.01)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read().decode(errors="replace")
+        stderr = stderr_file.read().decode(errors="replace")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def _test_owned_process_group_cleanup():
+    """Ensure a TERM-exiting leader cannot leave a live build descendant."""
+    _test_process_group_probe_handles_zombie_leader_and_non_utf8_threads()
+    with tempfile.TemporaryDirectory(prefix="vibix-process-group-test-") as temp_dir:
+        pid_path = Path(temp_dir) / "child.pid"
+        child_code = (
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, lambda *_: time.sleep(30)); "
+            "time.sleep(30)"
+        )
+        leader_code = (
+            "import os,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+            "open(sys.argv[1],'w').write(str(os.getpid())+' '+str(child.pid)); "
+            "time.sleep(30)"
+        )
+        command = [sys.executable, "-c", leader_code, str(pid_path), child_code]
+        try:
+            _run_owned_process_group(command, cwd=Path.cwd(), timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            return False
+        if not pid_path.exists():
+            return False
+        process_group = int(pid_path.read_text().split()[0])
+        # The leader's PID is its process-group ID; the group must be fully quiet.
+        return not _process_group_has_live_members(process_group)
 
 
 @dataclass
@@ -1302,8 +1500,555 @@ def test_tty_sigint():
             os.unlink(serial_path)
 
 
+def test_exec_argv_env_runtime():
+    """Exercise flat and ELF exec argv/env delivery through the production syscall."""
+    debug_runtime = os.environ.get("VIBIX_EXEC_ABI_DEBUG_TEST") == "1"
+    print("Testing real flat and ELF exec argv/env startup ABI...")
+    try:
+        test_exec_argv_vector_boundary_fixture_address()
+        test_exec_argv_env_debug_evidence()
+    except AssertionError as error:
+        print(f"FAIL ABI runtime transcript guard: {error}")
+        return False
+    print("PASS vector-boundary fixture keeps argv0 mapped")
+    if not _test_owned_process_group_cleanup():
+        print("FAIL owned build process-group descendants terminated before cleanup")
+        return False
+    print("PASS owned build process-group descendants terminated before cleanup")
+    repo = Path(__file__).resolve().parent
+    archive_path = repo / "userspace/initramfs.tar"
+    serial_path = None
+    staging = None
+    original_archive = None
+    archive_snapshot_ready = False
+    archive_restored = False
+    result = False
+    try:
+        original_archive = archive_path.read_bytes() if archive_path.exists() else None
+        archive_snapshot_ready = True
+        clean = _run_owned_process_group(["make", "clean"], cwd=repo, timeout=120)
+        if clean.returncode != 0:
+            print("VIBIX clean failed before runtime ABI test")
+            print(clean.stdout[-2000:])
+            print(clean.stderr[-2000:])
+            return False
+        with tempfile.NamedTemporaryFile(suffix=".serial", delete=False) as serial:
+            serial_path = serial.name
+        staging = Path(tempfile.mkdtemp(prefix="vibix-exec-argv-env-"))
+        init_source = staging / "init.asm"
+        probe_source = staging / "argv_probe.asm"
+        elf_probe_source = staging / "argv_elf_probe.asm"
+        elf_probe_object = staging / "argv_elf_probe.o"
+        elf_linker_script = staging / "argv_elf_probe.ld"
+        init_bin = staging / "init"
+        probe_bin = staging / "argv-probe"
+        elf_probe_bin = staging / "argv-elf-probe"
+        init_asm = """bits 64
+default rel
+start:
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rel bad_argv]
+    xor rdx, rdx
+    syscall
+    cmp rax, -14
+    jne bad_errno
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rsp-8]
+    lea rcx, [rel argv0]
+    mov [rsi], rcx
+    xor rdx, rdx
+    syscall
+    cmp rax, -14
+    jne bad_vector_boundary
+    mov byte [rsp-1], 'x'
+    lea rsi, [rsp-16]
+    lea rcx, [rsp-1]
+    mov [rsi], rcx
+    xor rdx, rdx
+    mov rax, 9
+    lea rdi, [rel target_path]
+    syscall
+    cmp rax, -14
+    jne bad_string_boundary
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rel too_many_argv]
+    xor rdx, rdx
+    syscall
+    cmp rax, -7
+    jne bad_e2big
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rel too_long_argv]
+    xor rdx, rdx
+    syscall
+    cmp rax, -7
+    jne bad_bytes_limit
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rel argv]
+    lea rdx, [rel envp]
+    syscall
+    jmp exec_returned
+bad_errno:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel errno_failed]
+    mov rdx, errno_failed_len
+    syscall
+    jmp terminate
+bad_vector_boundary:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel vector_boundary_failed]
+    mov rdx, vector_boundary_failed_len
+    syscall
+    jmp terminate
+bad_string_boundary:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel string_boundary_failed]
+    mov rdx, string_boundary_failed_len
+    syscall
+    jmp terminate
+bad_e2big:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel e2big_failed]
+    mov rdx, e2big_failed_len
+    syscall
+    jmp terminate
+bad_bytes_limit:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel byte_limit_failed]
+    mov rdx, byte_limit_failed_len
+    syscall
+    jmp terminate
+exec_returned:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel returned_failed]
+    mov rdx, returned_failed_len
+    syscall
+terminate:
+    xor rdi, rdi
+    mov rax, 0
+    syscall
+target_path: db '/bin/argv-probe', 0
+bad_argv: dq 0x9000, 0
+argv: dq argv0+0x2000000, arg1+0x2000000, 0
+envp: dq env0+0x2000000, 0
+too_many_argv: times 33 dq argv0+0x2000000
+too_long_argv: dq too_long_string+0x2000000, 0
+too_long_string: times 2048 db 'A'
+    db 0
+argv0: db '/bin/argv-probe', 0
+arg1: db 'alpha', 0
+env0: db 'ABI=ok', 0
+errno_failed: db 'EXEC ABI RUNTIME FAIL: expected EFAULT', 10
+errno_failed_len equ $-errno_failed
+vector_boundary_failed: db 'EXEC ABI RUNTIME FAIL: argv vector boundary was not EFAULT', 10
+vector_boundary_failed_len equ $-vector_boundary_failed
+string_boundary_failed: db 'EXEC ABI RUNTIME FAIL: argv string boundary was not EFAULT', 10
+string_boundary_failed_len equ $-string_boundary_failed
+e2big_failed: db 'EXEC ABI RUNTIME FAIL: 33 argv entries were not E2BIG', 10
+e2big_failed_len equ $-e2big_failed
+byte_limit_failed: db 'EXEC ABI RUNTIME FAIL: oversized argv string was not E2BIG', 10
+byte_limit_failed_len equ $-byte_limit_failed
+returned_failed: db 'EXEC ABI RUNTIME FAIL: exec returned unexpectedly', 10
+returned_failed_len equ $-returned_failed
+"""
+        if debug_runtime:
+            debug_exec_prefix = """    mov rax, 9
+    lea rdi, [rel fail_image_path]
+    lea rsi, [rel fail_argv]
+    lea rdx, [rel fail_envp]
+    syscall
+    cmp rax, -12
+    jne image_failure_bad
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel image_failure_preserved]
+    mov rdx, image_failure_preserved_len
+    syscall
+    mov rax, 9
+    lea rdi, [rel target_path]
+    lea rsi, [rel argv]
+    lea rdx, [rel envp]
+    syscall
+    jmp exec_returned
+image_failure_bad:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel image_failure_failed]
+    mov rdx, image_failure_failed_len
+    syscall
+    jmp terminate
+"""
+            init_asm = init_asm.replace(
+                "start:\n    mov rax, 9",
+                "start:\n" + debug_exec_prefix + "    mov rax, 9",
+                1,
+            )
+            init_asm = init_asm.replace(
+                "target_path: db '/bin/argv-probe', 0",
+                "fail_image_path: db '/bin/argv-fail-image', 0\n"
+                "target_path: db '/bin/argv-probe', 0\n"
+                "fail_argv: dq fail_argv0+0x2000000, fail_argv1+0x2000000, 0\n"
+                "fail_envp: dq fail_env0+0x2000000, 0\n"
+                "fail_argv0: db '/bin/argv-elf-probe', 0\n"
+                "fail_argv1: db 'alpha', 0\n"
+                "fail_env0: db 'ELF=ok', 0",
+                1,
+            )
+            init_asm = init_asm.replace(
+                "returned_failed_len equ $-returned_failed",
+                "returned_failed_len equ $-returned_failed\n"
+                "image_failure_preserved: db 'EXEC ABI IMAGE FAILURE PRESERVED', 10\n"
+                "image_failure_preserved_len equ $-image_failure_preserved\n"
+                "image_failure_failed: db 'EXEC ABI IMAGE FAILURE FAIL', 10\n"
+                "image_failure_failed_len equ $-image_failure_failed",
+                1,
+            )
+        init_source.write_text(init_asm)
+        probe_source.write_text("""bits 64
+default rel
+start:
+    mov r9d, 1
+    test rsp, 0xf
+    jne fail
+    inc r9d
+    cmp rdi, 32
+    je exact_byte_limit
+    cmp rdi, 2
+    jne fail
+    inc r9d
+    lea rcx, [rsp+8]
+    cmp rsi, rcx
+    jne fail
+    inc r9d
+    lea rcx, [rsi+24]
+    cmp rdx, rcx
+    jne fail
+    inc r9d
+    cmp qword [rsp], 2
+    jne fail
+    inc r9d
+    cmp qword [rsi+16], 0
+    jne fail
+    inc r9d
+    cmp qword [rdx+8], 0
+    jne fail
+    inc r9d
+    mov r8, [rsi]
+    cmp dword [r8], 0x6e69622f
+    jne fail
+    cmp dword [r8+4], 0x6772612f
+    jne fail
+    cmp word [r8+8], 0x2d76
+    jne fail
+    cmp dword [r8+10], 0x626f7270
+    jne fail
+    cmp word [r8+14], 0x0065
+    jne fail
+    inc r9d
+    mov r8, [rsi+8]
+    cmp dword [r8], 0x68706c61
+    jne fail
+    cmp word [r8+4], 0x0061
+    jne fail
+    inc r9d
+    mov r8, [rdx]
+    cmp dword [r8], 0x3d494241
+    jne fail
+    cmp word [r8+4], 0x6b6f
+    jne fail
+    cmp byte [r8+6], 0
+    jne fail
+    mov rax, 9
+    lea rdi, [rel self_path]
+    lea rsi, [rel exact_limit_argv]
+    xor rdx, rdx
+    syscall
+    jmp exact_exec_returned
+exact_byte_limit:
+    cmp qword [rsp], 32
+    jne exact_layout_fail
+    lea rcx, [rsp+8]
+    cmp rsi, rcx
+    jne exact_layout_fail
+    lea rcx, [rsi+264]
+    cmp rdx, rcx
+    jne exact_layout_fail
+    cmp qword [rsi+256], 0
+    jne exact_layout_fail
+    cmp qword [rdx], 0
+    jne exact_layout_fail
+    mov r8, [rsi+248]
+    mov ecx, 1984
+check_exact_bytes:
+    cmp byte [r8+rcx], 'A'
+    jne exact_data_fail
+    dec ecx
+    jns check_exact_bytes
+    cmp byte [r8+1985], 0
+    jne exact_data_fail
+report_pass:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel pass]
+    mov rdx, pass_len
+    syscall
+    mov rax, 9
+    lea rdi, [rel elf_path]
+    lea rsi, [rel elf_argv]
+    lea rdx, [rel elf_envp]
+    syscall
+    jmp exact_exec_returned
+fail:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel failed]
+    mov rdx, failed_len
+    syscall
+    mov rdi, 1
+    jmp exit
+exact_layout_fail:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel exact_layout_failed]
+    mov rdx, exact_layout_failed_len
+    syscall
+    mov rdi, 1
+    jmp exit
+exact_data_fail:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel exact_data_failed]
+    mov rdx, exact_data_failed_len
+    syscall
+    mov rdi, 1
+    jmp exit
+exact_exec_returned:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel exact_exec_failed]
+    mov rdx, exact_exec_failed_len
+    syscall
+    mov rdi, 1
+exit:
+    mov rax, 0
+    syscall
+exact_limit_argv: times 31 dq short_string+0x2000000
+    dq exact_limit_string+0x2000000, 0
+self_path: db '/bin/argv-probe', 0
+elf_path: db '/bin/argv-elf-probe', 0
+elf_argv: dq elf_argv0+0x2000000, elf_argv1+0x2000000, 0
+elf_envp: dq elf_env+0x2000000, 0
+elf_argv0: db '/bin/argv-elf-probe', 0
+elf_argv1: db 'alpha', 0
+elf_env: db 'ELF=ok', 0
+short_string: db 'x', 0
+exact_limit_string: times 1985 db 'A'
+    db 0
+pass: db 'EXEC ABI FLAT PASS', 10
+pass_len equ $-pass
+failed: db 'EXEC ABI RUNTIME FAIL: entry validation', 10
+failed_len equ $-failed
+exact_layout_failed: db 'EXEC ABI RUNTIME FAIL: exact-limit vector layout', 10
+exact_layout_failed_len equ $-exact_layout_failed
+exact_data_failed: db 'EXEC ABI RUNTIME FAIL: exact-limit string bytes', 10
+exact_data_failed_len equ $-exact_data_failed
+exact_exec_failed: db 'EXEC ABI RUNTIME FAIL: exact-limit exec rejected', 10
+exact_exec_failed_len equ $-exact_exec_failed
+""")
+        elf_probe_source.write_text("""bits 64
+default rel
+global _start
+section .text
+_start:
+    test rsp, 0xf
+    jne fail
+    cmp rdi, 2
+    jne fail
+    lea rcx, [rsp+8]
+    cmp rsi, rcx
+    jne fail
+    lea rcx, [rsi+24]
+    cmp rdx, rcx
+    jne fail
+    cmp qword [rsp], 2
+    jne fail
+    cmp qword [rsi+16], 0
+    jne fail
+    cmp qword [rdx+8], 0
+    jne fail
+    mov r8, [rsi]
+    mov rax, 0x6772612f6e69622f
+    cmp qword [r8], rax
+    jne fail
+    mov rax, 0x72702d666c652d76
+    cmp qword [r8+8], rax
+    jne fail
+    cmp dword [r8+16], 0x0065626f
+    jne fail
+    mov r8, [rsi+8]
+    cmp dword [r8], 0x68706c61
+    jne fail
+    cmp word [r8+4], 0x0061
+    jne fail
+    mov r8, [rdx]
+    cmp dword [r8], 0x3d464c45
+    jne fail
+    cmp word [r8+4], 0x6b6f
+    jne fail
+    cmp byte [r8+6], 0
+    jne fail
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel pass]
+    mov rdx, pass_len
+    syscall
+    xor rdi, rdi
+    mov rax, 0
+    syscall
+fail:
+    mov rax, 1
+    mov rdi, 1
+    lea rsi, [rel failed]
+    mov rdx, failed_len
+    syscall
+    mov rdi, 1
+    mov rax, 0
+    syscall
+pass: db 'EXEC ABI ELF PASS', 10
+pass_len equ $-pass
+failed: db 'EXEC ABI ELF FAIL', 10
+failed_len equ $-failed
+""")
+        elf_linker_script.write_text("""ENTRY(_start)
+PHDRS { text PT_LOAD FLAGS(5); }
+SECTIONS {
+    . = 0x02000000;
+    .text : ALIGN(0x1000) { *(.text*) *(.rodata*) } :text
+}
+""")
+        for source, binary in ((init_source, init_bin), (probe_source, probe_bin)):
+            assembled = subprocess.run(
+                ["nasm", "-f", "bin", str(source), "-o", str(binary)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if assembled.returncode != 0:
+                print(f"NASM fixture build failed: {assembled.stderr.strip()}")
+                return False
+
+        assembled_elf = subprocess.run(
+            ["nasm", "-f", "elf64", str(elf_probe_source), "-o", str(elf_probe_object)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if assembled_elf.returncode != 0:
+            print(f"ELF NASM fixture build failed: {assembled_elf.stderr.strip()}")
+            return False
+        linked_elf = subprocess.run(
+            ["ld", "-T", str(elf_linker_script), "-o", str(elf_probe_bin), str(elf_probe_object)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if linked_elf.returncode != 0:
+            print(f"ELF linker fixture build failed: {linked_elf.stderr.strip()}")
+            return False
+
+        (staging / "root/sbin").mkdir(parents=True)
+        (staging / "root/bin").mkdir(parents=True)
+        shutil.copyfile(init_bin, staging / "root/sbin/init")
+        shutil.copyfile(probe_bin, staging / "root/bin/argv-probe")
+        shutil.copyfile(elf_probe_bin, staging / "root/bin/argv-elf-probe")
+        shutil.copyfile(elf_probe_bin, staging / "root/bin/argv-fail-image")
+        import tarfile
+        with tarfile.open(archive_path, "w", format=tarfile.USTAR_FORMAT) as archive:
+            for name in (
+                "sbin/init", "bin/argv-probe", "bin/argv-elf-probe",
+                "bin/argv-fail-image",
+            ):
+                archive.add(staging / "root" / name, arcname=name, recursive=False)
+
+        build_command = ["make"]
+        if debug_runtime:
+            build_command.append("DEBUG=1")
+        build_command.extend(("-j1", "VIBIX_STAGED_INITRAMFS=1", "vibix.elf"))
+        build = _run_owned_process_group(
+            build_command,
+            cwd=repo, timeout=180,
+        )
+        if build.returncode != 0:
+            print("Runtime ABI kernel build failed")
+            print(build.stdout[-2500:])
+            print(build.stderr[-2500:])
+            return False
+
+        if debug_runtime:
+            probe = _run_bounded_qemu(
+                serial_path, _available_accelerators(), attempts=1,
+                completion_predicate=_exec_argv_env_debug_completion, timeout=45,
+            )
+        else:
+            probe = _run_bounded_qemu(
+                serial_path, _available_accelerators(), attempts=1,
+                completion_markers=("EXEC ABI ELF PASS\n", "EXEC ABI ELF FAIL\n", "EXEC ABI RUNTIME FAIL"), timeout=45,
+            )
+        output = probe.transcript
+        flat_pass = "EXEC ABI FLAT PASS" in output
+        elf_pass = "EXEC ABI ELF PASS" in output
+        pass_seen = flat_pass and elf_pass
+        fail_seen = "EXEC ABI RUNTIME FAIL" in output or "EXEC ABI ELF FAIL" in output or "exec returned unexpectedly" in output
+        exception = "VIBIX: EXCEPTION:" in output or "VIBIX: PANIC:" in output
+        print(f"{'PASS' if flat_pass and not fail_seen else 'FAIL'} flat exec EFAULT/page boundaries, E2BIG limits, exact 32-vector/2048-byte acceptance, and entry ABI")
+        print(f"{'PASS' if elf_pass and not fail_seen else 'FAIL'} ELF exec entry registers, stack vectors, and argument/environment strings")
+        if debug_runtime:
+            scheduled_return, failure_preserved = _exec_argv_env_debug_evidence(output)
+            print(f"{'PASS' if failure_preserved else 'FAIL'} failed exec after image construction leaves caller image usable")
+            print(f"{'PASS' if scheduled_return else 'FAIL'} forced scheduled-frame exec startup registers")
+            fail_seen |= "EXEC ABI IMAGE FAILURE FAIL" in output
+            pass_seen &= failure_preserved and scheduled_return
+        print(f"{'PASS' if not exception else 'FAIL'} no kernel panic or exception")
+        if not pass_seen or fail_seen or exception:
+            print(f"Serial transcript tail ({len(output)} chars):", repr(output[-4000:]))
+        result = pass_seen and not fail_seen and not exception
+    finally:
+        if serial_path and os.path.exists(serial_path):
+            os.unlink(serial_path)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if archive_snapshot_ready:
+            try:
+                if original_archive is None:
+                    archive_path.unlink(missing_ok=True)
+                    archive_restored = not archive_path.exists()
+                else:
+                    archive_path.write_bytes(original_archive)
+                    archive_restored = archive_path.read_bytes() == original_archive
+            except OSError as exc:
+                print(f"Original initramfs archive restoration failed: {exc}")
+        for name in (
+            "kernel64_entry.o", "interrupts.o", "syscall_entry.o", "context_switch.o",
+            "kernel64.elf", "kernel64.bin", "boot.o", "vibix.elf",
+        ):
+            (repo / name).unlink(missing_ok=True)
+    print(f"{'PASS' if archive_restored else 'FAIL'} original initramfs archive restored byte-for-byte")
+    return result and archive_restored
+
+
 def test_elf_rollback():
     """Verify DEBUG-only ELF rollback and allocator reclamation cases."""
+    entry_asm = (Path(__file__).resolve().parent / "kernel/syscall_entry.asm").read_text()
+    scheduled_frame = entry_asm.split(".normal_push:", 1)[1].split(".after_push:", 1)[0]
+    for register in ("rdi", "rsi", "rdx"):
+        instruction = f"push qword [rel syscall_state.entry_{register}]"
+        if instruction not in scheduled_frame:
+            print(f"  ❌ scheduled exec frame does not restore {register.upper()}")
+            return False
     print("🧪 Testing deterministic ELF partial-load rollback fixture...")
     with tempfile.NamedTemporaryFile(suffix=".serial", delete=False) as serial:
         serial_path = serial.name
@@ -1329,6 +2074,8 @@ def test_elf_rollback():
             "FLAT TEST: oversize rejection PASS": "flat oversize rejection",
             "FLAT TEST: old-root no-overwrite PASS": "flat old-root isolation",
             "FLAT TEST: small-binary zero-tail/no-stale copy PASS": "small-binary zero-tail and stale-PMM isolation",
+            "EXEC ABI TEST: input vectors PASS": "bounded argv/env input validation",
+            "EXEC ABI TEST: flat/ELF stack vectors PASS": "flat and ELF argc/argv/envp stack layout and empty vectors",
         }
         ok = True
         for marker, label in checks.items():

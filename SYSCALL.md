@@ -496,8 +496,21 @@ from the VFS path. Supports both ELF64 executables and flat binaries.
 
 **Arguments:**
 - `rdi` = `path`: Pointer to path string (e.g. "/sbin/init").
-- `rsi` = `argv`: Array of argument strings (currently ignored).
-- `rdx` = `envp`: Array of environment strings (currently ignored).
+- `rsi` = `argv`: Null-terminated array of argument string pointers.
+- `rdx` = `envp`: Null-terminated array of environment string pointers.
+
+On successful `exec`, the replacement image begins with `rdi = argc`, `rsi =
+argv`, and `rdx = envp`. Both vector arrays and their NUL-terminated strings
+are copied into the new image's user stack; they remain valid for the lifetime
+of that image. The stack begins with the matching word layout
+`argc, argv[0..argc], NULL, envp[0..], NULL`, followed by the strings, and
+`rsp` is 16-byte aligned. Flat and ELF images use this same entry contract.
+NULL input vectors are accepted as empty vectors and become non-NULL arrays
+containing only a NULL pointer. At most 32 entries per vector and 2048 total
+bytes of argument and environment strings (including terminators) are accepted;
+larger inputs fail with `E2BIG`. Unmapped or out-of-range user pointers fail
+with `EFAULT`. The initial PID 1 launch keeps its separate `rdi` command
+selector convention; this `argc/argv/envp` register contract applies to exec.
 
 **Return:** 0 on success, negative errno on error (process image is not replaced
 on error).

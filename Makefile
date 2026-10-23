@@ -35,7 +35,7 @@ INIT ?= default
 ASMFLAGS32  = -f elf32
 LDFLAGS32   = -m elf_i386 -T linker.ld -nostdlib
 
-.PHONY: all clean run debug test_tty_sigint test_elf_rollback test_vibit test_vibit_rust test_vibit_rust_shell test_vibit_rust_large
+.PHONY: all clean run debug test_tty_sigint test_elf_rollback test_exec_argv_env test_exec_argv_env_debug test_vibit test_vibit_rust test_vibit_rust_shell test_vibit_rust_large
 
 all: vibix.elf
 
@@ -118,6 +118,14 @@ test_tty_sigint: clean
 test_elf_rollback: clean
 	$(MAKE) DEBUG=1
 	python3 anti_cheat.py && python3 -c "from test_kernel import test_elf_rollback; import sys; sys.exit(0 if test_elf_rollback() else 1)"
+
+# Run PID 1 plus flat and ELF argv/env probes through the production syscall path.
+test_exec_argv_env:
+	python3 anti_cheat.py && python3 -c "from test_kernel import test_exec_argv_env_runtime; import sys; sys.exit(0 if test_exec_argv_env_runtime() else 1)"
+
+# Force the DEBUG-only scheduled-frame return and post-build failure probes.
+test_exec_argv_env_debug:
+	python3 anti_cheat.py && VIBIX_EXEC_ABI_DEBUG_TEST=1 python3 -c "from test_kernel import test_exec_argv_env_runtime; import sys; sys.exit(0 if test_exec_argv_env_runtime() else 1)"
 
 clean:
 	rm -f *.o *.elf *.bin kernel/interrupts.o kernel/syscall_entry.o kernel/context_switch.o

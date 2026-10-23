@@ -12,6 +12,8 @@ const MAX_PROCS: usize = 64;
 const KERNEL_STACK_SIZE: usize = 12288; // 12 KB (3 pages)
 pub const USER_CODE_ADDR: u64 = 0x2000000;
 const FLAT_USER_LIMIT: u64 = BRK_START;
+const EXEC_VECTOR_MAX: usize = 32;
+const EXEC_STRING_BYTES_MAX: usize = 2048;
 
 /// BRK start address (shared constant for per-process brk)
 pub const BRK_START: u64 = 0x500_0000; // Start well above the ELF and flat-binary stacks
@@ -88,6 +90,245 @@ pub struct SyscallSavedState {
     pub rsp: u64,
     pub rflags: u64,
     pub rip: u64,
+    pub entry_rdi: u64,
+    pub entry_rsi: u64,
+    pub entry_rdx: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UserStringRef { offset: u16 }
+
+struct ExecVectors {
+    bytes: [u8; EXEC_STRING_BYTES_MAX],
+    used: usize,
+    argv: [UserStringRef; EXEC_VECTOR_MAX],
+    argc: usize,
+    envp: [UserStringRef; EXEC_VECTOR_MAX],
+    envc: usize,
+}
+
+impl ExecVectors {
+    const fn new() -> Self {
+        Self { bytes: [0; EXEC_STRING_BYTES_MAX], used: 0,
+            argv: [UserStringRef { offset: 0 }; EXEC_VECTOR_MAX], argc: 0,
+            envp: [UserStringRef { offset: 0 }; EXEC_VECTOR_MAX], envc: 0 }
+    }
+}
+
+fn user_byte(addr: u64) -> Result<u8, i64> {
+    if addr < USER_CODE_ADDR
+        || addr >= crate::elf::USER_ADDR_LIMIT
+        || !crate::paging::is_user_accessible(addr)
+    {
+        return Err(-14); // EFAULT
+    }
+    Ok(unsafe { core::ptr::read(addr as *const u8) })
+}
+
+fn user_word_with<F>(addr: u64, read_byte: &F) -> Result<u64, i64>
+where
+    F: Fn(u64) -> Result<u8, i64>,
+{
+    let mut bytes = [0u8; 8];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_byte(addr.checked_add(i as u64).ok_or(-14)?)?;
+    }
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+fn copy_exec_vector(vectors: &mut ExecVectors, source: u64, env: bool) -> Result<(), i64> {
+    copy_exec_vector_with(vectors, source, env, &user_byte)
+}
+
+fn copy_exec_vector_with<F>(
+    vectors: &mut ExecVectors,
+    source: u64,
+    env: bool,
+    read_byte: &F,
+) -> Result<(), i64>
+where
+    F: Fn(u64) -> Result<u8, i64>,
+{
+    if source == 0 { return Ok(()); }
+    let mut index = 0usize;
+    loop {
+        let slot = source.checked_add((index as u64).checked_mul(8).ok_or(-14)?).ok_or(-14)?;
+        let string = user_word_with(slot, read_byte)?;
+        if string == 0 { return Ok(()); }
+        if index == EXEC_VECTOR_MAX { return Err(-7); } // E2BIG
+        let start = vectors.used;
+        loop {
+            if vectors.used == EXEC_STRING_BYTES_MAX { return Err(-7); }
+            let byte = read_byte(string.checked_add((vectors.used - start) as u64).ok_or(-14)?)?;
+            vectors.bytes[vectors.used] = byte;
+            vectors.used += 1;
+            if byte == 0 { break; }
+        }
+        let item = UserStringRef { offset: start as u16 };
+        if env { vectors.envp[index] = item; } else { vectors.argv[index] = item; }
+        index += 1;
+        if env { vectors.envc = index; } else { vectors.argc = index; }
+    }
+}
+
+#[cfg(feature = "debug")]
+fn exec_vector_fixture_byte(addr: u64) -> Result<u8, i64> {
+    match addr {
+        0x1000..=0x1007 => Ok([0x00, 0x20, 0, 0, 0, 0, 0, 0][(addr - 0x1000) as usize]),
+        0x1008..=0x100f => Ok(0),
+        0x2000..=0x2004 => Ok(*b"prog\0".get((addr - 0x2000) as usize).unwrap()),
+        0x3000..=0x37ff => Ok(b'x'),
+        0x6000..=0x6007 => Ok([0x00, 0x30, 0, 0, 0, 0, 0, 0][(addr - 0x6000) as usize]),
+        0x4000..=0x4107 => {
+            let index = ((addr - 0x4000) / 8) as usize;
+            let byte = ((addr - 0x4000) % 8) as usize;
+            Ok(if byte == 0 { 0x00 } else if byte == 1 { 0x50 } else if index < 33 { 0 } else { 0 })
+        }
+        0x5000..=0x5001 => Ok([b'x', 0][(addr - 0x5000) as usize]),
+        _ => Err(-14),
+    }
+}
+
+#[cfg(feature = "debug")]
+#[inline(never)]
+pub fn test_exec_vector_inputs(serial: &mut crate::serial::SerialPort) -> bool {
+    serial.writestrs(&["EXEC ABI TEST: input fixture begin\n"]);
+    let fixture_probe = exec_vector_fixture_byte(0x1000);
+    serial.writestrs(&[if fixture_probe == Ok(0) { "EXEC ABI TEST: fixture reader PASS\n" } else { "EXEC ABI TEST: fixture reader FAIL\n" }]);
+    let valid = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_INPUT_VALID) };
+    *valid = ExecVectors::new();
+    let valid_ok = copy_exec_vector_with(valid, 0x1000, false, &exec_vector_fixture_byte).is_ok()
+        && valid.argc == 1
+        && valid.used == 5
+        && &valid.bytes[..5] == b"prog\0";
+    serial.writestrs(&["EXEC ABI TEST: valid input checked\n"]);
+    let empty_ok = copy_exec_vector_with(valid, 0, true, &exec_vector_fixture_byte).is_ok()
+        && valid.envc == 0;
+    serial.writestrs(&["EXEC ABI TEST: empty input checked\n"]);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_INPUT_SCRATCH) };
+    *scratch = ExecVectors::new();
+    let invalid_pointer = copy_exec_vector_with(scratch, 0x9000, false, &exec_vector_fixture_byte) == Err(-14);
+    serial.writestrs(&["EXEC ABI TEST: invalid pointer checked\n"]);
+    *scratch = ExecVectors::new();
+    let unterminated_string = copy_exec_vector_with(scratch, 0x6000, false, &exec_vector_fixture_byte) == Err(-7);
+    serial.writestrs(&["EXEC ABI TEST: unterminated string checked\n"]);
+    *scratch = ExecVectors::new();
+    let unterminated_vector = copy_exec_vector_with(scratch, 0x4000, false, &exec_vector_fixture_byte) == Err(-7);
+    serial.writestrs(&["EXEC ABI TEST: unterminated vector checked\n"]);
+    let ok = valid_ok && empty_ok && invalid_pointer && unterminated_string && unterminated_vector;
+    serial.writestrs(&[if ok { "EXEC ABI TEST: input vectors PASS\n" } else { "EXEC ABI TEST: input vectors FAIL\n" }]);
+    ok
+}
+
+#[cfg(feature = "debug")]
+#[inline(never)]
+pub fn test_exec_vector_layout(image: &FlatImage, pmm: &mut PmmAllocator, serial: &mut crate::serial::SerialPort) -> bool {
+    serial.writestrs(&["EXEC ABI TEST: stack layout fixture begin\n"]);
+    let vectors = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_LAYOUT_VECTORS) };
+    vectors.bytes[..15].copy_from_slice(b"prog\0alpha\0K=V\0");
+    vectors.used = 15;
+    vectors.argv[0] = UserStringRef { offset: 0 };
+    vectors.argv[1] = UserStringRef { offset: 5 };
+    vectors.argc = 2;
+    vectors.envp[0] = UserStringRef { offset: 11 };
+    vectors.envc = 1;
+    let layout = install_exec_vectors(&vectors, image.root.phys, image.stack_low, image.user_rsp);
+    let mut ok = false;
+    if let Ok((rsp, argv, envp)) = layout {
+        let permissions_ok = paging::is_user_accessible_in_pml4(USER_CODE_ADDR, image.root.phys)
+            && paging::is_user_accessible_in_pml4(image.stack_low, image.root.phys)
+            && !paging::is_user_accessible_in_pml4(0x0020_0000, image.root.phys);
+        let saved_cr3 = paging::read_cr3();
+        unsafe { paging::write_cr3(image.root.phys); }
+        let words = rsp as *const u64;
+        let stack_argc = unsafe { words.read() };
+        let stack_argv0 = unsafe { words.add(1).read() };
+        ok = permissions_ok
+            && rsp & 0xf == 0
+            && argv == rsp + 8
+            && envp == rsp + 8 * 4
+            && stack_argc == 2 && stack_argv0 == image.user_rsp - 15
+            && unsafe { core::slice::from_raw_parts((image.user_rsp - 15) as *const u8, 15) == b"prog\0alpha\0K=V\0" }
+            && unsafe { words.add(3).read() == 0 && words.add(4).read() == image.user_rsp - 4 && words.add(5).read() == 0 };
+        unsafe { paging::write_cr3(saved_cr3); }
+    }
+    // Empty vectors remain valid and expose one null word for each vector.
+    if ok {
+        let empty = unsafe { &mut *core::ptr::addr_of_mut!(EXEC_LAYOUT_EMPTY_VECTORS) };
+        if let Ok((rsp, argv, envp)) = install_exec_vectors(&empty, image.root.phys, image.stack_low, image.user_rsp) {
+            let saved_cr3 = paging::read_cr3();
+            unsafe { paging::write_cr3(image.root.phys); }
+            let words = rsp as *const u64;
+            ok = unsafe { words.read() == 0 && (argv as *const u64).read() == 0 && (envp as *const u64).read() == 0 };
+            unsafe { paging::write_cr3(saved_cr3); }
+        } else { ok = false; }
+    }
+    let flat_ok = ok;
+    let elf_fixture = crate::elf::build_rollback_elf(false);
+    let mut elf_ok = false;
+    if let Some(elf_data) = elf_fixture {
+        let elf_bytes = unsafe { core::slice::from_raw_parts(elf_data, 0x1008) };
+        if let Ok(elf_image) = crate::elf::build_exec_image_quiet(elf_bytes, pmm) {
+            if let Ok((rsp, argv, envp)) = install_exec_vectors(
+                &vectors, elf_image.root.phys, elf_image.stack_low, elf_image.user_rsp,
+            ) {
+                let saved_cr3 = paging::read_cr3();
+                unsafe { paging::write_cr3(elf_image.root.phys); }
+                let words = rsp as *const u64;
+                elf_ok = rsp & 0xf == 0
+                    && argv == rsp + 8
+                    && envp == rsp + 32
+                    && paging::translate(rsp).is_some()
+                    && unsafe { words.read() == 2 && words.add(1).read() != 0 && words.add(4).read() != 0 };
+                unsafe { paging::write_cr3(saved_cr3); }
+            }
+            paging::destroy_uncommitted_pml4(elf_image.root, pmm);
+        }
+        crate::kmm::kfree(elf_data);
+    }
+    ok = flat_ok && elf_ok;
+    serial.writestrs(&[if ok { "EXEC ABI TEST: flat/ELF stack vectors PASS\n" } else { "EXEC ABI TEST: flat/ELF stack vectors FAIL\n" }]);
+    ok
+}
+
+/// Copy caller vectors while the old address space is still active, then lay
+/// out argc/argv/envp and their strings in the new image's bounded user stack.
+fn install_exec_vectors(vectors: &ExecVectors, root: u64, stack_low: u64, stack_top: u64)
+    -> Result<(u64, u64, u64), i64> {
+    let table_words = 1usize.checked_add(vectors.argc).and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_add(vectors.envc)).and_then(|n| n.checked_add(1)).ok_or(-7)?;
+    let table_bytes = table_words.checked_mul(8).ok_or(-7)?;
+    let strings_start = stack_top.checked_sub(vectors.used as u64).ok_or(-7)?;
+    let table_unaligned = strings_start.checked_sub(table_bytes as u64).ok_or(-7)?;
+    let rsp = table_unaligned & !0xf;
+    if rsp < stack_low { return Err(-7); }
+    let argv_addr = rsp.checked_add(8).ok_or(-7)?;
+    let envp_addr = argv_addr.checked_add(((vectors.argc + 1) * 8) as u64).ok_or(-7)?;
+    let saved_cr3 = crate::paging::read_cr3();
+    let saved_if: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) saved_if, options(nostack));
+        crate::paging::write_cr3(root);
+        let words = rsp as *mut u64;
+        words.write(vectors.argc as u64);
+        for i in 0..vectors.argc {
+            let item = vectors.argv[i];
+            words.add(1 + i).write(strings_start + item.offset as u64);
+        }
+        words.add(1 + vectors.argc).write(0);
+        let env_start = 2 + vectors.argc;
+        for i in 0..vectors.envc {
+            let item = vectors.envp[i];
+            words.add(env_start + i).write(strings_start + item.offset as u64);
+        }
+        words.add(env_start + vectors.envc).write(0);
+        if vectors.used != 0 {
+            core::ptr::copy_nonoverlapping(vectors.bytes.as_ptr(), strings_start as *mut u8, vectors.used);
+        }
+        crate::paging::write_cr3(saved_cr3);
+        if saved_if & 0x200 != 0 { core::arch::asm!("sti", options(nomem, nostack)); }
+    }
+    Ok((rsp, argv_addr, envp_addr))
 }
 
 extern "C" {
@@ -97,6 +338,9 @@ extern "C" {
 extern "C" {
     pub static mut should_schedule: u8;
 }
+
+#[cfg(feature = "debug")]
+static mut EXEC_SCHEDULE_TEST_PENDING: u8 = 0;
 
 // --- Helpers ---
 
@@ -434,6 +678,14 @@ static FLAT_ROLLBACK_DATA: [u8; 0x1001] = [0x90; 0x1001];
 
 #[cfg(feature = "debug")]
 static FLAT_SMALL_DATA: [u8; 1] = [0xCC];
+#[cfg(feature = "debug")]
+static mut EXEC_LAYOUT_VECTORS: ExecVectors = ExecVectors::new();
+#[cfg(feature = "debug")]
+static mut EXEC_LAYOUT_EMPTY_VECTORS: ExecVectors = ExecVectors::new();
+#[cfg(feature = "debug")]
+static mut EXEC_INPUT_VALID: ExecVectors = ExecVectors::new();
+#[cfg(feature = "debug")]
+static mut EXEC_INPUT_SCRATCH: ExecVectors = ExecVectors::new();
 
 /// DEBUG-only proof that flat construction is fresh-root and failure-atomic.
 #[cfg(feature = "debug")]
@@ -511,10 +763,12 @@ pub fn test_flat_image_failures(
                 && code_second.is_some()
                 && stack.is_some()
                 && image.user_rsp == image.stack_low + 0x1000;
+            let entry_vectors_ok = test_exec_vector_layout(&image, pmm, serial);
             paging::destroy_uncommitted_pml4(image.root, pmm);
             stale_seed_ok
                 && stale_frame_reused
                 && layout_ok
+                && entry_vectors_ok
                 && first_tail_zero
                 && second_page_zero
         }
@@ -950,6 +1204,17 @@ pub extern "C" fn scheduler_switch_exit(current_rsp: u64) -> u64 {
     let cur = process_mut(cur_pid);
     cur.kernel_rsp = current_rsp;
 
+    #[cfg(feature = "debug")]
+    unsafe {
+        if core::ptr::read_volatile(&raw const EXEC_SCHEDULE_TEST_PENDING) != 0 {
+            core::ptr::write_volatile(&raw mut EXEC_SCHEDULE_TEST_PENDING, 0);
+            let mut serial = crate::serial::SerialPort::new();
+            serial.init();
+            use core::fmt::Write;
+            let _ = writeln!(serial, "DBG EXEC TEST: scheduled frame observed pid={}", cur_pid);
+        }
+    }
+
     if cfg!(feature = "debug") {
         use core::fmt::Write;
         let mut serial = crate::serial::SerialPort::new();
@@ -1159,7 +1424,7 @@ pub fn sys_fork() -> i64 {
 
 /// Exec — reload user program context from a VFS-resolved path.
 /// Supports both ELF64 executables and flat binaries.
-pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
+pub fn sys_exec(path: u64, argv: u64, envp: u64) -> i64 {
     let pid = current_pid();
     let old_proc = process(pid);
     if cfg!(feature = "debug") {
@@ -1170,17 +1435,28 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         let _ = write!(serial, "DBG EXEC BEGIN: pid={} state={:?} cr3={:016x} pml4={:016x} rip={:016x} rsp={:016x} krsp={:016x}\n", pid, old_proc.state, crate::paging::read_cr3(), old_proc.pml4_phys, saved_rip, saved_rsp, old_proc.kernel_rsp);
     }
 
+    // Snapshot all inputs while the old image is still active. Bounds and
+    // mapping checks happen before any replacement image is published.
+    let mut vectors = ExecVectors::new();
+    if let Err(error) = copy_exec_vector(&mut vectors, argv, false) { return error; }
+    if let Err(error) = copy_exec_vector(&mut vectors, envp, true) { return error; }
+
     // 1. Copy path string from user space
-    let path_buf = unsafe {
-        match crate::vfs::cstr_from_user(path as *const u8, crate::vfs::PATH_MAX) {
-            Ok(buf) => buf,
-            Err(e) => return -e as i64,
+    if path == 0 { return -14; }
+    let mut path_buf = [0u8; crate::vfs::PATH_MAX];
+    let mut path_len = 0usize;
+    let mut path_terminated = false;
+    for (index, byte) in path_buf.iter_mut().enumerate() {
+        let address = match path.checked_add(index as u64) { Some(value) => value, None => return -14 };
+        match user_byte(address) {
+            Ok(value) => {
+                *byte = value;
+                if value == 0 { path_len = index; path_terminated = true; break; }
+            }
+            Err(error) => return error,
         }
-    };
-    let path_len = path_buf
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(crate::vfs::PATH_MAX);
+    }
+    if !path_terminated { return -(crate::vfs::ENAMETOOLONG as i64); }
     let path_slice = &path_buf[..path_len];
 
     // 2. Resolve path through VFS
@@ -1213,6 +1489,33 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
     }
 
     let pmm = crate::pmm::global_pmm();
+
+    // Deterministically exercise sys_exec's failure atomicity after the new
+    // ELF image and its first stack page have been constructed. This exact
+    // DEBUG fixture path is absent from non-debug builds.
+    #[cfg(feature = "debug")]
+    if path_slice == b"/bin/argv-fail-image" {
+        use core::fmt::Write;
+        let data_slice = unsafe { core::slice::from_raw_parts(data, size) };
+        return match crate::elf::build_exec_image_with_stack_failure(data_slice, pmm, 1) {
+            Err((crate::elf::ElfError::Oom, mapped_stack_pages)) => {
+                let mut serial = crate::serial::SerialPort::new();
+                serial.init();
+                let _ = write!(
+                    serial,
+                    "DBG EXEC TEST: failed image construction mapped_stack_pages={}\n",
+                    mapped_stack_pages,
+                );
+                if mapped_stack_pages == 1 { -12 } else { -22 }
+            }
+            Err((crate::elf::ElfError::MetadataOom, _)) => -12,
+            Err((_, _)) => -22,
+            Ok(image) => {
+                crate::paging::destroy_uncommitted_pml4(image.root, pmm);
+                -22
+            }
+        };
+    }
 
     // 4. Check for ELF magic and dispatch accordingly
     let entry: u64;
@@ -1266,6 +1569,18 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         }
     }
 
+    // Add the same argc/argv/envp representation to either image format.
+    // If stack construction fails, discard the still-unpublished root.
+    let (user_rsp, argv_addr, envp_addr) = match install_exec_vectors(
+        &vectors, root.phys, stack_low, user_rsp,
+    ) {
+        Ok(layout) => layout,
+        Err(error) => {
+            crate::paging::destroy_uncommitted_pml4(root, pmm);
+            return error;
+        }
+    };
+
     // 5. Publish the fully built image only after all mappings succeeded.
     let proc = process_mut(pid);
     let saved_if: u64;
@@ -1282,6 +1597,9 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         core::ptr::write_volatile(&raw mut syscall_state.rip, entry);
         core::ptr::write_volatile(&raw mut syscall_state.rsp, user_rsp);
         core::ptr::write_volatile(&raw mut syscall_state.rflags, 0x202);
+        core::ptr::write_volatile(&raw mut syscall_state.entry_rdi, vectors.argc as u64);
+        core::ptr::write_volatile(&raw mut syscall_state.entry_rsi, argv_addr);
+        core::ptr::write_volatile(&raw mut syscall_state.entry_rdx, envp_addr);
         if saved_if & 0x200 != 0 {
             core::arch::asm!("sti", options(nostack));
         }
@@ -1343,6 +1661,20 @@ pub fn sys_exec(path: u64, _argv: u64, _envp: u64) -> i64 {
         let mut serial = crate::serial::SerialPort::new();
         serial.init();
         let _ = write!(serial, "DBG EXEC END: pid={} state={:?} rip={:016x} rsp={:016x} cr3={:016x} pml4={:016x} kernel_rsp={:016x}\n", pid, proc.state, end_rip, end_rsp, crate::paging::read_cr3(), proc.pml4_phys, proc.kernel_rsp);
+    }
+
+    // Force syscall_entry's scheduled synthetic-frame return for the focused
+    // DEBUG argv/env probe. This path is excluded from release builds.
+    #[cfg(feature = "debug")]
+    if path_slice == b"/bin/argv-probe" {
+        use core::fmt::Write;
+        let mut serial = crate::serial::SerialPort::new();
+        serial.init();
+        let _ = writeln!(serial, "DBG EXEC TEST: scheduled return armed pid={}", pid);
+        unsafe {
+            core::ptr::write_volatile(&raw mut EXEC_SCHEDULE_TEST_PENDING, 1);
+            core::ptr::write_volatile(&raw mut should_schedule, 1);
+        }
     }
     0
 }
