@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-23
+
+### Strengthen kernel source-provenance screening
+- **`anti_cheat.py`**: Replaced generic substring checks with comment/string-aware, whitespace-normalized signatures for selected Linux/BSD APIs and separate license-marker findings. Added deterministic, deduplicated source traversal that excludes build/VCS trees and fails on unreadable inputs. Added optional token-shingle similarity comparison against caller-supplied local reference trees; a missing/empty configured tree is an error. Output now states when no comparison corpus is configured and explicitly avoids treating a clean scan as proof of originality.
+- **`tests/test_anti_cheat.py`, `Makefile`, `AGENTS.md`**: Added regressions for harmless project-name comments, split signature detection, copied-code matching, duplicate/build-tree exclusion, and invalid reference roots; wired them into `make test` and documented the detector's limits.
+- **Validation**: `python3 -m unittest discover -s tests -p 'test_anti_cheat.py' -v` passes (5 tests); `python3 -m py_compile anti_cheat.py tests/test_anti_cheat.py` passes; `python3 anti_cheat.py` reports no known signatures in 50 source files and explicitly notes that no external reference tree was configured. This run does not establish that no unrecognized or rewritten third-party code is present.
+
 ## 2026-10-22
 
 ### Close argv/env runtime-evidence review findings

@@ -103,6 +103,7 @@ debug: $(USR_BIN) vibix.elf
 	$(QEMU) $(QEMU_FLAGS) -L /usr/share/qemu -serial stdio -display none -s -S
 
 test: vibix.elf
+	python3 -m unittest discover -s tests -p 'test_anti_cheat.py'
 	python3 anti_cheat.py && python3 test_kernel.py
 
 test_vibit: clean

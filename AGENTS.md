@@ -8,7 +8,7 @@
 2. **Orchestration**: High-level planning, architecture, and multi-phase refactors use the orchestrator with deepwork skill. Implementation is delegated to specialist agents (fixer, coder).
 3. **Changelog**: All agents must log every change to `CHANGELOG.md` at the end of each session. The changelog entry must include: date, a brief description of what was changed, files modified, and test results. This keeps the project history accessible to all agents (and humans).
 4. **Avoid**:
-   - Copying foreign kernel source code verbatim (anti-plagiarism checker scans for Linux/BSD patterns).
+   - Copying foreign kernel source code verbatim. `anti_cheat.py` screens for known signatures and can compare against supplied local reference trees; neither mode proves originality.
    - Re-using any GPL-licensed source code.
    - Using Mistral models (known flaky behavior with low-level kernel code).
 
@@ -166,10 +166,14 @@ Source code for userspace programs lives in their own repos:
    its contents exist only for development and testing.
 4. **Kernel source code** stays in `kernel_rust/src/` and `kernel/`. Never mix
    userspace source code into these directories.
-5. **Anti-plagiarism**: The `anti_cheat.py` check runs as part of `make test`
-   and scans ALL source files (including `.rs`, `.asm`, `.inc`) for
-   Linux/BSD/GPL patterns. False positives for ABI compatibility references
-   are handled via the exception system in `anti_cheat.py`.
+5. **Source-provenance screen**: `anti_cheat.py` runs as part of `make test`
+   and scans Rust, C/header, NASM, and include sources for selected upstream
+   API signatures and license markers. Pass `--reference-root PATH` to compare
+   normalized code shingles against a local kernel source tree. A clean run
+   without a reference tree checks only known signatures; it does not rule out
+   copied or substantially rewritten source. Review provenance and licensing
+   before accepting code. Narrow false-positive exceptions are maintained in
+   `anti_cheat.py`.
 
 ### exec() Caveats
 - `exec()` does NOT reset `sig_pending`. The child inherits the parent's
